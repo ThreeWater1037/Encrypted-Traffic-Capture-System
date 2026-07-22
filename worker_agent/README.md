@@ -46,6 +46,16 @@ $env:WORKER_DATA_DIR='D:\TrafficCaptureWorker\data'
 python -m worker_agent
 ```
 
+Worker 与实际采集程序共用浏览器自动发现逻辑，依次检查环境变量、PATH、Windows
+App Paths 注册表以及 Program Files/LocalAppData 等安装目录。通常无需为不同子机器
+修改代码。便携版或特殊安装位置可以显式覆盖：
+
+```powershell
+$env:CHROME_BINARY='E:\Browsers\Chrome\chrome.exe'
+$env:EDGE_BINARY='E:\Browsers\Edge\msedge.exe'
+$env:FIREFOX_BINARY='E:\Browsers\Firefox\firefox.exe'
+```
+
 安装 `waitress` 后会自动使用 Waitress；没有安装时仅为方便本机调试而回退到
 Flask 开发服务器。多机使用时，应在防火墙中只允许主控机访问 5100 端口。
 

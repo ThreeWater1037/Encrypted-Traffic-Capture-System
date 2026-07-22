@@ -39,6 +39,8 @@ from webdriver_manager.microsoft import EdgeChromiumDriverManager
 from webdriver_manager.firefox import GeckoDriverManager
 from webdriver_manager.core.driver_cache import DriverCacheManager
 
+from browser_discovery import discover_browser
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -320,9 +322,18 @@ class ChromeDriver(BrowserDriver):
     """创建全新、无缓存并开启 TLS key log 的 Chrome 实例。"""
     name = "Chrome (Blink)"
 
+    @staticmethod
+    def _find_binary() -> Optional[str]:
+        """使用与 Worker 能力探测相同的规则定位 Chrome。"""
+        return discover_browser("chrome")
+
     def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Chrome:
         """配置 Chrome 启动参数、驱动服务和 CDP 无缓存设置。"""
         opts = ChromeOptions()
+        binary = self._find_binary()
+        if not binary:
+            raise RuntimeError("Google Chrome/Chromium not found")
+        opts.binary_location = binary
 
         # Fresh profile — no persistent cache or cookies
         opts.add_argument(f"--user-data-dir={profile_dir}")
@@ -359,20 +370,10 @@ class EdgeDriver(BrowserDriver):
     """创建与 Chrome 采用相同无缓存策略的 Chromium Edge 实例。"""
     name = "Microsoft Edge (Blink)"
 
-    _BINARY_CANDIDATES = [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        "/usr/bin/microsoft-edge",
-        "/usr/bin/microsoft-edge-stable",
-    ]
-
-    @classmethod
-    def _find_binary(cls) -> Optional[str]:
-        for path in cls._BINARY_CANDIDATES:
-            if os.path.isfile(path):
-                return path
-        return shutil.which("msedge") or shutil.which("microsoft-edge")
+    @staticmethod
+    def _find_binary() -> Optional[str]:
+        """使用覆盖变量、PATH、注册表和安装目录定位 Edge。"""
+        return discover_browser("edge")
 
     def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Edge:
         """配置 Edge 启动参数、驱动服务和 CDP 无缓存设置。"""
@@ -411,20 +412,10 @@ class FirefoxDriver(BrowserDriver):
     """创建禁用磁盘、内存和 HTTP 缓存的 Firefox 实例。"""
     name = "Firefox (Gecko)"
 
-    _BINARY_CANDIDATES = [
-        "/Applications/Firefox.app/Contents/MacOS/firefox",
-        "/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox",
-        "/Applications/Firefox Nightly.app/Contents/MacOS/firefox",
-        "/usr/bin/firefox",
-        "/usr/local/bin/firefox",
-    ]
-
-    @classmethod
-    def _find_binary(cls) -> Optional[str]:
-        for path in cls._BINARY_CANDIDATES:
-            if os.path.isfile(path):
-                return path
-        return shutil.which("firefox")
+    @staticmethod
+    def _find_binary() -> Optional[str]:
+        """使用覆盖变量、PATH、注册表和安装目录定位 Firefox。"""
+        return discover_browser("firefox")
 
     def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Firefox:
         """配置 Firefox Profile、缓存首选项和 TLS key log 环境变量。"""
@@ -438,9 +429,9 @@ class FirefoxDriver(BrowserDriver):
         opts.binary_location = binary
         os.environ["SSLKEYLOGFILE"] = str(key_log_path)
 
-        # 使用临时 profile 目录，与 Chrome 保持一致，避免复用旧 session 数据
-        opts.add_argument("-profile")
-        opts.add_argument(str(profile_dir))
+        # 不传 -profile：GeckoDriver 会为每次会话创建全新临时 Profile，并把
+        # 下方首选项写入该 Profile。Firefox 153 在接收一个已经存在的自定义
+        # -profile 目录时会返回 Failed to set preferences。
 
         # 浏览器级缓存
         opts.set_preference("browser.cache.disk.enable", False)

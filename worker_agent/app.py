@@ -17,6 +17,8 @@ from typing import Any
 
 from flask import Flask, jsonify, request
 
+from browser_discovery import discover_browser
+
 from .config import WorkerConfig
 from .schema import (
     TASK_ID_RE,
@@ -42,33 +44,9 @@ def _find_first(candidates: list[str | Path]) -> str | None:
 
 def detect_capabilities(config: WorkerConfig) -> dict[str, Any]:
     """探测当前子机器可用浏览器、TShark、解释器和分析脚本。"""
-    chrome = _find_first(
-        [
-            "chrome",
-            "google-chrome",
-            "chromium",
-            Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-            Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-        ]
-    )
-    firefox = _find_first(
-        [
-            "firefox",
-            Path(r"C:\Program Files\Mozilla Firefox\firefox.exe"),
-            Path(r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"),
-            Path("/Applications/Firefox.app/Contents/MacOS/firefox"),
-        ]
-    )
-    edge = _find_first(
-        [
-            "msedge",
-            "microsoft-edge",
-            Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-            Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
-            Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
-        ]
-    )
+    chrome = discover_browser("chrome")
+    firefox = discover_browser("firefox")
+    edge = discover_browser("edge")
     tshark = _find_first(
         [
             "tshark",

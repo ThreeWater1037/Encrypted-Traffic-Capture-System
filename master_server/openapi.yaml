@@ -1,0 +1,415 @@
+openapi: 3.0.3
+info:
+  title: 加密流量实验主控 API
+  version: 1.0.0
+  description: |
+    Vue 前端只调用本 API。主控负责管理 Worker、分发任务并汇总
+    URL、机器和浏览器级结果；原始实验文件仍保存在 Worker 本地。
+servers:
+  - url: http://127.0.0.1:5200
+    description: 本机主控
+tags:
+  - name: System
+  - name: Machines
+  - name: Jobs
+paths:
+  /api/v1/health:
+    get:
+      tags: [System]
+      operationId: getMasterHealth
+      summary: 主控健康检查
+      responses:
+        '200':
+          description: 主控正常
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /api/v1/machines:
+    get:
+      tags: [Machines]
+      operationId: listMachines
+      summary: 查询机器列表
+      responses:
+        '200':
+          description: Worker 列表，不包含 Token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  machines:
+                    type: array
+                    items: { $ref: '#/components/schemas/Machine' }
+    post:
+      tags: [Machines]
+      operationId: saveMachine
+      summary: 新增或更新 Worker
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MachineInput' }
+      responses:
+        '201':
+          description: 已新增
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Machine' }
+        '200':
+          description: 已更新
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Machine' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/v1/machines/{machine_id}:
+    parameters:
+      - $ref: '#/components/parameters/MachineId'
+    delete:
+      tags: [Machines]
+      operationId: deleteMachine
+      summary: 删除 Worker
+      description: 仅允许删除未被实验执行记录引用的机器；已有历史实验的机器应改为停用。
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [machine_id, deleted]
+                properties:
+                  machine_id: { type: string }
+                  deleted: { type: boolean, enum: [true] }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: 机器已有实验记录，不能删除
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /api/v1/machines/{machine_id}/probe:
+    parameters:
+      - $ref: '#/components/parameters/MachineId'
+    post:
+      tags: [Machines]
+      operationId: probeMachine
+      summary: 探测 Worker 健康和能力
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Worker 在线
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Machine' }
+        '502':
+          description: Worker 无法连接
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Machine' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/jobs:
+    get:
+      tags: [Jobs]
+      operationId: listJobs
+      summary: 查询任务列表
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        '200':
+          description: 任务列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: '#/components/schemas/Job' }
+    post:
+      tags: [Jobs]
+      operationId: createJob
+      summary: 使用 JSON 创建任务
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/JobInput' }
+      responses:
+        '202':
+          description: 已进入主控队列
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/jobs/from-file:
+    post:
+      tags: [Jobs]
+      operationId: createJobFromFile
+      summary: 上传 TXT/TSV 创建任务
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, targets]
+              properties:
+                job_id: { type: string, example: upload-20260722-001 }
+                name: { type: string, example: 百科站点批量实验 }
+                file: { type: string, format: binary }
+                targets:
+                  type: string
+                  description: MachineTarget 数组的 JSON 字符串
+                  example: '[{"machine_id":"worker-local","browsers":["chrome","edge"]}]'
+                pcap: { type: boolean, default: true }
+                analysis_steps: { type: string, example: extract,classify,infer }
+                with_coframe: { type: boolean, default: false }
+                sni_suffixes: { type: string, example: wikipedia.org,wikimedia.org }
+      responses:
+        '202':
+          description: 文件已保存，任务已进入主控队列
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+  /api/v1/jobs/{job_id}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      operationId: getJob
+      summary: 查询任务及 URL 执行矩阵
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: 任务详情
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/jobs/{job_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [Jobs]
+      operationId: cancelJob
+      summary: 取消主控任务及下游 Worker 任务
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: 取消请求已记录
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/jobs/{job_id}/results:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      operationId: getJobResults
+      summary: 查询结构化结果与 Worker 本地路径
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: 结构化任务结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/jobs/{job_id}/logs:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      operationId: getJobLogs
+      summary: 汇总各目标 Worker 日志
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Worker 日志数组
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string }
+                  logs:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+        '404': { $ref: '#/components/responses/NotFound' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 仅设置 MASTER_TOKEN 后需要
+  parameters:
+    MachineId:
+      in: path
+      name: machine_id
+      required: true
+      schema: { type: string }
+    JobId:
+      in: path
+      name: job_id
+      required: true
+      schema: { type: string }
+  responses:
+    BadRequest:
+      description: 参数错误
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: 记录不存在
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: ID 冲突
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooLarge:
+      description: 上传内容超过限制
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Health:
+      type: object
+      required: [status, service, machines, cache_enabled]
+      properties:
+        status: { type: string, enum: [ok] }
+        service: { type: string }
+        machines: { type: integer }
+        cache_enabled: { type: boolean, enum: [false] }
+    MachineInput:
+      type: object
+      required: [machine_id, base_url]
+      properties:
+        machine_id: { type: string, example: worker-local }
+        name: { type: string, example: 本机 Worker }
+        base_url: { type: string, format: uri, example: 'http://127.0.0.1:5100' }
+        token: { type: string, writeOnly: true, description: 新建机器时必填；更新已有机器时省略表示保留原 Token }
+        enabled: { type: boolean, default: true }
+    Machine:
+      type: object
+      properties:
+        machine_id: { type: string }
+        name: { type: string }
+        base_url: { type: string }
+        enabled: { type: boolean }
+        status: { type: string, enum: [UNKNOWN, ONLINE, BUSY, OFFLINE] }
+        token_configured: { type: boolean }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        last_error: { type: string, nullable: true }
+        health: { type: object, nullable: true, additionalProperties: true }
+        capabilities: { type: object, nullable: true, additionalProperties: true }
+    TaskItem:
+      type: object
+      required: [id, name, url]
+      properties:
+        id: { type: string, example: '1' }
+        name: { type: string, example: Example }
+        url: { type: string, format: uri, example: 'https://example.com/' }
+    MachineTarget:
+      type: object
+      required: [machine_id, browsers]
+      properties:
+        machine_id: { type: string, example: worker-local }
+        browsers:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, enum: [chrome, edge, firefox] }
+    JobInput:
+      type: object
+      required: [name, items, targets]
+      properties:
+        job_id: { type: string, description: 留空时由主控生成 }
+        name: { type: string }
+        items:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/TaskItem' }
+        targets:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/MachineTarget' }
+        pcap: { type: boolean, default: true }
+        analysis:
+          type: object
+          properties:
+            steps:
+              type: array
+              items: { type: string, enum: [extract, classify, infer] }
+            with_coframe: { type: boolean, default: false }
+            sni_suffixes:
+              type: array
+              items: { type: string }
+    Execution:
+      type: object
+      properties:
+        execution_id: { type: integer }
+        machine_id: { type: string }
+        machine_name: { type: string }
+        worker_task_id: { type: string }
+        item_id: { type: string }
+        browser: { type: string }
+        status: { type: string }
+        stage: { type: string }
+        error: { type: string, nullable: true }
+        result: { type: object, nullable: true, additionalProperties: true }
+    Job:
+      type: object
+      properties:
+        job_id: { type: string }
+        name: { type: string }
+        status: { type: string }
+        stage: { type: string }
+        source_filename: { type: string, nullable: true }
+        cancel_requested: { type: boolean }
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        request: { $ref: '#/components/schemas/JobInput' }
+        summary:
+          type: object
+          additionalProperties: true
+        targets:
+          type: array
+          items: { type: object, additionalProperties: true }
+        items:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/TaskItem'
+              - type: object
+                properties:
+                  status: { type: string }
+                  executions:
+                    type: array
+                    items: { $ref: '#/components/schemas/Execution' }
+        executions:
+          type: array
+          items: { $ref: '#/components/schemas/Execution' }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        message: { type: string }
