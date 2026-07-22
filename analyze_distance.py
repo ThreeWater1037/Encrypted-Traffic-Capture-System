@@ -74,8 +74,6 @@ def load_tsv(path: Path, label_col: str,
 
     with path.open(encoding="utf-8") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
-        missing_warn = set()
-
         for row in reader:
             label = row.get(label_col, "").strip()
             if not label:
@@ -134,6 +132,7 @@ def zscore_params(groups: dict, num_cols: list[str]
 
 
 def normalize(vec: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """使用全局均值和标准差对数值向量做 z-score 标准化。"""
     return (vec - mean) / std
 
 
@@ -222,6 +221,7 @@ def compute_centroid(samples: list[dict], mean: np.ndarray, std: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def dist_stats(vals: list[float]) -> dict:
+    """计算一组有效距离的数量、均值、标准差和分位数。"""
     if not vals:
         return {"count": 0, "mean": "", "median": "", "std": "", "min": "", "max": ""}
     a = np.array(vals)
@@ -242,6 +242,7 @@ def dist_stats(vals: list[float]) -> dict:
 def intra_distances(groups: dict, mean: np.ndarray, std: np.ndarray,
                     num_cols: list[str], seq_cols: list[str]
                     ) -> list[dict]:
+    """计算每个标签内部所有样本对的距离统计。"""
     rows = []
     for label, samples in groups.items():
         n = len(samples)
@@ -311,7 +312,7 @@ def inter_distances(centroids: dict[str, dict],
         return [], []
 
     # ── 数值重心矩阵 → 全量 pdist ──────────────────────────────────────
-    num_mat = np.vstack([centroids[l]["num"] for l in labels])
+    num_mat = np.vstack([centroids[label]["num"] for label in labels])
     # 含 NaN 的列用 0 替代再算距离（简单处理）
     num_mat_clean = np.nan_to_num(num_mat, nan=0.0)
     num_flat = pdist(num_mat_clean, metric="euclidean")   # 三角形展开，长度 n*(n-1)/2
@@ -320,8 +321,8 @@ def inter_distances(centroids: dict[str, dict],
     sl2_flats: dict[str, np.ndarray] = {}
     for col in seq_cols:
         q_mat = []
-        for l in labels:
-            qv = centroids[l]["seq_q"].get(col)
+        for label in labels:
+            qv = centroids[label]["seq_q"].get(col)
             q_mat.append(qv if qv is not None else np.zeros(N_QUANTILES))
         q_arr = np.vstack(q_mat)
         sl2_flats[col] = pdist(q_arr, metric="euclidean")
@@ -337,7 +338,6 @@ def inter_distances(centroids: dict[str, dict],
         for col in seq_cols:
             emd_arr = np.full(len(ref_flat), np.nan)
             # 三角形索引 → (i, j)
-            from scipy.spatial.distance import squareform
             # 构建完整索引对
             idx = 0
             pair_map: dict[int, tuple[int, int]] = {}
@@ -355,7 +355,6 @@ def inter_distances(centroids: dict[str, dict],
             emd_flats[col] = emd_arr
 
     # ── Top-K 最相似对（按 num + 第一 seq sorted-L2 之和排序）──────────
-    n_pairs = len(num_flat)
     if seq_cols:
         sort_key = num_flat + sl2_flats[seq_cols[0]]
     else:
@@ -420,6 +419,7 @@ def inter_distances(centroids: dict[str, dict],
 # ---------------------------------------------------------------------------
 
 def write_tsv(path: Path, rows: list[dict]):
+    """以稳定列顺序写出分析结果 TSV。"""
     if not rows:
         log.warning("无数据，跳过写出：%s", path)
         return
@@ -437,6 +437,7 @@ def write_tsv(path: Path, rows: list[dict]):
 # ---------------------------------------------------------------------------
 
 def main():
+    """组织加载、标准化、类内/类间距离计算和结果输出。"""
     parser = argparse.ArgumentParser(
         description="统计分析 TSV 中各标签的类内/类间特征距离。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -463,7 +464,8 @@ def main():
 
     tsv_path = Path(args.tsv)
     if not tsv_path.exists():
-        log.error("文件不存在：%s", tsv_path); sys.exit(1)
+        log.error("文件不存在：%s", tsv_path)
+        sys.exit(1)
 
     out_dir = Path(args.output_dir) if args.output_dir else tsv_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -539,7 +541,7 @@ def main():
                         if r.get(f"{safe}_emd_mean") != ""]
             _fmt(f"{col} EMD（各类内均值）", emd_vals)
     # 类间整体
-    print(f"\n类间（inter）统计：")
+    print("\n类间（inter）统计：")
     for r in stats_rows:
         if not r.get("n_pairs"):
             continue

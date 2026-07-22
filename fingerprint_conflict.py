@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 
 
 def main():
+    """按指定特征列构造指纹，并统计重复指纹造成的样本冲突。"""
     parser = argparse.ArgumentParser(
         description=(
             "将指定列组合为指纹向量，统计行冲突分布。\n\n"
@@ -123,6 +124,7 @@ def main():
     out_fieldnames = ["conflict_size", "group_count", "row_count", "row_pct"]
 
     def write_rows(writer_or_none):
+        """复用同一遍统计结果，同时支持终端和 TSV 输出。"""
         for sz in sorted_sizes:
             if args.only_conflicts and sz == 1:
                 continue
@@ -150,8 +152,10 @@ def main():
                     ids = []
                     for r in fp_rows[:5]:
                         tag = ""
-                        if has_id:   tag += r.get("id", "")
-                        if has_name: tag += "-" + r.get("wiki_name", "")
+                        if has_id:
+                            tag += r.get("id", "")
+                        if has_name:
+                            tag += "-" + r.get("wiki_name", "")
                         if tag:
                             ids.append(tag)
                     ids_str = ", ".join(ids)

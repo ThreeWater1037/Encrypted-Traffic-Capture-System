@@ -96,12 +96,10 @@ def process_flow_file(tsv_path: Path) -> dict:
 
     with tsv_path.open(encoding="utf-8") as fh:
         data_lines: list[str] = []
-        in_comments = True
         for raw_line in fh:
             if raw_line.startswith("#"):
                 comment_lines.append(raw_line)
             else:
-                in_comments = False
                 data_lines.append(raw_line)
 
     # ── 解析注释头 ────────────────────────────────────────────────────
@@ -167,6 +165,7 @@ def process_dir(subdir: Path, browser: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def main():
+    """汇总所有正向推断流，输出适合距离分析的单一 TSV。"""
     parser = argparse.ArgumentParser(
         description=(
             "遍历 fetch_output 目录，读取 capture_{browser}_inferred/ 下所有\n"
@@ -230,6 +229,7 @@ def main():
         writers: dict[str, tuple] = {}
 
         def _sni_filename(sni: str) -> Path:
+            """把 SNI 清理为安全文件名，用于按域名拆分输出。"""
             # SNI 中的点保留，替换不安全字符
             safe = sni.replace("/", "_").replace("\\", "_") or "unknown"
             return out_dir / f"forward_{safe}.tsv"

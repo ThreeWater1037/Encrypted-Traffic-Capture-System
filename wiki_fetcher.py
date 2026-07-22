@@ -1,17 +1,16 @@
-"""
-Wiki fetcher — drives real browser engines via Selenium.
-Each browser performs a genuine network request (no cache).
-TLS session keys are captured via SSLKEYLOGFILE (Chrome & Firefox).
-Network traffic can optionally be saved as pcap (--pcap).
+"""真实浏览器网页抓取与加密流量采集入口。
 
-Usage:
+脚本使用 Selenium 驱动 Chrome、Edge、Firefox 或 Safari。每次访问都创建临时
+浏览器配置并关闭缓存；可在浏览器启动前拉起 TShark/tcpdump 保存 PCAP，同时为
+支持的浏览器导出 TLS 会话密钥。
+
+用法：
     python3 wiki_fetcher.py <wiki_url> [--output-dir ./fetch_output]
-    python3 wiki_fetcher.py <wiki_url> --browsers chrome firefox safari
+    python3 wiki_fetcher.py <wiki_url> --browsers chrome edge firefox safari
     python3 wiki_fetcher.py <wiki_url> --pcap
 """
 
 import os
-import sys
 import time
 import signal
 import hashlib
@@ -25,19 +24,20 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import urlparse
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.safari.service import Service as SafariService
 from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.microsoft import EdgeChromiumDriverManager
 from webdriver_manager.firefox import GeckoDriverManager
+from webdriver_manager.core.driver_cache import DriverCacheManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -191,6 +191,7 @@ class PacketCapture:
     # ------------------------------------------------------------------
 
     def start(self):
+        """选择可用抓包工具并在浏览器启动前开始捕获。"""
         result = self._find_tool()
         if result is None:
             log.warning("Neither tshark nor tcpdump found — pcap skipped.")
@@ -202,29 +203,44 @@ class PacketCapture:
         log.info("  pcap capture starting (%s) → %s", self._tool, self.pcap_path)
         log.debug("  cmd: %s", " ".join(cmd))
 
-        self._proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        popen_kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        self._proc = subprocess.Popen(cmd, **popen_kwargs)
         # Wait for sniffer to open BPF handles and start capturing
         time.sleep(1.2)
 
     def stop(self) -> Optional[Path]:
+        """刷新并可靠关闭抓包进程，返回非空 PCAP 路径。"""
         if self._proc is None:
             return None
 
         # Brief pause so the last packets (TCP FIN, TLS close_notify) are written
         time.sleep(0.5)
-        # SIGINT flushes tshark/tcpdump write buffers cleanly
+        # Ask the sniffer to flush write buffers, then guarantee termination.
         try:
-            self._proc.send_signal(signal.SIGINT)
+            if os.name == "nt":
+                self._proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                self._proc.send_signal(signal.SIGINT)
             self._proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self._proc.kill()
             self._proc.wait()
         except Exception:
-            pass
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
+            except Exception:
+                if self._proc.poll() is None:
+                    self._proc.kill()
+                    self._proc.wait()
 
         self._proc = None
 
@@ -243,6 +259,7 @@ class PacketCapture:
 
 @dataclass
 class SessionRecord:
+    """记录一次 URL 与浏览器组合的抓取结果和产物路径。"""
     browser: str
     url: str
     timestamp: str
@@ -258,6 +275,7 @@ class SessionRecord:
     error: Optional[str] = None
 
     def summary(self) -> str:
+        """生成便于写入 report.txt 的人类可读摘要。"""
         cookie_names = ", ".join(c["name"] for c in self.cookies) or "(none)"
         lines = [
             f"  Browser        : {self.browser}",
@@ -282,16 +300,28 @@ class SessionRecord:
 # ---------------------------------------------------------------------------
 
 class BrowserDriver:
+    """不同浏览器构建逻辑的统一接口。"""
     name: str
 
     def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Remote:
+        """根据临时配置目录和密钥路径构造浏览器实例。"""
         raise NotImplementedError
 
 
+def _driver_cache_manager() -> DriverCacheManager:
+    """把驱动依赖缓存定向到 Worker 数据目录，而不是实验结果目录。"""
+    root_dir = os.getenv("WDM_CACHE_DIR")
+    if root_dir:
+        return DriverCacheManager(root_dir=root_dir)
+    return DriverCacheManager()
+
+
 class ChromeDriver(BrowserDriver):
+    """创建全新、无缓存并开启 TLS key log 的 Chrome 实例。"""
     name = "Chrome (Blink)"
 
     def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Chrome:
+        """配置 Chrome 启动参数、驱动服务和 CDP 无缓存设置。"""
         opts = ChromeOptions()
 
         # Fresh profile — no persistent cache or cookies
@@ -315,7 +345,9 @@ class ChromeDriver(BrowserDriver):
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
 
-        service = ChromeService(ChromeDriverManager().install())
+        service = ChromeService(
+            ChromeDriverManager(cache_manager=_driver_cache_manager()).install()
+        )
         driver = webdriver.Chrome(service=service, options=opts)
 
         driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
@@ -323,7 +355,60 @@ class ChromeDriver(BrowserDriver):
         return driver
 
 
+class EdgeDriver(BrowserDriver):
+    """创建与 Chrome 采用相同无缓存策略的 Chromium Edge 实例。"""
+    name = "Microsoft Edge (Blink)"
+
+    _BINARY_CANDIDATES = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/usr/bin/microsoft-edge",
+        "/usr/bin/microsoft-edge-stable",
+    ]
+
+    @classmethod
+    def _find_binary(cls) -> Optional[str]:
+        for path in cls._BINARY_CANDIDATES:
+            if os.path.isfile(path):
+                return path
+        return shutil.which("msedge") or shutil.which("microsoft-edge")
+
+    def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Edge:
+        """配置 Edge 启动参数、驱动服务和 CDP 无缓存设置。"""
+        binary = self._find_binary()
+        if not binary:
+            raise RuntimeError("Microsoft Edge not found")
+
+        opts = EdgeOptions()
+        opts.binary_location = binary
+        opts.add_argument(f"--user-data-dir={profile_dir}")
+        opts.add_argument("--disable-application-cache")
+        opts.add_argument("--disable-cache")
+        opts.add_argument("--disk-cache-size=0")
+        opts.add_argument("--media-cache-size=0")
+        opts.add_argument("--disable-offline-load-stale-cache")
+        opts.add_argument(f"--ssl-key-log-file={key_log_path}")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+
+        service = EdgeService(
+            EdgeChromiumDriverManager(
+                cache_manager=_driver_cache_manager()
+            ).install()
+        )
+        driver = webdriver.Edge(service=service, options=opts)
+        driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+        driver.execute_cdp_cmd("Network.enable", {})
+        return driver
+
+
 class FirefoxDriver(BrowserDriver):
+    """创建禁用磁盘、内存和 HTTP 缓存的 Firefox 实例。"""
     name = "Firefox (Gecko)"
 
     _BINARY_CANDIDATES = [
@@ -342,6 +427,7 @@ class FirefoxDriver(BrowserDriver):
         return shutil.which("firefox")
 
     def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Firefox:
+        """配置 Firefox Profile、缓存首选项和 TLS key log 环境变量。"""
         binary = self._find_binary()
         if not binary:
             raise RuntimeError(
@@ -368,14 +454,18 @@ class FirefoxDriver(BrowserDriver):
         opts.set_preference("browser.shell.checkDefaultBrowser", False)
         opts.add_argument("--headless")
 
-        service = FirefoxService(GeckoDriverManager().install())
+        service = FirefoxService(
+            GeckoDriverManager(cache_manager=_driver_cache_manager()).install()
+        )
         return webdriver.Firefox(service=service, options=opts)
 
 
 class SafariDriver(BrowserDriver):
+    """创建 Safari 实例；Safari 不支持导出 TLS 会话密钥。"""
     name = "Safari (WebKit)"
 
     def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Safari:
+        """调用系统 safaridriver，并把未启用远程自动化转换为可读错误。"""
         # Requires:
         #   1. Safari → 设置 → 高级 → 勾选「在菜单栏中显示"开发"菜单」
         #   2. 开发菜单 → 允许远程自动化（Allow Remote Automation）
@@ -402,6 +492,7 @@ class SafariDriver(BrowserDriver):
 
 AVAILABLE_DRIVERS = {
     "chrome":  ChromeDriver(),
+    "edge":    EdgeDriver(),
     "firefox": FirefoxDriver(),
     "safari":  SafariDriver(),
 }
@@ -418,10 +509,9 @@ INTERVAL_BETWEEN_URLS: float = 3.0   # seconds
 # URL entry — carries ID + name parsed from urls.txt
 # ---------------------------------------------------------------------------
 
-from dataclasses import dataclass as _dc
-
-@_dc
+@dataclass
 class UrlEntry:
+    """从输入 TSV 读取的单个词条标识、名称和完整 URL。"""
     id: str          # 词条 ID（字符串，保留原始值）
     name: str        # 词条中文名
     url: str         # 完整 URL
@@ -445,6 +535,7 @@ def _entry_slug(entry: "UrlEntry") -> str:
 
 
 class WikiFetcher:
+    """按 URL 和浏览器顺序执行抓取，并维护汇总报告。"""
     def __init__(self, output_dir: Path, browsers: list[str], capture_pcap: bool):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -472,6 +563,7 @@ class WikiFetcher:
     # ------------------------------------------------------------------
 
     def _fetch_with(self, url: str, driver_key: str, url_dir: Path) -> SessionRecord:
+        """完成单个 URL/浏览器的抓包、访问、落盘与资源清理。"""
         bd = AVAILABLE_DRIVERS[driver_key]
         timestamp = datetime.now().isoformat()
 
@@ -503,7 +595,7 @@ class WikiFetcher:
 
             t0 = time.perf_counter()
 
-            if isinstance(driver, webdriver.Chrome):
+            if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
                 driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
                     "headers": {
                         "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -526,8 +618,8 @@ class WikiFetcher:
             NETWORK_IDLE_THRESHOLD = 2.0   # seconds of silence = "done"
             NETWORK_IDLE_TIMEOUT   = 15.0  # give up after this long regardless
 
-            if isinstance(driver, webdriver.Chrome):
-                # Track in-flight request count via CDP Network events (Chrome only)
+            if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
+                # Track in-flight request count via CDP Network events (Chromium only)
                 driver.execute_cdp_cmd("Network.enable", {})
                 driver.execute_script("""
                     window.__inflight = 0;
@@ -611,6 +703,7 @@ class WikiFetcher:
     # ------------------------------------------------------------------
 
     def _run_entry(self, entry: "UrlEntry", position: int, total: int):
+        """依次运行当前词条选择的浏览器，并写入词条级 report.txt。"""
         slug = _entry_slug(entry)
         url_dir = self._url_dir(slug)
         url_records: list[SessionRecord] = []
@@ -650,6 +743,7 @@ class WikiFetcher:
     # ------------------------------------------------------------------
 
     def run(self, entries: list["UrlEntry"]):
+        """执行完整批次；URL 之间保留固定间隔以减少相互干扰。"""
         total = len(entries)
         log.info("词条数 : %d", total)
         log.info("Output : %s", self.output_dir)
@@ -674,6 +768,7 @@ class WikiFetcher:
     # ------------------------------------------------------------------
 
     def _write_summary(self):
+        """把本批次所有浏览器会话写入根目录 summary.txt。"""
         path = self.output_dir / "summary.txt"
         lines = [
             "Wiki Fetch Summary",
@@ -736,6 +831,7 @@ def _load_entries(txt_path: str,
 
 
 def main():
+    """解析命令行参数并启动单 URL 或 TSV 批量抓取。"""
     parser = argparse.ArgumentParser(
         description=(
             "Fetch wiki URLs using real browser engines via Selenium.\n"
@@ -774,7 +870,7 @@ def main():
         "--browsers", nargs="+",
         choices=list(AVAILABLE_DRIVERS),
         default=["chrome", "firefox"],
-        help="使用的浏览器（默认：chrome firefox）。Safari 需先运行 safaridriver --enable。",
+        help="使用的浏览器（默认：chrome firefox；可选 edge）。Safari 需先运行 safaridriver --enable。",
     )
     parser.add_argument(
         "--pcap", action="store_true",

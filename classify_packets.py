@@ -33,6 +33,7 @@ TSHARK_CANDIDATES = [
 ]
 
 def find_tshark() -> str:
+    """定位用于 TLS 解密和 HTTP/2 字段提取的 TShark。"""
     for p in TSHARK_CANDIDATES:
         if Path(p).is_file():
             return p
@@ -91,6 +92,7 @@ TSHARK_FIELDS = [
 ]
 
 def run_tshark(pcap: Path, keylog: Path) -> list[dict]:
+    """使用 TLS key log 解密 PCAP，并返回逐包字段记录。"""
     cmd = [
         TSHARK, "-r", str(pcap),
         "-o", f"tls.keylog_file:{keylog}",
@@ -153,6 +155,7 @@ def read_flow_tsv(tsv_path: Path) -> dict[FlowKey, dict]:
 # ---------------------------------------------------------------------------
 
 def classify_pkt(raw_ct: str, raw_h2_types: list[str], tcp_payload_len: int) -> str:
+    """依据 TLS content type、HTTP/2 frame type 和载荷长度标注数据包。"""
     if raw_ct == "22":
         return "header"
     if raw_h2_types:
@@ -166,6 +169,7 @@ def classify_pkt(raw_ct: str, raw_h2_types: list[str], tcp_payload_len: int) -> 
 # ---------------------------------------------------------------------------
 
 def process(pcap: Path, keylog: Path, flow_tsv: Path, output_dir: Path):
+    """把解密后的数据包归入目标流，并为每条流输出独立 TSV。"""
     # 读取流列表
     flow_meta = read_flow_tsv(flow_tsv)
     if not flow_meta:
@@ -218,7 +222,11 @@ def process(pcap: Path, keylog: Path, flow_tsv: Path, output_dir: Path):
         tls_ct = TLS_CONTENT_TYPES.get(raw_ct, "-" if not raw_ct else raw_ct)
 
         raw_h2_types = [t.strip() for t in pkt["http2.type"].split(",") if t.strip()]
-        raw_h2_lens  = [l.strip() for l in pkt["http2.length"].split(",") if l.strip()]
+        raw_h2_lens = [
+            length.strip()
+            for length in pkt["http2.length"].split(",")
+            if length.strip()
+        ]
         h2_types_str = ",".join(H2_FRAME_TYPES.get(t, t) for t in raw_h2_types)
         h2_lens_str  = ",".join(raw_h2_lens)
 
@@ -275,6 +283,7 @@ def process(pcap: Path, keylog: Path, flow_tsv: Path, output_dir: Path):
 # ---------------------------------------------------------------------------
 
 def main():
+    """校验输入文件并启动基于密钥的包级分类。"""
     parser = argparse.ArgumentParser(
         description=(
             "对 capture_chrome.tsv 中的每条流（正向+反向），从 pcap 提取包级信息，\n"
@@ -298,14 +307,17 @@ def main():
     keylog = Path(args.keylog)
 
     if not pcap.exists():
-        log.error("pcap 不存在：%s", pcap); sys.exit(1)
+        log.error("pcap 不存在：%s", pcap)
+        sys.exit(1)
     if not keylog.exists():
-        log.error("keylog 不存在：%s", keylog); sys.exit(1)
+        log.error("keylog 不存在：%s", keylog)
+        sys.exit(1)
 
     flow_tsv = (Path(args.flow_tsv) if args.flow_tsv
                 else pcap.parent / f"{pcap.stem}.tsv")
     if not flow_tsv.exists():
-        log.error("flow-tsv 不存在：%s", flow_tsv); sys.exit(1)
+        log.error("flow-tsv 不存在：%s", flow_tsv)
+        sys.exit(1)
 
     output_dir = (Path(args.output_dir) if args.output_dir
                   else pcap.parent / f"{pcap.stem}_flows")

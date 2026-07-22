@@ -67,6 +67,7 @@ def browser_paths(pcap: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def run(cmd: list[str], label: str) -> bool:
+    """执行一个后处理子命令，并将失败转换为可汇总的布尔结果。"""
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=600
@@ -207,6 +208,7 @@ def process_one(
 # ---------------------------------------------------------------------------
 
 def process_one_star(args):
+    """把元组参数展开为进程池可调用形式。"""
     try:
         return process_one(*args)
     except Exception:
@@ -218,6 +220,7 @@ def process_one_star(args):
 # ---------------------------------------------------------------------------
 
 def main():
+    """扫描所有词条目录，并按选择的阶段串行或并行处理 PCAP。"""
     parser = argparse.ArgumentParser(
         description=(
             "批量处理 fetch_output 下所有子文件夹，\n"
@@ -256,11 +259,13 @@ def main():
 
     root = Path(args.root)
     if not root.is_dir():
-        log.error("目录不存在：%s", root); sys.exit(1)
+        log.error("目录不存在：%s", root)
+        sys.exit(1)
 
     subdirs = sorted(d for d in root.iterdir() if d.is_dir())
     if not subdirs:
-        log.warning("未找到任何子目录：%s", root); sys.exit(0)
+        log.warning("未找到任何子目录：%s", root)
+        sys.exit(0)
 
     steps = set(args.only)
     log.info("根目录  : %s", root)

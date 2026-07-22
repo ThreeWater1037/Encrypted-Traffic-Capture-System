@@ -52,6 +52,7 @@ def parse_row(line: str) -> tuple[str, str, str] | None:
 
 
 def main():
+    """读取原始特征表，去重后生成抓取程序要求的三列 urls.txt。"""
     if not INPUT_TSV.exists():
         print(f"错误：找不到 {INPUT_TSV}", file=sys.stderr)
         sys.exit(1)

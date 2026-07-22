@@ -101,6 +101,7 @@ def compute_metrics(records: list[tuple]) -> dict:
 SEP = "-" * 90
 
 def print_flow_row(name: str, m: dict):
+    """打印单条流的准确率、精确率、召回率和 F1。"""
     ov = m["overall"]
     h  = m["header"]
     d  = m["data"]
@@ -112,10 +113,9 @@ def print_flow_row(name: str, m: dict):
     )
 
 def print_overall(all_records: list[tuple]):
+    """合并全部流并打印总体混淆矩阵与分类指标。"""
     m = compute_metrics(all_records)
     ov = m["overall"]
-    h  = m["header"]
-    d  = m["data"]
 
     print(SEP)
     print("整体统计（所有流合并）")
@@ -150,6 +150,7 @@ def print_overall(all_records: list[tuple]):
 # ---------------------------------------------------------------------------
 
 def main():
+    """按同名流文件对齐真值与推断结果并执行评估。"""
     parser = argparse.ArgumentParser(
         description="评估 infer_packets.py 的 header/data 推测准确性。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -162,9 +163,11 @@ def main():
     pred_dir = Path(args.pred_dir)
 
     if not gt_dir.is_dir():
-        print(f"错误：gt_dir 不存在：{gt_dir}", file=sys.stderr); sys.exit(1)
+        print(f"错误：gt_dir 不存在：{gt_dir}", file=sys.stderr)
+        sys.exit(1)
     if not pred_dir.is_dir():
-        print(f"错误：pred_dir 不存在：{pred_dir}", file=sys.stderr); sys.exit(1)
+        print(f"错误：pred_dir 不存在：{pred_dir}", file=sys.stderr)
+        sys.exit(1)
 
     gt_files   = {f.name for f in gt_dir.glob("*.tsv")}
     pred_files = {f.name for f in pred_dir.glob("*.tsv")}

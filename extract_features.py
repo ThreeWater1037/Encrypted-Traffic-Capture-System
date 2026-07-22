@@ -13,7 +13,6 @@ import logging
 import argparse
 import subprocess
 from pathlib import Path
-from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 
 logging.basicConfig(
@@ -37,6 +36,7 @@ TSHARK_CANDIDATES = [
 ]
 
 def find_tshark() -> str:
+    """按固定候选路径和 PATH 查找 TShark，找不到时立即报错。"""
     for p in TSHARK_CANDIDATES:
         if Path(p).is_file():
             return p
@@ -84,6 +84,7 @@ FlowKey = tuple[str, str, int, int, str]  # src_ip, dst_ip, src_port, dst_port, 
 
 @dataclass
 class FlowRecord:
+    """聚合同一双向五元组的时间、字节、包数、TLS 和 SNI 特征。"""
     src_ip:       str
     dst_ip:       str
     src_port:     int
@@ -99,6 +100,7 @@ class FlowRecord:
     _last_time:   float = field(default=0.0, repr=False)
 
     def update_time(self, ts: float):
+        """用新数据包时间更新流的起止时间。"""
         if self.start_time == 0.0:
             self.start_time = ts
         self._last_time = max(self._last_time, ts)
@@ -283,6 +285,7 @@ def filter_by_sni(flows: list[FlowRecord],
         normalized.append(s)
 
     def sni_matches(sni: str) -> bool:
+        """按完整域名或子域后缀匹配 SNI 白名单。"""
         sni = sni.lower()
         for suffix in normalized:
             if sni == suffix.lstrip(".") or sni.endswith(suffix):
@@ -344,6 +347,7 @@ def write_tsv(flows: list[FlowRecord], output: Path):
 
 
 def process_pcap(pcap: Path, output: Path, sni_suffixes: list[str]):
+    """完成单个 PCAP 的解析、流聚合、SNI 过滤和 TSV 输出。"""
     log.info("处理: %s", pcap)
     packets = run_tshark(pcap)
     log.info("  包数: %d", len(packets))
@@ -362,6 +366,7 @@ def process_pcap(pcap: Path, output: Path, sni_suffixes: list[str]):
 # ---------------------------------------------------------------------------
 
 def main():
+    """解析命令行参数，支持处理单个 PCAP 或递归处理目录。"""
     parser = argparse.ArgumentParser(
         description=(
             "从 pcap 文件提取每条流的特征，输出 TSV。\n"
