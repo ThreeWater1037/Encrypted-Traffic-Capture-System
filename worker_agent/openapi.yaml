@@ -1,0 +1,833 @@
+openapi: 3.0.3
+info:
+  title: Encrypted Traffic Capture Worker API
+  version: 1.0.0
+  description: |
+    子机器 Worker API。负责接收 URL 或 UTF-8 txt/TSV 文件，在本机串行执行浏览器抓取、
+    PCAP 捕获和后处理，并将结果保存在 `WORKER_DATA_DIR/tasks/{task_id}`。
+
+    除健康检查外，所有接口都需要 Bearer Token。所有响应均禁止 HTTP 缓存。
+servers:
+  - url: http://127.0.0.1:5100
+    description: 当前本机 Worker
+  - url: http://{workerHost}:5100
+    description: 局域网子机器
+    variables:
+      workerHost:
+        default: 192.168.1.100
+        description: 子机器 IP 地址
+tags:
+  - name: Worker
+    description: Worker 状态与能力
+  - name: Tasks
+    description: 实验任务
+security:
+  - bearerAuth: []
+paths:
+  /api/v1/health:
+    get:
+      tags: [Worker]
+      summary: 健康检查
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: Worker 正常
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: ok
+                worker_id: win-01
+                busy: false
+                active_task_id: null
+                queue_size: 0
+                queue_capacity: 10
+                task_counts:
+                  SUCCEEDED: 3
+                cache_enabled: false
+
+  /api/v1/capabilities:
+    get:
+      tags: [Worker]
+      summary: 查询子机器能力
+      operationId: getCapabilities
+      responses:
+        '200':
+          description: 操作系统、浏览器、抓包和分析能力
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilitiesResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/tasks:
+    post:
+      tags: [Tasks]
+      summary: 使用 JSON 创建任务
+      operationId: createTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskRequest'
+            example:
+              task_id: apifox-test-20260722-001
+              items:
+                - id: '1'
+                  name: LiuYunXi
+                  url: https://zh.wikipedia.org/wiki/钦东高速公路
+                - id: '2'
+                  name: Example
+                  url: https://example.com/
+              browsers: [chrome, edge]
+              pcap: true
+              analysis:
+                steps: [extract, classify, infer]
+                with_coframe: false
+                sni_suffixes: []
+      responses:
+        '202':
+          description: 新任务已进入本地队列
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskAcceptedResponse'
+        '200':
+          description: task_id 已存在，返回原任务且 duplicate=true
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskAcceptedResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/QueueFull'
+
+  /api/v1/tasks/from-file:
+    post:
+      tags: [Tasks]
+      summary: 上传 txt/TSV 创建任务
+      description: |
+        文件必须为 UTF-8 编码，每个有效行格式为：
+        `ID<TAB>名称<TAB>完整URL`。空行和以 `#` 开头的行会被忽略。
+
+        `browsers`、`analysis_steps` 和 `sni_suffixes` 使用逗号分隔；也接受 JSON 数组字符串。
+        不要手工覆盖 multipart boundary。
+      operationId: createTaskFromFile
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [task_id, file]
+              properties:
+                task_id:
+                  type: string
+                  pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+                  example: upload-20260722-001
+                file:
+                  type: string
+                  format: binary
+                  description: UTF-8 编码的 .txt 或 .tsv 文件
+                browsers:
+                  type: string
+                  default: chrome
+                  example: chrome,edge,firefox
+                pcap:
+                  type: boolean
+                  default: true
+                analysis_steps:
+                  type: string
+                  default: extract,classify,infer
+                  example: extract,classify,infer
+                with_coframe:
+                  type: boolean
+                  default: false
+                sni_suffixes:
+                  type: string
+                  description: 留空表示不过滤
+                  example: wikipedia.org,wikimedia.org
+            encoding:
+              file:
+                contentType: text/plain, text/tab-separated-values
+      responses:
+        '202':
+          description: 文件解析成功，新任务已进入队列
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileTaskAcceptedResponse'
+        '200':
+          description: task_id 已存在，返回原任务且 duplicate=true
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileTaskAcceptedResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '503':
+          $ref: '#/components/responses/QueueFull'
+
+  /api/v1/tasks/{task_id}:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      tags: [Tasks]
+      summary: 查询任务状态
+      description: 任务完成后，`items` 返回每个 URL 的状态；`result.units` 返回每个 URL 与浏览器组合的详情。
+      operationId: getTask
+      responses:
+        '200':
+          description: 任务状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskRecord'
+        '400':
+          $ref: '#/components/responses/InvalidTaskId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/tasks/{task_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Tasks]
+      summary: 取消任务
+      operationId: cancelTask
+      responses:
+        '200':
+          description: 取消请求已处理；终态任务会原样返回
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskRecord'
+        '400':
+          $ref: '#/components/responses/InvalidTaskId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/tasks/{task_id}/result:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      tags: [Tasks]
+      summary: 查询最终结果
+      operationId: getTaskResult
+      responses:
+        '200':
+          description: 最终结果与本地目录
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResultResponse'
+        '400':
+          $ref: '#/components/responses/InvalidTaskId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 任务尚未进入终态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotReadyError'
+
+  /api/v1/tasks/{task_id}/log:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      tags: [Tasks]
+      summary: 增量读取任务日志
+      operationId: getTaskLog
+      parameters:
+        - name: offset
+          in: query
+          description: 从该字节偏移开始读取
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          description: 单次最多读取 65536 字节
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 65536
+            default: 65536
+      responses:
+        '200':
+          description: 日志片段
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogResponse'
+        '400':
+          description: task_id 或分页参数无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Worker Token
+
+  parameters:
+    TaskId:
+      name: task_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+      example: upload-two-20260722-001
+
+  responses:
+    Unauthorized:
+      description: Bearer Token 无效或缺失
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: unauthorized
+            message: Worker Token 无效
+    ValidationError:
+      description: 输入参数或上传文件格式错误
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: validation_error
+            message: browsers 只允许 chrome、edge、firefox
+    InvalidTaskId:
+      description: task_id 格式错误
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: invalid_task_id
+    NotFound:
+      description: 任务不存在
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: not_found
+            message: 任务不存在
+    Conflict:
+      description: task_id 或任务目录冲突
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    QueueFull:
+      description: Worker 本地队列已满
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RequestTooLarge:
+      description: 请求体超过 MAX_CONTENT_LENGTH
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    BrowserName:
+      type: string
+      enum: [chrome, edge, firefox]
+
+    TaskLifecycleStatus:
+      type: string
+      enum:
+        - QUEUED
+        - PREPARING
+        - CAPTURING
+        - ANALYZING
+        - VALIDATING
+        - CANCELING
+        - SUCCEEDED
+        - PARTIAL
+        - FAILED
+        - CANCELED
+        - INTERRUPTED
+
+    ResultStatus:
+      type: string
+      enum: [SUCCEEDED, PARTIAL, FAILED]
+
+    AnalysisStep:
+      type: string
+      enum: [extract, classify, infer]
+
+    TaskItemInput:
+      type: object
+      additionalProperties: false
+      required: [id, name, url]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+          example: '1'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+          example: LiuYunXi
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+          pattern: '^https?://'
+          example: https://zh.wikipedia.org/wiki/钦东高速公路
+
+    AnalysisOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        steps:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/AnalysisStep'
+          default: [extract, classify, infer]
+        with_coframe:
+          type: boolean
+          default: false
+        sni_suffixes:
+          type: array
+          uniqueItems: true
+          description: 空数组表示不过滤 SNI
+          items:
+            type: string
+            maxLength: 253
+          example: [wikipedia.org, wikimedia.org]
+
+    TaskRequest:
+      type: object
+      additionalProperties: false
+      required: [task_id, items, browsers]
+      properties:
+        task_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+        items:
+          type: array
+          minItems: 1
+          maxItems: 10000
+          items:
+            $ref: '#/components/schemas/TaskItemInput'
+        browsers:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/BrowserName'
+        pcap:
+          type: boolean
+          default: true
+        analysis:
+          $ref: '#/components/schemas/AnalysisOptions'
+
+    BrowserStatus:
+      type: object
+      required: [browser, status]
+      properties:
+        browser:
+          $ref: '#/components/schemas/BrowserName'
+        status:
+          $ref: '#/components/schemas/ResultStatus'
+
+    TaskItemStatus:
+      type: object
+      required: [item_id, name, url, status, browser_statuses]
+      properties:
+        item_id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+        status:
+          $ref: '#/components/schemas/ResultStatus'
+        browser_statuses:
+          type: array
+          items:
+            $ref: '#/components/schemas/BrowserStatus'
+
+    ArtifactInfo:
+      type: object
+      nullable: true
+      properties:
+        path:
+          type: string
+          example: fetch_output/1-wiki-Example/capture_edge.pcap
+        kind:
+          type: string
+          enum: [file, directory]
+        size:
+          type: integer
+          format: int64
+          minimum: 0
+
+    UnitResult:
+      type: object
+      required: [item_id, name, url, browser, status, checks, artifacts]
+      properties:
+        item_id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+        browser:
+          $ref: '#/components/schemas/BrowserName'
+        status:
+          $ref: '#/components/schemas/ResultStatus'
+        checks:
+          type: object
+          additionalProperties:
+            type: boolean
+          example:
+            body: true
+            pcap: true
+            extract: true
+            classify: true
+            infer: true
+        artifacts:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ArtifactInfo'
+
+    StatusSummary:
+      type: object
+      required: [total, succeeded, partial, failed]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        succeeded:
+          type: integer
+          minimum: 0
+        partial:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+
+    TaskManifest:
+      type: object
+      required:
+        - task_id
+        - worker_id
+        - status
+        - summary
+        - item_summary
+        - items
+        - units
+        - storage
+      properties:
+        task_id:
+          type: string
+        worker_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/ResultStatus'
+        generated_at:
+          type: string
+          format: date-time
+        summary:
+          allOf:
+            - $ref: '#/components/schemas/StatusSummary'
+          description: URL 与浏览器组合的统计
+        item_summary:
+          allOf:
+            - $ref: '#/components/schemas/StatusSummary'
+          description: URL 级统计
+        cache_policy:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+              enum: [false]
+            fresh_browser_profile:
+              type: boolean
+            reuse_existing_results:
+              type: boolean
+            supported_browsers:
+              type: array
+              items:
+                $ref: '#/components/schemas/BrowserName'
+        process_errors:
+          type: array
+          items:
+            type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TaskItemStatus'
+        units:
+          type: array
+          items:
+            $ref: '#/components/schemas/UnitResult'
+        storage:
+          type: object
+          required: [task_dir, file_count, total_bytes]
+          properties:
+            task_dir:
+              type: string
+            file_count:
+              type: integer
+              minimum: 0
+            total_bytes:
+              type: integer
+              format: int64
+              minimum: 0
+
+    TaskRecord:
+      type: object
+      required: [task_id, status, cancel_requested, request, items]
+      properties:
+        task_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/TaskLifecycleStatus'
+        stage:
+          type: string
+          nullable: true
+        error:
+          type: string
+          nullable: true
+        pid:
+          type: integer
+          nullable: true
+        cancel_requested:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        updated_at:
+          type: string
+          format: date-time
+        request:
+          $ref: '#/components/schemas/TaskRequest'
+        result:
+          allOf:
+            - $ref: '#/components/schemas/TaskManifest'
+          nullable: true
+        items:
+          type: array
+          description: 未完成任务通常为空数组
+          items:
+            $ref: '#/components/schemas/TaskItemStatus'
+
+    TaskAcceptedResponse:
+      allOf:
+        - $ref: '#/components/schemas/TaskRecord'
+        - type: object
+          required: [duplicate, status_url]
+          properties:
+            duplicate:
+              type: boolean
+            status_url:
+              type: string
+              example: /api/v1/tasks/apifox-test-20260722-001
+
+    FileTaskAcceptedResponse:
+      allOf:
+        - $ref: '#/components/schemas/TaskAcceptedResponse'
+        - type: object
+          required: [source_filename, item_count]
+          properties:
+            source_filename:
+              type: string
+              example: urls.txt
+            item_count:
+              type: integer
+              minimum: 1
+
+    TaskResultResponse:
+      type: object
+      required: [task_id, status, items, result, local_result_dir]
+      properties:
+        task_id:
+          type: string
+        status:
+          type: string
+          enum: [SUCCEEDED, PARTIAL, FAILED, CANCELED, INTERRUPTED]
+        error:
+          type: string
+          nullable: true
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TaskItemStatus'
+        result:
+          allOf:
+            - $ref: '#/components/schemas/TaskManifest'
+          nullable: true
+        local_result_dir:
+          type: string
+          example: tasks/upload-two-20260722-001
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - worker_id
+        - busy
+        - queue_size
+        - queue_capacity
+        - task_counts
+        - cache_enabled
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        worker_id:
+          type: string
+        busy:
+          type: boolean
+        active_task_id:
+          type: string
+          nullable: true
+        queue_size:
+          type: integer
+          minimum: 0
+        queue_capacity:
+          type: integer
+          minimum: 1
+        task_counts:
+          type: object
+          additionalProperties:
+            type: integer
+        cache_enabled:
+          type: boolean
+          enum: [false]
+
+    BrowserCapability:
+      type: object
+      required: [name, path, no_cache_verified]
+      properties:
+        name:
+          $ref: '#/components/schemas/BrowserName'
+        path:
+          type: string
+        no_cache_verified:
+          type: boolean
+
+    CapabilitiesResponse:
+      type: object
+      required: [worker_id, os, architecture, python, browsers, capture, analysis, input, cache_policy]
+      properties:
+        worker_id:
+          type: string
+        os:
+          type: string
+        os_version:
+          type: string
+        architecture:
+          type: string
+        python:
+          type: object
+          additionalProperties: true
+        browsers:
+          type: array
+          items:
+            $ref: '#/components/schemas/BrowserCapability'
+        capture:
+          type: object
+          additionalProperties: true
+        analysis:
+          type: object
+          additionalProperties: true
+        input:
+          type: object
+          additionalProperties: true
+        cache_policy:
+          type: object
+          additionalProperties: true
+
+    LogResponse:
+      type: object
+      required: [task_id, text, next_offset, eof]
+      properties:
+        task_id:
+          type: string
+        text:
+          type: string
+        next_offset:
+          type: integer
+          minimum: 0
+        eof:
+          type: boolean
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+
+    NotReadyError:
+      type: object
+      required: [error, status, stage]
+      properties:
+        error:
+          type: string
+          enum: [not_ready]
+        status:
+          $ref: '#/components/schemas/TaskLifecycleStatus'
+        stage:
+          type: string

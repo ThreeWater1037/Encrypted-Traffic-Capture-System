@@ -38,6 +38,7 @@ TSHARK_CANDIDATES = [
 ]
 
 def find_tshark() -> str:
+    """定位只读取明文 TLS record 元数据所需的 TShark。"""
     for p in TSHARK_CANDIDATES:
         if Path(p).is_file():
             return p
@@ -126,6 +127,7 @@ def run_tshark(pcap: Path) -> list[dict]:
 FlowKey = tuple[str, str, str, str]  # src_ip, dst_ip, src_port, dst_port
 
 def read_flow_tsv(tsv_path: Path) -> dict[FlowKey, dict]:
+    """读取 extract 阶段的双向流表并建立五元组索引。"""
     flows: dict[FlowKey, dict] = {}
     with tsv_path.open(encoding="utf-8") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
@@ -360,6 +362,7 @@ def infer_packet(
 # ---------------------------------------------------------------------------
 
 def process(pcap: Path, flow_tsv: Path, output_dir: Path, with_ctrl: bool = False):
+    """在不解密负载的前提下推断包类别，并按流写入结果目录。"""
     flow_meta = read_flow_tsv(flow_tsv)
     if not flow_meta:
         log.error("capture_chrome.tsv 中未找到有效流记录，退出")
@@ -409,7 +412,11 @@ def process(pcap: Path, flow_tsv: Path, output_dir: Path, with_ctrl: bool = Fals
 
         # 一个包可能含多条 TLS record → occurrence=a 给出逗号分隔值
         raw_ct_list      = [t.strip() for t in pkt["tls.record.content_type"].split(",") if t.strip()]
-        raw_rec_len_list = [l.strip() for l in pkt["tls.record.length"].split(",")       if l.strip()]
+        raw_rec_len_list = [
+            length.strip()
+            for length in pkt["tls.record.length"].split(",")
+            if length.strip()
+        ]
 
         inferred = infer_packet(
             raw_ct_list, raw_rec_len_list,
@@ -470,6 +477,7 @@ def process(pcap: Path, flow_tsv: Path, output_dir: Path, with_ctrl: bool = Fals
 # ---------------------------------------------------------------------------
 
 def main():
+    """解析命令行参数并执行密文侧包类型推断。"""
     parser = argparse.ArgumentParser(
         description=(
             "对 capture_chrome.tsv 中的每条流，不解密密文流量，\n"
@@ -592,12 +600,14 @@ def main():
 
     pcap = Path(args.pcap)
     if not pcap.exists():
-        log.error("pcap 不存在：%s", pcap); sys.exit(1)
+        log.error("pcap 不存在：%s", pcap)
+        sys.exit(1)
 
     flow_tsv = (Path(args.flow_tsv) if args.flow_tsv
                 else pcap.parent / f"{pcap.stem}.tsv")
     if not flow_tsv.exists():
-        log.error("flow-tsv 不存在：%s", flow_tsv); sys.exit(1)
+        log.error("flow-tsv 不存在：%s", flow_tsv)
+        sys.exit(1)
 
     output_dir = (Path(args.output_dir) if args.output_dir
                   else pcap.parent / f"{pcap.stem}_inferred")
