@@ -25,35 +25,52 @@ Worker 服务与采集脚本可以使用不同 Python。Worker 服务环境安�
 python -m pip install -r requirements-worker.txt
 ```
 
-`PYTHON_EXECUTABLE` 指向已经安装 Selenium、webdriver-manager 等采集依赖的
-解释器，例如：
+采集解释器还需要安装 Selenium 和 webdriver-manager：
 
 ```powershell
-$env:PYTHON_EXECUTABLE='D:\Anaconda\envs\encrypted-traffic\python.exe'
+python -m pip install selenium webdriver-manager
 ```
 
-## Windows 启动示例
+## YAML 配置（推荐）
+
+Worker 默认读取项目根目录的 `worker.yaml`：
 
 ```powershell
-$env:WORKER_ID='win-01'
-$env:WORKER_HOST='0.0.0.0'
-$env:WORKER_PORT='5100'
-$env:WORKER_TOKEN='请替换为随机长字符串'
-$env:PROJECT_ROOT='D:\Project\Encrypted Traffic Capture System'
-$env:PYTHON_EXECUTABLE='D:\Anaconda\envs\encrypted-traffic\python.exe'
-$env:WORKER_DATA_DIR='D:\TrafficCaptureWorker\data'
+Copy-Item worker.yaml.example worker.yaml
+notepad worker.yaml
 
 python -m worker_agent
 ```
 
-Worker 与实际采集程序共用浏览器自动发现逻辑，依次检查环境变量、PATH、Windows
-App Paths 注册表以及 Program Files/LocalAppData 等安装目录。通常无需为不同子机器
-修改代码。便携版或特殊安装位置可以显式覆盖：
+完整字段见根目录的 [`worker.yaml.example`](../worker.yaml.example)。真实
+`worker.yaml` 包含 Token，已被 `.gitignore` 忽略。相对路径以 YAML 文件所在目录为
+基准；`python_executable` 留空时使用启动 Worker 的解释器。
+
+配置优先级为：
+
+```text
+环境变量 > worker.yaml > 程序默认值
+```
+
+自定义配置文件位置：
 
 ```powershell
-$env:CHROME_BINARY='E:\Browsers\Chrome\chrome.exe'
-$env:EDGE_BINARY='E:\Browsers\Edge\msedge.exe'
-$env:FIREFOX_BINARY='E:\Browsers\Firefox\firefox.exe'
+$env:WORKER_CONFIG_FILE='D:\WorkerConfig\worker.yaml'
+python -m worker_agent
+```
+
+原有 `WORKER_ID`、`WORKER_HOST`、`WORKER_TOKEN`、`PYTHON_EXECUTABLE` 等环境
+变量继续兼容，适合临时覆盖或由系统服务注入，不再要求日常启动时逐项设置。
+
+Worker 与实际采集程序共用浏览器自动发现逻辑，依次检查环境变量、PATH、Windows
+App Paths 注册表以及 Program Files/LocalAppData 等安装目录。通常无需为不同子机器
+修改代码。便携版或特殊安装位置可以在 YAML 的 `browsers` 分区填写绝对路径：
+
+```yaml
+browsers:
+  chrome_binary: E:/Browsers/Chrome/chrome.exe
+  edge_binary: E:/Browsers/Edge/msedge.exe
+  firefox_binary: E:/Browsers/Firefox/firefox.exe
 ```
 
 安装 `waitress` 后会自动使用 Waitress；没有安装时仅为方便本机调试而回退到

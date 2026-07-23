@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from master_server.app import create_app
@@ -63,6 +64,7 @@ class MasterServerTests(unittest.TestCase):
             token="",
             data_dir=Path(self.temp_dir.name),
             poll_interval=0.01,
+            bootstrap_worker_enabled=True,
             bootstrap_worker_token="test-worker-token",
         )
         self.config.prepare()
@@ -143,6 +145,21 @@ class MasterServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["deleted"])
         self.assertIsNone(self.store.get_machine("unused-worker"))
+
+    def test_deleted_local_machine_is_not_recreated_when_bootstrap_is_disabled(self):
+        self.store.delete_machine("worker-local")
+        disabled_config = replace(
+            self.config,
+            bootstrap_worker_enabled=False,
+        )
+
+        create_app(
+            disabled_config,
+            store=self.store,
+            dispatcher=self.dispatcher,
+        )
+
+        self.assertIsNone(self.store.get_machine("worker-local"))
 
     def test_delete_machine_with_experiments_is_rejected(self):
         self.store.create_job(self.payload("machine-delete-guard-001"))

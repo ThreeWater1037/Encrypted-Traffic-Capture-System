@@ -14,7 +14,10 @@ def main() -> None:
     app = create_app(config)
     if not config.token and config.host not in {"127.0.0.1", "localhost", "::1"}:
         print("WARNING: 主控对外监听但未设置 MASTER_TOKEN。", file=sys.stderr)
-    if config.bootstrap_worker_token == "dev-worker-token":
+    if (
+        config.bootstrap_worker_enabled
+        and config.bootstrap_worker_token == "dev-worker-token"
+    ):
         print(
             "WARNING: 本机 Worker 使用默认 Token；请确保 Worker 与主控配置一致。",
             file=sys.stderr,

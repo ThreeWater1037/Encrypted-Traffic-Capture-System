@@ -7,3 +7,5 @@ docs
 urls.txt
 worker_data/
 master_data/
+worker.yaml
+worker.yml

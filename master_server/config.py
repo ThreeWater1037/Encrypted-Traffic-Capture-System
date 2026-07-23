@@ -33,6 +33,19 @@ def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
     return value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """读取布尔环境变量，避免把任意非空字符串都误判为启用。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} 必须是 true 或 false")
+
+
 @dataclass(frozen=True)
 class MasterConfig:
     """主控不可变运行配置。"""
@@ -50,6 +63,7 @@ class MasterConfig:
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     )
+    bootstrap_worker_enabled: bool = False
     bootstrap_worker_id: str = "worker-local"
     bootstrap_worker_name: str = "本机 Worker"
     bootstrap_worker_url: str = "http://127.0.0.1:5100"
@@ -86,6 +100,7 @@ class MasterConfig:
                 ).split(",")
                 if value.strip()
             ),
+            bootstrap_worker_enabled=_env_bool("BOOTSTRAP_LOCAL_WORKER", False),
             bootstrap_worker_id=os.getenv("LOCAL_WORKER_ID", "worker-local"),
             bootstrap_worker_name=os.getenv("LOCAL_WORKER_NAME", "本机 Worker"),
             bootstrap_worker_url=os.getenv(

@@ -1,0 +1,30 @@
+# 复制为 worker.yaml 后修改。worker.yaml 包含 Token，已被 .gitignore 忽略。
+worker:
+  id: win-worker-01
+  host: 0.0.0.0
+  port: 5100
+  token: "replace-with-a-long-random-token"
+
+# 相对路径以 worker.yaml 所在目录为基准。
+# python_executable 留空时使用启动 Worker 的 Python 解释器。
+paths:
+  project_root: .
+  python_executable:
+  data_dir: ./worker_data
+
+limits:
+  max_queue_size: 10
+  max_items: 10000
+  task_timeout_seconds: 21600
+  max_content_length: 20971520
+
+cors:
+  allowed_origins:
+    - http://localhost:5173
+    - http://127.0.0.1:5173
+
+# 通常留空即可自动发现。只有便携版或特殊安装位置才填写绝对路径。
+browsers:
+  chrome_binary:
+  edge_binary:
+  firefox_binary:

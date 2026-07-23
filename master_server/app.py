@@ -125,16 +125,17 @@ def create_app(
     master_config = config or MasterConfig.from_env()
     master_config.prepare()
     master_store = store or MasterStore(master_config.database_path)
-    # 本机 Worker 由环境变量声明，每次启动同步连接配置；其他机器记录保持不变。
-    master_store.upsert_machine(
-        {
-            "machine_id": master_config.bootstrap_worker_id,
-            "name": master_config.bootstrap_worker_name,
-            "base_url": master_config.bootstrap_worker_url.rstrip("/"),
-            "token": master_config.bootstrap_worker_token,
-            "enabled": True,
-        }
-    )
+    # 自动注册仅用于显式启用的本机联调；默认尊重数据库中的新增、编辑和删除结果。
+    if master_config.bootstrap_worker_enabled:
+        master_store.upsert_machine(
+            {
+                "machine_id": master_config.bootstrap_worker_id,
+                "name": master_config.bootstrap_worker_name,
+                "base_url": master_config.bootstrap_worker_url.rstrip("/"),
+                "token": master_config.bootstrap_worker_token,
+                "enabled": True,
+            }
+        )
     job_dispatcher = dispatcher or JobDispatcher(master_config, master_store)
 
     app = Flask(__name__)
