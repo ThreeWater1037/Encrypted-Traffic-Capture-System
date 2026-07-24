@@ -1,0 +1,30 @@
+# 主控 Flask 监听配置。迁移到其他机器后，如需远程访问可将 host 改为 0.0.0.0。
+server:
+  host: 127.0.0.1
+  port: 5200
+  token: ""
+
+# 相对路径以 master.yaml 所在目录为基准。
+paths:
+  data_dir: ./master_data
+
+limits:
+  max_content_length: 20971520
+  max_items: 10000
+  max_queue_size: 100
+  worker_request_timeout: 15
+  poll_interval: 2
+
+cors:
+  allowed_origins:
+    - http://localhost:5173
+    - http://127.0.0.1:5173
+
+# 默认关闭，由“机器管理”页面维护全部机器。
+# 仅在需要本机联调时启用；token 必须与本机 worker.yaml 一致。
+bootstrap_worker:
+  enabled: false
+  id: worker-local
+  name: 本机 Worker
+  url: http://127.0.0.1:5100
+  token: "replace-with-the-worker-token"

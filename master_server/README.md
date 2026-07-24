@@ -17,22 +17,35 @@ Worker，并把结果聚合到 `URL × 机器 × 浏览器` 粒度。PCAP、HTML
 ```powershell
 python -m pip install -r requirements-master.txt
 
-$env:MASTER_HOST='127.0.0.1'
-$env:MASTER_PORT='5200'
-$env:MASTER_DATA_DIR='D:\TrafficCaptureMaster\data'
-$env:BOOTSTRAP_LOCAL_WORKER='true'
-$env:LOCAL_WORKER_URL='http://127.0.0.1:5100'
-$env:LOCAL_WORKER_TOKEN='与 Worker 相同的 Token'
+Copy-Item master.yaml.example master.yaml
+notepad master.yaml
 
 python -m master_server
 ```
 
-`BOOTSTRAP_LOCAL_WORKER` 默认为 `false`，此时机器完全由“机器管理”页面维护，删除后
-重启主控也不会重新出现。只有设为 `true` 时，主控才会在每次启动时自动注册或更新
-`LOCAL_WORKER_ID` 对应的本机 Worker。
+主控默认读取项目根目录的 `master.yaml`，完整字段见根目录的
+[`master.yaml.example`](../master.yaml.example)。真实配置可能包含主控 Token 和
+Worker Token，已被 `.gitignore` 忽略。相对路径以 YAML 文件所在目录为基准。
 
-如果 Worker 和主控从同一个 PowerShell 窗口启动，也可以只设置一次
-`WORKER_TOKEN`；启用本机自动注册后，主控在未设置 `LOCAL_WORKER_TOKEN` 时会继承它。
+配置优先级为：
+
+```text
+环境变量 > master.yaml > 程序默认值
+```
+
+如需从其他位置读取配置：
+
+```powershell
+$env:MASTER_CONFIG_FILE='D:\MasterConfig\master.yaml'
+python -m master_server
+```
+
+原有 `MASTER_HOST`、`MASTER_PORT`、`MASTER_DATA_DIR`、`LOCAL_WORKER_TOKEN` 等
+环境变量继续兼容，适合临时覆盖或由系统服务注入。
+
+`bootstrap_worker.enabled` 默认为 `false`，此时机器完全由“机器管理”页面维护，删除后
+重启主控也不会重新出现。只有设为 `true` 时，主控才会在每次启动时自动注册或更新
+`bootstrap_worker.id` 对应的本机 Worker，其 Token 必须与本机 `worker.yaml` 一致。
 
 本机调试时可以不设置 `MASTER_TOKEN`。主控迁移到其他机器并对外监听时，应设置
 随机 `MASTER_TOKEN`，同时在前端 `.env.local` 中配置：
@@ -42,11 +55,11 @@ VITE_MASTER_API=http://主控IP:5200/api/v1
 VITE_MASTER_TOKEN=与主控相同的Token
 ```
 
-主控数据库和上传原文件分别位于：
+主控数据库和上传原文件位于 `paths.data_dir` 指定的目录：
 
 ```text
-MASTER_DATA_DIR/master.db
-MASTER_DATA_DIR/uploads/{job_id}/
+paths.data_dir/master.db
+paths.data_dir/uploads/{job_id}/
 ```
 
 ## 启动顺序

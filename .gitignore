@@ -9,3 +9,5 @@ worker_data/
 master_data/
 worker.yaml
 worker.yml
+master.yaml
+master.yml
