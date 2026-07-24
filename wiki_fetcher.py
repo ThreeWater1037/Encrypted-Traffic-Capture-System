@@ -11,6 +11,7 @@
 """
 
 import os
+import platform
 import time
 import signal
 import hashlib
@@ -138,7 +139,19 @@ class PacketCapture:
     )
     # tshark pseudo-sources that are not real interfaces
     _SKIP_IFACE_NAMES = {
-        "ciscodump", "etwdump", "randpkt", "sshdump", "udpdump", "wifidump",
+        "bluetooth-monitor",
+        "ciscodump",
+        "dbus-session",
+        "dbus-system",
+        "dpauxmon",
+        "etwdump",
+        "nflog",
+        "nfqueue",
+        "randpkt",
+        "sdjournal",
+        "sshdump",
+        "udpdump",
+        "wifidump",
     }
 
     @classmethod
@@ -148,6 +161,12 @@ class PacketCapture:
         Keeps Wi-Fi (en0), Ethernet (en*), and Loopback (lo0).
         Skips tunnel/virtual adapters that can't be opened without root.
         """
+        # Linux 的特殊接口 any 已覆盖全部实体接口。WSL 镜像网络会额外暴露多个
+        # eth*、nflog、DBus 和 extcap 伪接口；逐一传给 TShark 时，只要其中一个
+        # 无法打开，整个抓包进程就可能立即退出并留下空 PCAP。
+        if platform.system().lower() == "linux":
+            return ["any"]
+
         try:
             out = subprocess.check_output(
                 [binary, "-D"],
@@ -177,6 +196,8 @@ class PacketCapture:
     @staticmethod
     def _default_iface_tcpdump() -> Optional[str]:
         """Detect the primary outbound interface on macOS via netstat."""
+        if platform.system().lower() == "linux":
+            return "any"
         try:
             out = subprocess.check_output(
                 ["route", "-n", "get", "default"], stderr=subprocess.DEVNULL, text=True
@@ -207,13 +228,22 @@ class PacketCapture:
 
         popen_kwargs = {
             "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
+            # 继承父进程的 stderr。Worker 已把父进程输出写入 worker.log，
+            # 因此接口或权限错误会直接出现在任务日志中，且不会产生管道阻塞。
+            "stderr": None,
         }
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         self._proc = subprocess.Popen(cmd, **popen_kwargs)
         # Wait for sniffer to open BPF handles and start capturing
         time.sleep(1.2)
+        return_code = self._proc.poll()
+        if return_code is not None:
+            log.warning(
+                "  %s exited before capture started (code=%s); see error output above.",
+                self._tool,
+                return_code,
+            )
 
     def stop(self) -> Optional[Path]:
         """刷新并可靠关闭抓包进程，返回非空 PCAP 路径。"""
@@ -224,11 +254,19 @@ class PacketCapture:
         time.sleep(0.5)
         # Ask the sniffer to flush write buffers, then guarantee termination.
         try:
-            if os.name == "nt":
-                self._proc.send_signal(signal.CTRL_BREAK_EVENT)
+            return_code = self._proc.poll()
+            if return_code is None:
+                if os.name == "nt":
+                    self._proc.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    self._proc.send_signal(signal.SIGINT)
+                self._proc.wait(timeout=10)
             else:
-                self._proc.send_signal(signal.SIGINT)
-            self._proc.wait(timeout=10)
+                log.warning(
+                    "  %s capture process exited early (code=%s).",
+                    self._tool,
+                    return_code,
+                )
         except subprocess.TimeoutExpired:
             self._proc.kill()
             self._proc.wait()

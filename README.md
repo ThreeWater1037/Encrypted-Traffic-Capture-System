@@ -33,6 +33,10 @@ Worker 默认读取项目根目录的 `worker.yaml`。仓库只提交 `worker.ya
 真实配置包含 Token，已被 `.gitignore` 忽略。原有环境变量继续兼容，并且优先级高于
 YAML，适合临时覆盖或由操作系统服务管理器注入。
 
+主控采用相同方式，默认读取根目录的 `master.yaml`。首次使用时执行
+`Copy-Item master.yaml.example master.yaml`，再按部署机器修改监听地址、数据目录、
+跨域来源和可选的本机 Worker 自动注册配置。
+
 ## 2. 所有操作系统的共同前提
 
 每台子机器需要：
@@ -294,6 +298,8 @@ cd "$PROJECT_ROOT"
 ### 4.4 Linux 特有说明
 
 - 浏览器通常从 PATH 或 `/usr/bin` 自动发现。
+- Linux/WSL 抓包固定使用 TShark 的 `any` 接口，覆盖全部实体接口并避开
+  `nflog`、DBus、蓝牙监控等不可用伪接口。
 - PCAP 权限应通过发行版提供的 `dumpcap` 权限或 `wireshark` 用户组配置，不建议长期以 root 运行整个 Worker。
 - 无桌面服务器需要额外提供可运行的浏览器环境；当前实现不是纯 HTTP 抓取器。
 - 使用 UFW 时可只允许主控访问：
