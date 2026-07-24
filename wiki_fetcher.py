@@ -161,21 +161,40 @@ class PacketCapture:
         Keeps Wi-Fi (en0), Ethernet (en*), and Loopback (lo0).
         Skips tunnel/virtual adapters that can't be opened without root.
         """
+        system = platform.system().lower()
+
         # Linux 的特殊接口 any 已覆盖全部实体接口。WSL 镜像网络会额外暴露多个
         # eth*、nflog、DBus 和 extcap 伪接口；逐一传给 TShark 时，只要其中一个
         # 无法打开，整个抓包进程就可能立即退出并留下空 PCAP。
-        if platform.system().lower() == "linux":
+        if system == "linux":
             return ["any"]
 
-        try:
-            out = subprocess.check_output(
-                [binary, "-D"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
-            )
+        # Windows 首次启动 TShark/Npcap 可能较慢，因此延长超时并重试一次。
+        # macOS 通常无需重试，同时仍保留 en0/lo0 作为该平台的安全回退。
+        attempts = 2 if system == "windows" else 1
+        last_error = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                out = subprocess.check_output(
+                    [binary, "-D"],
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=15,
+                )
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                log.warning(
+                    "  tshark interface detection failed (%s/%s): %s",
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    time.sleep(0.5)
+                continue
+
             ifaces = []
             for line in out.splitlines():
                 # Format: "2. en0 (Wi-Fi)" or "22. lo0 (Loopback)"
@@ -189,9 +208,32 @@ class PacketCapture:
                 if any(name.startswith(p) for p in cls._SKIP_IFACE_PREFIXES):
                     continue
                 ifaces.append(name)
-            return ifaces or ["en0", "lo0"]
-        except Exception:
+
+            if ifaces:
+                return ifaces
+
+            last_error = "tshark -D returned no usable capture interfaces"
+            log.warning(
+                "  tshark interface detection failed (%s/%s): %s",
+                attempt,
+                attempts,
+                last_error,
+            )
+            if attempt < attempts:
+                time.sleep(0.5)
+
+        if system == "darwin":
+            log.warning(
+                "  tshark interface detection failed on macOS; "
+                "falling back to en0 and lo0."
+            )
             return ["en0", "lo0"]
+
+        # Windows 绝不能回退到 macOS 的 en0/lo0，否则会生成空 PCAP。
+        raise RuntimeError(
+            f"tshark interface detection failed on {platform.system()} "
+            f"after {attempts} attempt(s): {last_error}"
+        )
 
     @staticmethod
     def _default_iface_tcpdump() -> Optional[str]:
@@ -221,7 +263,13 @@ class PacketCapture:
             return
 
         self._tool, binary = result
-        cmd = self._build_cmd(self._tool, binary)
+        try:
+            cmd = self._build_cmd(self._tool, binary)
+        except RuntimeError as exc:
+            # 接口探测失败时保留网页抓取结果，但明确跳过 PCAP，任务会标记为部分成功。
+            log.error("  pcap capture skipped: %s", exc)
+            self._tool = None
+            return
 
         log.info("  pcap capture starting (%s) → %s", self._tool, self.pcap_path)
         log.debug("  cmd: %s", " ".join(cmd))

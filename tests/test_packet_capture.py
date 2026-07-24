@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -44,6 +45,65 @@ class PacketCaptureTests(unittest.TestCase):
                 str(pcap_path),
             ],
         )
+
+    def test_windows_tshark_retries_after_timeout(self) -> None:
+        tshark_output = (
+            "1. \\Device\\NPF_{ONE} (Ethernet)\n"
+            "2. \\Device\\NPF_{TWO} (Wi-Fi)\n"
+            "3. ciscodump (Cisco remote capture)\n"
+        )
+        with (
+            patch("wiki_fetcher.platform.system", return_value="Windows"),
+            patch(
+                "wiki_fetcher.subprocess.check_output",
+                side_effect=[
+                    subprocess.TimeoutExpired("tshark -D", 15),
+                    tshark_output,
+                ],
+            ) as check_output,
+            patch("wiki_fetcher.time.sleep") as sleep,
+        ):
+            interfaces = PacketCapture._list_interfaces_tshark(
+                r"C:\Program Files\Wireshark\tshark.exe"
+            )
+
+        self.assertEqual(
+            interfaces,
+            [r"\Device\NPF_{ONE}", r"\Device\NPF_{TWO}"],
+        )
+        self.assertEqual(check_output.call_count, 2)
+        sleep.assert_called_once_with(0.5)
+        self.assertEqual(check_output.call_args.kwargs["timeout"], 15)
+
+    def test_windows_tshark_failure_never_uses_macos_interfaces(self) -> None:
+        with (
+            patch("wiki_fetcher.platform.system", return_value="Windows"),
+            patch(
+                "wiki_fetcher.subprocess.check_output",
+                side_effect=subprocess.TimeoutExpired("tshark -D", 15),
+            ) as check_output,
+            patch("wiki_fetcher.time.sleep"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "tshark interface detection failed on Windows",
+            ):
+                PacketCapture._list_interfaces_tshark(
+                    r"C:\Program Files\Wireshark\tshark.exe"
+                )
+
+        self.assertEqual(check_output.call_count, 2)
+
+    def test_macos_tshark_keeps_platform_specific_fallback(self) -> None:
+        with (
+            patch("wiki_fetcher.platform.system", return_value="Darwin"),
+            patch("wiki_fetcher.subprocess.check_output", return_value=""),
+        ):
+            interfaces = PacketCapture._list_interfaces_tshark(
+                "/Applications/Wireshark.app/Contents/MacOS/tshark"
+            )
+
+        self.assertEqual(interfaces, ["en0", "lo0"])
 
     def test_tshark_errors_are_inherited_and_early_exit_is_logged(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
