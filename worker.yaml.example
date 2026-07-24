@@ -28,3 +28,8 @@ browsers:
   chrome_binary:
   edge_binary:
   firefox_binary:
+
+# WSL/Linux 浏览器不会自动继承 Windows 系统代理。需要访问受限站点时填写代理，
+# 例如 http://<Windows 主机在 WSL 中的地址>:7890；不需要代理时留空。
+network:
+  proxy_url:

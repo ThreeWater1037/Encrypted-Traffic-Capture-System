@@ -43,6 +43,8 @@ cors:
     - http://localhost:5173
 browsers:
   chrome_binary: ./portable/chrome.exe
+network:
+  proxy_url: http://127.0.0.1:7890
 """.strip(),
             encoding="utf-8",
         )
@@ -62,6 +64,7 @@ browsers:
             self.assertEqual(config.data_dir, (self.root / "runtime").resolve())
             self.assertEqual(config.max_queue_size, 3)
             self.assertEqual(config.allowed_origins, ("http://localhost:5173",))
+            self.assertEqual(config.proxy_url, "http://127.0.0.1:7890")
             self.assertEqual(
                 os.environ["CHROME_BINARY"],
                 str((self.root / "portable" / "chrome.exe").resolve()),
@@ -77,6 +80,7 @@ browsers:
                 "WORKER_PORT": "5120",
                 "WORKER_TOKEN": "env-token",
                 "MAX_QUEUE_SIZE": "8",
+                "WORKER_PROXY_URL": "socks5://127.0.0.1:1080",
             },
             clear=True,
         ):
@@ -85,6 +89,7 @@ browsers:
             self.assertEqual(config.port, 5120)
             self.assertEqual(config.token, "env-token")
             self.assertEqual(config.max_queue_size, 8)
+            self.assertEqual(config.proxy_url, "socks5://127.0.0.1:1080")
 
     def test_unquoted_numeric_token_is_rejected(self) -> None:
         self.write_config(token="111")
@@ -107,6 +112,19 @@ browsers:
             clear=True,
         ):
             with self.assertRaisesRegex(ValueError, "未知字段"):
+                WorkerConfig.from_env()
+
+    def test_invalid_proxy_url_is_rejected(self) -> None:
+        self.write_config()
+        with patch.dict(
+            os.environ,
+            {
+                "WORKER_CONFIG_FILE": str(self.config_path),
+                "WORKER_PROXY_URL": "http://127.0.0.1",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "主机和端口"):
                 WorkerConfig.from_env()
 
 

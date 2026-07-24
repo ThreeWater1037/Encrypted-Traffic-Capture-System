@@ -105,6 +105,15 @@ paths:
 `python_executable` 留空时使用启动 Worker 的 Python。相对路径以 `worker.yaml`
 所在目录为基准。需要把配置放在其他位置时设置 `WORKER_CONFIG_FILE`。
 
+WSL/Linux 中的浏览器需要显式使用代理时，在同一文件中增加：
+
+```yaml
+network:
+  proxy_url: http://<代理主机>:<端口>
+```
+
+该配置会同时注入 Chrome、Edge 和 Firefox；支持 `http`、`socks4`、`socks5`。
+
 ## 3. Windows 子机器
 
 ### 3.1 安装系统依赖

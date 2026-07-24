@@ -78,6 +78,15 @@ class WorkerAgentApiTests(unittest.TestCase):
         self.assertEqual(response.get_json()["error"], "unauthorized")
         self.assertIn("no-store", response.headers["Cache-Control"])
 
+    def test_capabilities_report_browser_proxy_configuration(self) -> None:
+        response = self.client.get("/api/v1/capabilities", headers=self.auth)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["network"]["browser_proxy_configured"],
+            False,
+        )
+
     def test_submit_is_queued_and_idempotent(self) -> None:
         first = self.client.post(
             "/api/v1/tasks", json=self.payload(), headers=self.auth

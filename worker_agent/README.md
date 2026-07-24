@@ -73,6 +73,23 @@ browsers:
   firefox_binary: E:/Browsers/Firefox/firefox.exe
 ```
 
+### WSL/Linux 浏览器代理
+
+WSL 中的 Linux 浏览器不会可靠继承 Windows 系统代理，也不会自动使用终端里的
+`HTTPS_PROXY`。访问维基百科等需要代理的站点时，在 `worker.yaml` 中显式设置：
+
+```yaml
+network:
+  proxy_url: http://<Windows 主机在 WSL 中的地址>:7890
+```
+
+支持 `http`、`socks4` 和 `socks5`，必须填写端口。也可以用环境变量
+`WORKER_PROXY_URL` 临时覆盖。代理程序需要允许来自 WSL 的连接；除非 WSL
+镜像网络已经验证可用，否则不要默认把 Windows 代理写成 `127.0.0.1`。
+
+配置只注入实验浏览器，不会改变主控访问 Worker API 的网络路径。Chrome、Edge 和
+Firefox 仍然为每次实验创建全新无缓存 Profile。修改后需要重启 Worker。
+
 安装 `waitress` 后会自动使用 Waitress；没有安装时仅为方便本机调试而回退到
 Flask 开发服务器。多机使用时，应在防火墙中只允许主控机访问 5100 端口。
 

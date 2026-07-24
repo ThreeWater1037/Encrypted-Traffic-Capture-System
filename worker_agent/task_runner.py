@@ -355,6 +355,11 @@ class TaskManager:
         environment["PYTHONUNBUFFERED"] = "1"
         environment["PYTHONUTF8"] = "1"
         environment["PYTHONIOENCODING"] = "utf-8"
+        # 浏览器代理只传给采集子进程使用，不改变主控访问 Worker 的网络路径。
+        if self.config.proxy_url:
+            environment["BROWSER_PROXY_URL"] = self.config.proxy_url
+        else:
+            environment.pop("BROWSER_PROXY_URL", None)
         # webdriver-manager 的驱动二进制属于运行依赖，不是网页实验缓存。
         # 固定放到 WORKER_DATA_DIR/.wdm，避免服务账户无法写用户主目录。
         environment.pop("WDM_LOCAL", None)

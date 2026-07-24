@@ -14,6 +14,8 @@ from typing import Any
 
 import yaml
 
+from browser_proxy import parse_browser_proxy
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "worker.yaml"
@@ -29,6 +31,7 @@ _SCHEMA = {
     },
     "cors": {"allowed_origins"},
     "browsers": {"chrome_binary", "edge_binary", "firefox_binary"},
+    "network": {"proxy_url"},
 }
 
 
@@ -164,6 +167,7 @@ class WorkerConfig:
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     )
+    proxy_url: str | None = None
     config_file: Path | None = None
 
     @property
@@ -209,6 +213,15 @@ class WorkerConfig:
             base_dir=base_dir,
         )
         _apply_browser_paths(settings, base_dir=base_dir)
+        proxy = parse_browser_proxy(
+            _value(
+                settings,
+                "network",
+                "proxy_url",
+                "WORKER_PROXY_URL",
+                None,
+            )
+        )
 
         return cls(
             worker_id=_text(
@@ -274,6 +287,7 @@ class WorkerConfig:
                     ["http://localhost:5173", "http://127.0.0.1:5173"],
                 )
             ),
+            proxy_url=proxy.url if proxy else None,
             config_file=config_file,
         )
 

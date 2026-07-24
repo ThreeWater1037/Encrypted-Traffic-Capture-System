@@ -18,6 +18,7 @@ import hashlib
 import secrets
 import logging
 import argparse
+import re
 import tempfile
 import shutil
 import subprocess
@@ -41,6 +42,7 @@ from webdriver_manager.firefox import GeckoDriverManager
 from webdriver_manager.core.driver_cache import DriverCacheManager
 
 from browser_discovery import discover_browser
+from browser_proxy import BrowserProxy, parse_browser_proxy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -391,7 +393,12 @@ class BrowserDriver:
     """不同浏览器构建逻辑的统一接口。"""
     name: str
 
-    def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Remote:
+    def build(
+        self,
+        key_log_path: Path,
+        profile_dir: Path,
+        proxy: BrowserProxy | None = None,
+    ) -> webdriver.Remote:
         """根据临时配置目录和密钥路径构造浏览器实例。"""
         raise NotImplementedError
 
@@ -404,6 +411,60 @@ def _driver_cache_manager() -> DriverCacheManager:
     return DriverCacheManager()
 
 
+def _apply_chromium_proxy(options: ChromeOptions | EdgeOptions, proxy: BrowserProxy | None) -> None:
+    """把统一代理地址转换为 Chromium 启动参数。"""
+    if proxy is not None:
+        options.add_argument(f"--proxy-server={proxy.url}")
+
+
+def _apply_firefox_proxy(options: FirefoxOptions, proxy: BrowserProxy | None) -> None:
+    """把统一代理地址转换为 Firefox 临时 Profile 首选项。"""
+    if proxy is None:
+        return
+
+    options.set_preference("network.proxy.type", 1)
+    options.set_preference("network.proxy.no_proxies_on", "localhost, 127.0.0.1, ::1")
+    if proxy.scheme == "http":
+        # 同一个 HTTP CONNECT 代理同时处理 HTTP 和 HTTPS 目标。
+        options.set_preference("network.proxy.http", proxy.host)
+        options.set_preference("network.proxy.http_port", proxy.port)
+        options.set_preference("network.proxy.ssl", proxy.host)
+        options.set_preference("network.proxy.ssl_port", proxy.port)
+        options.set_preference("network.proxy.share_proxy_settings", True)
+    else:
+        options.set_preference("network.proxy.socks", proxy.host)
+        options.set_preference("network.proxy.socks_port", proxy.port)
+        options.set_preference(
+            "network.proxy.socks_version",
+            4 if proxy.scheme == "socks4" else 5,
+        )
+        options.set_preference("network.proxy.socks_remote_dns", True)
+
+
+def _detect_browser_error_page(final_url: str, html: str) -> str | None:
+    """识别 Selenium 未抛异常但实际展示的浏览器网络错误页。"""
+    normalized_url = final_url.lower()
+    if normalized_url.startswith("about:neterror"):
+        return f"Firefox network error page: {final_url}"
+    if normalized_url.startswith("chrome-error://"):
+        return f"Chromium network error page: {final_url}"
+
+    lowered = html.lower()
+    chrome_error_layout = any(
+        marker in lowered
+        for marker in (
+            'id="main-frame-error"',
+            'class="error-code"',
+            "interstitial-wrapper",
+        )
+    )
+    if chrome_error_layout:
+        match = re.search(r"\bERR_[A-Z0-9_]+\b", html, flags=re.IGNORECASE)
+        error_code = match.group(0).upper() if match else "unknown network error"
+        return f"Chromium network error page: {error_code}"
+    return None
+
+
 class ChromeDriver(BrowserDriver):
     """创建全新、无缓存并开启 TLS key log 的 Chrome 实例。"""
     name = "Chrome (Blink)"
@@ -413,7 +474,12 @@ class ChromeDriver(BrowserDriver):
         """使用与 Worker 能力探测相同的规则定位 Chrome。"""
         return discover_browser("chrome")
 
-    def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Chrome:
+    def build(
+        self,
+        key_log_path: Path,
+        profile_dir: Path,
+        proxy: BrowserProxy | None = None,
+    ) -> webdriver.Chrome:
         """配置 Chrome 启动参数、驱动服务和 CDP 无缓存设置。"""
         opts = ChromeOptions()
         binary = self._find_binary()
@@ -441,6 +507,7 @@ class ChromeDriver(BrowserDriver):
         opts.add_argument("--headless=new")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
+        _apply_chromium_proxy(opts, proxy)
 
         service = ChromeService(
             ChromeDriverManager(cache_manager=_driver_cache_manager()).install()
@@ -461,7 +528,12 @@ class EdgeDriver(BrowserDriver):
         """使用覆盖变量、PATH、注册表和安装目录定位 Edge。"""
         return discover_browser("edge")
 
-    def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Edge:
+    def build(
+        self,
+        key_log_path: Path,
+        profile_dir: Path,
+        proxy: BrowserProxy | None = None,
+    ) -> webdriver.Edge:
         """配置 Edge 启动参数、驱动服务和 CDP 无缓存设置。"""
         binary = self._find_binary()
         if not binary:
@@ -482,6 +554,7 @@ class EdgeDriver(BrowserDriver):
         opts.add_argument("--headless=new")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
+        _apply_chromium_proxy(opts, proxy)
 
         service = EdgeService(
             EdgeChromiumDriverManager(
@@ -503,7 +576,12 @@ class FirefoxDriver(BrowserDriver):
         """使用覆盖变量、PATH、注册表和安装目录定位 Firefox。"""
         return discover_browser("firefox")
 
-    def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Firefox:
+    def build(
+        self,
+        key_log_path: Path,
+        profile_dir: Path,
+        proxy: BrowserProxy | None = None,
+    ) -> webdriver.Firefox:
         """配置 Firefox Profile、缓存首选项和 TLS key log 环境变量。"""
         binary = self._find_binary()
         if not binary:
@@ -529,6 +607,7 @@ class FirefoxDriver(BrowserDriver):
         opts.set_preference("network.http.cache.memory.enable", False)
 
         opts.set_preference("browser.shell.checkDefaultBrowser", False)
+        _apply_firefox_proxy(opts, proxy)
         opts.add_argument("--headless")
 
         service = FirefoxService(
@@ -541,7 +620,12 @@ class SafariDriver(BrowserDriver):
     """创建 Safari 实例；Safari 不支持导出 TLS 会话密钥。"""
     name = "Safari (WebKit)"
 
-    def build(self, key_log_path: Path, profile_dir: Path) -> webdriver.Safari:
+    def build(
+        self,
+        key_log_path: Path,
+        profile_dir: Path,
+        proxy: BrowserProxy | None = None,
+    ) -> webdriver.Safari:
         """调用系统 safaridriver，并把未启用远程自动化转换为可读错误。"""
         # Requires:
         #   1. Safari → 设置 → 高级 → 勾选「在菜单栏中显示"开发"菜单」
@@ -618,6 +702,10 @@ class WikiFetcher:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.browsers = browsers
         self.capture_pcap = capture_pcap
+        self.proxy = parse_browser_proxy(
+            os.getenv("BROWSER_PROXY_URL"),
+            name="BROWSER_PROXY_URL",
+        )
         self.all_records: list[SessionRecord] = []   # flat list across all URLs
 
     # ------------------------------------------------------------------
@@ -665,10 +753,11 @@ class WikiFetcher:
         html = ""
         cookies = []
         response_time_ms = 0.0
+        error_html = ""
 
         try:
             log.info("    Starting %s ...", bd.name)
-            driver = bd.build(browser_key_log, profile_dir)
+            driver = bd.build(browser_key_log, profile_dir, self.proxy)
 
             t0 = time.perf_counter()
 
@@ -730,6 +819,15 @@ class WikiFetcher:
             html = driver.page_source
             cookies = driver.get_cookies()
 
+            detected_error = _detect_browser_error_page(final_url, html)
+            if detected_error:
+                # 错误页单独保存供排查，但不能作为成功正文参与 Worker 状态判断。
+                error_msg = detected_error
+                error_html = html
+                html = ""
+                cookies = []
+                log.warning("    Error: %s", detected_error)
+
             # Stage 3: let the browser flush any remaining in-flight responses
             # before we call quit() and terminate all connections.
             time.sleep(0.5)
@@ -754,6 +852,15 @@ class WikiFetcher:
 
         content_hash = hashlib.sha256(html.encode()).hexdigest() if html else ""
         html_length = len(html.encode())
+
+        if error_html:
+            error_body_path = url_dir / f"error_{driver_key}.html"
+            error_body_path.write_text(error_html, encoding="utf-8")
+            log.info(
+                "    Browser error page → %s (%d bytes)",
+                error_body_path,
+                len(error_html.encode()),
+            )
 
         if html:
             body_path = url_dir / f"body_{driver_key}.html"
@@ -825,6 +932,10 @@ class WikiFetcher:
         log.info("词条数 : %d", total)
         log.info("Output : %s", self.output_dir)
         log.info("pcap   : %s", "enabled" if self.capture_pcap else "disabled")
+        log.info(
+            "Browser proxy: %s",
+            self.proxy.display_url if self.proxy else "disabled",
+        )
         log.info("Interval between URLs: %.1f s", INTERVAL_BETWEEN_URLS)
         log.info("=" * 60)
 

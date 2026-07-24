@@ -767,7 +767,7 @@ components:
 
     CapabilitiesResponse:
       type: object
-      required: [worker_id, os, architecture, python, browsers, capture, analysis, input, cache_policy]
+      required: [worker_id, os, architecture, python, browsers, capture, network, analysis, input, cache_policy]
       properties:
         worker_id:
           type: string
@@ -787,6 +787,12 @@ components:
         capture:
           type: object
           additionalProperties: true
+        network:
+          type: object
+          required: [browser_proxy_configured]
+          properties:
+            browser_proxy_configured:
+              type: boolean
         analysis:
           type: object
           additionalProperties: true

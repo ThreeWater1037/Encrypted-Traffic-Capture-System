@@ -100,6 +100,10 @@ def detect_capabilities(config: WorkerConfig) -> dict[str, Any]:
             "pcap": tshark is not None,
             "tshark_path": tshark,
         },
+        "network": {
+            # 只公开是否配置，避免把可能敏感的代理地址返回给主控或前端。
+            "browser_proxy_configured": config.proxy_url is not None,
+        },
         "analysis": {
             "scripts_ready": all(
                 (config.project_root / script).is_file()
