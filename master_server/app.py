@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import secrets
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -62,7 +63,7 @@ def _create_job(
     source_content: bytes | None = None,
 ):
     normalized = validate_job(payload, max_items=config.max_items)
-    if store.get_job(normalized["job_id"]) is not None:
+    if store.get_job_status(normalized["job_id"]) is not None:
         raise sqlite3.IntegrityError(f"job_id {normalized['job_id']} 已存在")
     missing: list[str] = []
     disabled: list[str] = []
@@ -111,7 +112,7 @@ def _create_job(
             finished_at=utc_now(),
         )
         raise
-    job = store.get_job(normalized["job_id"])
+    job = store.get_job_page(normalized["job_id"])
     return jsonify(summarize_job(job or {})), 202
 
 
@@ -270,10 +271,12 @@ def create_app(
             "items": parse_uploaded_input(text, max_items=master_config.max_items),
             "targets": targets,
             "pcap": _form_bool("pcap", default=True),
+            "outputs": {
+                "html": _form_bool("save_html", default=False),
+                "reports": _form_bool("save_reports", default=False),
+            },
             "analysis": {
-                "steps": _form_list(
-                    "analysis_steps", default=["extract", "classify", "infer"]
-                ),
+                "steps": _form_list("analysis_steps", default=[]),
                 "with_coframe": _form_bool("with_coframe", default=False),
                 "sni_suffixes": _form_list("sni_suffixes", default=[]),
             },
@@ -297,42 +300,113 @@ def create_app(
 
     @app.get("/api/v1/jobs/<job_id>")
     def get_job(job_id: str):
-        job = master_store.get_job(job_id)
+        try:
+            offset = max(0, int(request.args.get("offset", "0")))
+            limit = min(5000, max(1, int(request.args.get("limit", "500"))))
+        except ValueError:
+            raise ValidationError("offset 和 limit 必须是整数")
+        job = master_store.get_job_page(job_id, offset=offset, limit=limit)
         if job is None:
             return jsonify({"error": "not_found", "message": "任务不存在"}), 404
         return jsonify(summarize_job(job))
 
     @app.post("/api/v1/jobs/<job_id>/cancel")
     def cancel_job(job_id: str):
-        job = master_store.get_job(job_id)
+        job = master_store.get_job_status(job_id)
         if job is None:
             return jsonify({"error": "not_found", "message": "任务不存在"}), 404
         if job["status"] not in TERMINAL_STATUSES:
             job_dispatcher.cancel(job_id)
-        return jsonify(summarize_job(master_store.get_job(job_id) or job))
+        return jsonify(summarize_job(master_store.get_job_page(job_id) or job))
+
+    @app.post("/api/v1/jobs/<job_id>/resume")
+    def resume_job(job_id: str):
+        """沿用原 Worker 任务目录，从逐 URL 原子检查点继续。"""
+        job = master_store.get_job_status(job_id)
+        if job is None:
+            return jsonify({"error": "not_found", "message": "任务不存在"}), 404
+        if job["status"] not in {"PARTIAL", "FAILED", "CANCELED", "INTERRUPTED"}:
+            return (
+                jsonify(
+                    {
+                        "error": "job_not_resumable",
+                        "message": "只有部分成功、失败、已取消或中断任务可以断点继续",
+                    }
+                ),
+                409,
+            )
+        resume_token = f"resume-{secrets.token_hex(16)}"
+        if not master_store.resume_job(job_id, resume_token):
+            return (
+                jsonify({"error": "resume_conflict", "message": "任务状态已变化，请刷新后重试"}),
+                409,
+            )
+        job_dispatcher.enqueue(job_id)
+        resumed = master_store.get_job_page(job_id)
+        return jsonify(summarize_job(resumed or {})), 202
+
+    @app.post("/api/v1/jobs/<job_id>/restart")
+    def restart_job(job_id: str):
+        """复制原任务配置并创建全新 job_id/Worker 目录。"""
+        source = master_store.get_job_control(job_id)
+        if source is None:
+            return jsonify({"error": "not_found", "message": "任务不存在"}), 404
+        if source["status"] not in TERMINAL_STATUSES:
+            return (
+                jsonify(
+                    {
+                        "error": "job_still_active",
+                        "message": "当前任务仍在运行；请先取消或等待结束后再开启新一轮",
+                    }
+                ),
+                409,
+            )
+        options = request.get_json(silent=True) or {}
+        if not isinstance(options, dict) or set(options) - {"job_id", "name"}:
+            raise ValidationError("重新开启只允许指定 job_id 和 name")
+        payload = {
+            key: value
+            for key, value in source["request"].items()
+            if key != "job_id"
+        }
+        if options.get("job_id"):
+            payload["job_id"] = options["job_id"]
+        payload["name"] = options.get("name") or f"{source['name']} - 新一轮"[:120]
+        return _create_job(
+            payload,
+            store=master_store,
+            dispatcher=job_dispatcher,
+            config=master_config,
+        )
 
     @app.get("/api/v1/jobs/<job_id>/results")
     def get_results(job_id: str):
-        job = master_store.get_job(job_id)
+        try:
+            offset = max(0, int(request.args.get("offset", "0")))
+            limit = min(5000, max(1, int(request.args.get("limit", "500"))))
+        except ValueError:
+            raise ValidationError("offset 和 limit 必须是整数")
+        job = master_store.get_job_page(job_id, offset=offset, limit=limit)
         if job is None:
             return jsonify({"error": "not_found", "message": "任务不存在"}), 404
         return jsonify(summarize_job(job))
 
     @app.get("/api/v1/jobs/<job_id>/logs")
     def get_logs(job_id: str):
-        job = master_store.get_job(job_id)
+        job = master_store.get_job_control(job_id)
         if job is None:
             return jsonify({"error": "not_found", "message": "任务不存在"}), 404
         logs = []
-        for target in summarize_job(job)["targets"]:
+        for target in job["request"]["targets"]:
             machine = master_store.get_machine(target["machine_id"])
-            if machine is None or not target.get("worker_task_id"):
+            if machine is None:
                 continue
+            worker_task_id = MasterStore.worker_task_id(job_id, target["machine_id"])
             client = WorkerClient(
                 machine["base_url"], machine["token"], timeout=master_config.worker_request_timeout
             )
             try:
-                entry = client.get_log(target["worker_task_id"])
+                entry = client.get_log(worker_task_id)
                 logs.append({"machine_id": machine["machine_id"], "machine_name": machine["name"], **entry})
             except WorkerRequestError as exc:
                 logs.append({"machine_id": machine["machine_id"], "machine_name": machine["name"], "text": "", "error": str(exc)})

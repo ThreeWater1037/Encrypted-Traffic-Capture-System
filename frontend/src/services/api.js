@@ -21,6 +21,8 @@ export const deleteMachine = (machineId) => request(`/machines/${encodeURICompon
 export const getJobs = () => request('/jobs')
 export const getJob = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}`)
 export const cancelJob = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' })
+export const resumeJob = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/resume`, { method: 'POST' })
+export const restartJob = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/restart`, { method: 'POST', body: JSON.stringify({}) })
 export const getJobLogs = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/logs`)
 export const createJsonJob = (payload) => request('/jobs', { method: 'POST', body: JSON.stringify(payload) })
 export const createFileJob = (form) => request('/jobs/from-file', { method: 'POST', body: form })

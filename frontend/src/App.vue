@@ -25,6 +25,8 @@ import {
   getJobs,
   getMachines,
   probeMachine,
+  restartJob,
+  resumeJob,
   saveMachine,
 } from './services/api'
 
@@ -72,10 +74,6 @@ async function loadMachines({ probeUnknown = false } = {}) {
 
 async function loadJobs() {
   jobs.value = (await getJobs()).jobs
-  if (selectedJob.value) {
-    const latest = jobs.value.find((job) => job.job_id === selectedJob.value.job_id)
-    if (latest) selectedJob.value = latest
-  }
 }
 
 async function loadInitialData() {
@@ -127,6 +125,33 @@ async function handleCancel(jobId) {
     notify('取消请求已发送')
   } catch (reason) {
     showError(reason)
+  }
+}
+
+async function handleResume(jobId) {
+  loading.value = true
+  try {
+    selectedJob.value = await resumeJob(jobId)
+    await loadJobs()
+    notify('已从原任务检查点继续')
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    loading.value = false
+  }
+}
+
+async function handleRestart(jobId) {
+  loading.value = true
+  try {
+    const job = await restartJob(jobId)
+    await loadJobs()
+    selectedJob.value = job
+    notify(`新一轮任务 ${job.job_id} 已创建`)
+  } catch (reason) {
+    showError(reason)
+  } finally {
+    loading.value = false
   }
 }
 
@@ -243,6 +268,8 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
           :logs="selectedLogs"
           @select="handleSelectJob"
           @cancel="handleCancel"
+          @resume="handleResume"
+          @restart="handleRestart"
           @logs="handleLogs"
           @refresh="loadJobs"
         />

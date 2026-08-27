@@ -68,6 +68,15 @@ paths:
       tags: [Tasks]
       summary: 使用 JSON 创建任务
       operationId: createTask
+      parameters:
+        - name: include_request
+          in: query
+          description: 设为 false 时不回显可能很大的 URL 请求体
+          schema: { type: boolean, default: true }
+        - name: include_result
+          in: query
+          description: 设为 false 时不回显结果体
+          schema: { type: boolean, default: true }
       requestBody:
         required: true
         content:
@@ -85,8 +94,11 @@ paths:
                   url: https://example.com/
               browsers: [chrome, edge]
               pcap: true
+              outputs:
+                html: false
+                reports: false
               analysis:
-                steps: [extract, classify, infer]
+                steps: []
                 with_coframe: false
                 sni_suffixes: []
       responses:
@@ -145,9 +157,15 @@ paths:
                 pcap:
                   type: boolean
                   default: true
+                save_html:
+                  type: boolean
+                  default: false
+                save_reports:
+                  type: boolean
+                  default: false
                 analysis_steps:
                   type: string
-                  default: extract,classify,infer
+                  default: ''
                   example: extract,classify,infer
                 with_coframe:
                   type: boolean
@@ -191,6 +209,15 @@ paths:
       summary: 查询任务状态
       description: 任务完成后，`items` 返回每个 URL 的状态；`result.units` 返回每个 URL 与浏览器组合的详情。
       operationId: getTask
+      parameters:
+        - name: include_result
+          in: query
+          description: 大任务轮询时设为 false，只返回轻量生命周期状态
+          schema: { type: boolean, default: true }
+        - name: compact
+          in: query
+          description: 设为 true 时省略与 result 重复的顶层 items
+          schema: { type: boolean, default: false }
       responses:
         '200':
           description: 任务状态
@@ -226,6 +253,39 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /api/v1/tasks/{task_id}/resume:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [Tasks]
+      summary: 从原任务检查点幂等续跑
+      operationId: resumeTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resume_token]
+              properties:
+                resume_token:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+      responses:
+        '202':
+          description: 终态任务已重新入队
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskRecord' }
+        '200':
+          description: 同一续跑令牌已处理，返回当前状态
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskRecord' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /api/v1/tasks/{task_id}/result:
     parameters:
       - $ref: '#/components/parameters/TaskId'
@@ -233,6 +293,11 @@ paths:
       tags: [Tasks]
       summary: 查询最终结果
       operationId: getTaskResult
+      parameters:
+        - name: compact
+          in: query
+          description: 设为 true 时省略与 result 重复的顶层 items
+          schema: { type: boolean, default: false }
       responses:
         '200':
           description: 最终结果与本地目录
@@ -375,6 +440,7 @@ components:
       type: string
       enum:
         - QUEUED
+        - RESUMING
         - PREPARING
         - CAPTURING
         - ANALYZING
@@ -426,7 +492,7 @@ components:
           uniqueItems: true
           items:
             $ref: '#/components/schemas/AnalysisStep'
-          default: [extract, classify, infer]
+          default: []
         with_coframe:
           type: boolean
           default: false
@@ -438,6 +504,18 @@ components:
             type: string
             maxLength: 253
           example: [wikipedia.org, wikimedia.org]
+
+    OutputOptions:
+      type: object
+      additionalProperties: false
+      description: HTML 与报告均为可选辅助产物；TLS keylog 固定保存。
+      properties:
+        html:
+          type: boolean
+          default: false
+        reports:
+          type: boolean
+          default: false
 
     TaskRequest:
       type: object
@@ -452,7 +530,7 @@ components:
         items:
           type: array
           minItems: 1
-          maxItems: 10000
+          maxItems: 100000
           items:
             $ref: '#/components/schemas/TaskItemInput'
         browsers:
@@ -464,6 +542,8 @@ components:
         pcap:
           type: boolean
           default: true
+        outputs:
+          $ref: '#/components/schemas/OutputOptions'
         analysis:
           $ref: '#/components/schemas/AnalysisOptions'
 
@@ -529,8 +609,11 @@ components:
           additionalProperties:
             type: boolean
           example:
-            body: true
+            tls_keylog: true
+            checkpoint: true
             pcap: true
+            html: true
+            report: true
             extract: true
             classify: true
             infer: true
@@ -593,7 +676,9 @@ components:
               enum: [false]
             fresh_browser_profile:
               type: boolean
-            reuse_existing_results:
+            reuse_completed_capture_units:
+              type: boolean
+            atomic_url_checkpoints:
               type: boolean
             supported_browsers:
               type: array
@@ -627,7 +712,7 @@ components:
 
     TaskRecord:
       type: object
-      required: [task_id, status, cancel_requested, request, items]
+      required: [task_id, status, cancel_requested]
       properties:
         task_id:
           type: string
@@ -697,7 +782,7 @@ components:
 
     TaskResultResponse:
       type: object
-      required: [task_id, status, items, result, local_result_dir]
+      required: [task_id, status, result, local_result_dir]
       properties:
         task_id:
           type: string
@@ -727,6 +812,7 @@ components:
         - busy
         - queue_size
         - queue_capacity
+        - recovered_tasks_on_startup
         - task_counts
         - cache_enabled
       properties:
@@ -746,6 +832,9 @@ components:
         queue_capacity:
           type: integer
           minimum: 1
+        recovered_tasks_on_startup:
+          type: integer
+          minimum: 0
         task_counts:
           type: object
           additionalProperties:

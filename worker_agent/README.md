@@ -14,6 +14,7 @@ Worker Flask 将现有 `wiki_fetcher.py` 和 `batch_process.py` 包装为内部 
 - 所有任务使用全新目录，不传递 `--skip-existing`
 - 所有 API 响应均包含 `Cache-Control: no-store`
 - SQLite 只保存任务状态；实验文件保存在 `WORKER_DATA_DIR/tasks/{task_id}`
+- 未完成任务在 Worker 重启后自动重新排队，并从逐 URL/浏览器原子检查点继续
 - webdriver-manager 的驱动二进制放在 `WORKER_DATA_DIR/.wdm`；它只是运行依赖，
   不包含网页响应、Cookie 或实验结果
 
@@ -131,8 +132,12 @@ $body = @{
   )
   browsers = @('chrome')
   pcap = $true
+  outputs = @{
+    html = $false
+    reports = $false
+  }
   analysis = @{
-    steps = @('extract', 'classify', 'infer')
+    steps = @()
     with_coframe = $false
     sni_suffixes = @('wikipedia.org')
   }
@@ -159,7 +164,9 @@ Invoke-RestMethod `
 | `task_id` | 是 | `upload-20260722-001` |
 | `browsers` | 否 | `chrome,edge,firefox`，默认 `chrome` |
 | `pcap` | 否 | `true`，默认 `true` |
-| `analysis_steps` | 否 | `extract,classify,infer` |
+| `save_html` | 否 | `false`；额外保存页面 HTML |
+| `save_reports` | 否 | `false`；额外保存抓取报告 |
+| `analysis_steps` | 否 | 默认空；可选 `extract,classify,infer` |
 | `with_coframe` | 否 | `false` |
 | `sni_suffixes` | 否 | `wikipedia.org,wikimedia.org`；留空表示不过滤 |
 
@@ -171,7 +178,9 @@ form.append('task_id', 'upload-20260722-001')
 form.append('file', fileInput.files[0])
 form.append('browsers', 'chrome,firefox')
 form.append('pcap', 'true')
-form.append('analysis_steps', 'extract,classify,infer')
+form.append('save_html', 'false')
+form.append('save_reports', 'false')
+form.append('analysis_steps', '')
 form.append('with_coframe', 'false')
 form.append('sni_suffixes', '')
 
@@ -184,10 +193,11 @@ const task = await response.json()
 ```
 
 不要手动设置 `Content-Type`，浏览器会自动生成 multipart boundary。默认请求上限为
-20 MiB、每个文件最多 10000 个 URL，可分别通过 `MAX_CONTENT_LENGTH` 和
+256 MiB、每个任务最多 100000 个 URL，可分别通过 `MAX_CONTENT_LENGTH` 和
 `MAX_ITEMS` 调整。前端地址需要加入 `WORKER_ALLOWED_ORIGINS`。
 
-Worker 会生成结构化的 `input.tsv`，再依次执行：
+Worker 会生成结构化的 `input.tsv`，默认只执行采集命令；仅当
+`analysis_steps` 非空时才执行第二行后处理：
 
 ```text
 wiki_fetcher.py --input input.tsv ...
@@ -205,10 +215,27 @@ worker_data/tasks/exec-20260722-0001/
 └── fetch_output/
 ```
 
-`manifest.json` 根据实际 HTML、PCAP、TSV、flows 和 inferred 产物判断
-`SUCCEEDED`、`PARTIAL` 或 `FAILED`，不只依赖脚本退出码。
+`manifest.json` 默认根据实际 TLS keylog 和 PCAP 判断 `SUCCEEDED`、`PARTIAL` 或
+`FAILED`，不只依赖脚本退出码。HTML、报告、TSV、flows 和 inferred 只在显式启用
+时生成并加入校验。
 
 多 URL 任务完成后，`GET /api/v1/tasks/{task_id}` 和
 `GET /api/v1/tasks/{task_id}/result` 都会返回 `items[]`。其中每个元素对应一个
 URL，包含该 URL 的汇总 `status` 和 `browser_statuses[]`；顶层 `status` 仍表示
 整个任务的汇总状态。`units[]` 保留每个“URL + 浏览器”组合的检查项和产物详情。
+
+## 长任务恢复语义
+
+默认 `TASK_TIMEOUT_SECONDS=0`，即不设置整批任务总超时。每个采集单元成功落盘后会
+原子生成 `capture_<browser>.complete.json`；只有标记中的 URL、浏览器和各产物精确
+大小都匹配时，续跑才会跳过该单元。中断时正在写入的 URL 会清理半截文件并重抓，
+此前已完成的 URL 不会重复访问。
+
+`wiki_fetcher.py` 非零退出后，Worker 每 5 秒重启一次采集进程；Worker 自身重启后，
+SQLite 中的未完成任务会恢复为 `QUEUED / RESUMING`。健康接口字段
+`recovered_tasks_on_startup` 可用于监控本次启动恢复了多少任务。
+
+默认容量目标是单任务 10 万 URL。百万级输入应拆成 1 万至 5 万 URL 的独立任务，
+避免一个超大 HTTP 请求、结果 JSON 和 SQLite 事务成为单点故障。24 小时运行还需
+由 systemd、Windows 服务或容器 restart policy 拉起 Worker；代码负责进程恢复后的
+续跑，不负责在操作系统杀死进程后自行复活。

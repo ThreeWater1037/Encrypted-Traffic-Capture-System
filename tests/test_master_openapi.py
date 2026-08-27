@@ -23,6 +23,8 @@ class MasterOpenApiTests(unittest.TestCase):
             "/api/v1/jobs/from-file": {"post"},
             "/api/v1/jobs/{job_id}": {"get"},
             "/api/v1/jobs/{job_id}/cancel": {"post"},
+            "/api/v1/jobs/{job_id}/resume": {"post"},
+            "/api/v1/jobs/{job_id}/restart": {"post"},
             "/api/v1/jobs/{job_id}/results": {"get"},
             "/api/v1/jobs/{job_id}/logs": {"get"},
         }

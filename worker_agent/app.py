@@ -217,7 +217,32 @@ def _form_bool(name: str, *, default: bool) -> bool:
     raise ValidationError(f"{name} 必须是 true 或 false")
 
 
-def _public_task(task: dict[str, Any]) -> dict[str, Any]:
+def _include_request_in_response() -> bool:
+    """主控可关闭大请求体回显，直接 API 调试仍默认保留。"""
+    return request.args.get("include_request", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _include_result_in_response() -> bool:
+    return request.args.get("include_result", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _public_task(
+    task: dict[str, Any],
+    *,
+    include_request: bool = False,
+    include_items: bool = True,
+    include_result: bool = True,
+) -> dict[str, Any]:
     """过滤内部字段，生成稳定的公共任务响应结构。"""
     response = {
         key: task.get(key)
@@ -232,12 +257,15 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
             "started_at",
             "finished_at",
             "updated_at",
-            "request",
         )
     }
-    result = _result_with_items(task.get("result"))
-    response["result"] = result
-    response["items"] = result.get("items", []) if isinstance(result, dict) else []
+    if include_request:
+        response["request"] = task.get("request")
+    if include_result:
+        result = _result_with_items(task.get("result"))
+        response["result"] = result
+        if include_items:
+            response["items"] = result.get("items", []) if isinstance(result, dict) else []
     return response
 
 
@@ -314,6 +342,7 @@ def create_app(
                 "active_task_id": task_manager.active_task_id,
                 "queue_size": task_manager.queue_size,
                 "queue_capacity": worker_config.max_queue_size,
+                "recovered_tasks_on_startup": task_manager.recovered_task_count,
                 "task_counts": task_store.status_counts(),
                 "cache_enabled": False,
             }
@@ -337,7 +366,15 @@ def create_app(
         except TaskConflictError as exc:
             return jsonify({"error": "task_conflict", "message": str(exc)}), 409
 
-        response = _public_task(task)
+        include_request = _include_request_in_response()
+        include_result = _include_result_in_response()
+        if include_request or (include_result and task["status"] in TERMINAL_STATUSES):
+            task = task_store.get_task(payload["task_id"]) or task
+        response = _public_task(
+            task,
+            include_request=include_request,
+            include_result=include_result,
+        )
         response["duplicate"] = not created
         response["status_url"] = f"/api/v1/tasks/{payload['task_id']}"
         return jsonify(response), 202 if created else 200
@@ -364,10 +401,14 @@ def create_app(
                 ),
                 "browsers": _form_list("browsers", default=["chrome"]),
                 "pcap": _form_bool("pcap", default=True),
+                "outputs": {
+                    "html": _form_bool("save_html", default=False),
+                    "reports": _form_bool("save_reports", default=False),
+                },
                 "analysis": {
                     "steps": _form_list(
                         "analysis_steps",
-                        default=["extract", "classify", "infer"],
+                        default=[],
                     ),
                     "with_coframe": _form_bool("with_coframe", default=False),
                     "sni_suffixes": _form_list("sni_suffixes", default=[]),
@@ -382,7 +423,15 @@ def create_app(
         except TaskConflictError as exc:
             return jsonify({"error": "task_conflict", "message": str(exc)}), 409
 
-        response = _public_task(task)
+        include_request = _include_request_in_response()
+        include_result = _include_result_in_response()
+        if include_request or (include_result and task["status"] in TERMINAL_STATUSES):
+            task = task_store.get_task(payload["task_id"]) or task
+        response = _public_task(
+            task,
+            include_request=include_request,
+            include_result=include_result,
+        )
         response["duplicate"] = not created
         response["source_filename"] = Path(uploaded.filename).name
         response["item_count"] = len(payload["items"])
@@ -394,10 +443,22 @@ def create_app(
         """查询生命周期状态；终态时同时返回每个 URL 的结果。"""
         if not TASK_ID_RE.fullmatch(task_id):
             return jsonify({"error": "invalid_task_id"}), 400
-        task = task_store.get_task(task_id)
+        include_result = request.args.get("include_result", "true").strip().lower() not in {
+            "0", "false", "no", "off"
+        }
+        task = task_store.get_task_status(task_id)
         if task is None:
             return jsonify({"error": "not_found", "message": "任务不存在"}), 404
-        return jsonify(_public_task(task))
+        if include_result and task["status"] in TERMINAL_STATUSES:
+            task = task_store.get_task(task_id) or task
+        compact = request.args.get("compact", "false").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        return jsonify(
+            _public_task(
+                task, include_items=not compact, include_result=include_result
+            )
+        )
 
     @app.post("/api/v1/tasks/<task_id>/cancel")
     def cancel_task(task_id: str):
@@ -409,12 +470,41 @@ def create_app(
             return jsonify({"error": "not_found", "message": "任务不存在"}), 404
         return jsonify(_public_task(task)), 200
 
+    @app.post("/api/v1/tasks/<task_id>/resume")
+    def resume_task(task_id: str):
+        """幂等恢复原任务目录；已完成 URL 由原子检查点跳过。"""
+        if not TASK_ID_RE.fullmatch(task_id):
+            return jsonify({"error": "invalid_task_id"}), 400
+        payload = request.get_json(silent=True)
+        resume_token = payload.get("resume_token") if isinstance(payload, dict) else None
+        if (
+            not isinstance(resume_token, str)
+            or not 1 <= len(resume_token) <= 128
+            or not TASK_ID_RE.fullmatch(resume_token)
+        ):
+            return (
+                jsonify(
+                    {
+                        "error": "validation_error",
+                        "message": "resume_token 格式错误",
+                    }
+                ),
+                400,
+            )
+        task, queued = task_manager.resume(task_id, resume_token)
+        if task is None:
+            return jsonify({"error": "not_found", "message": "任务不存在"}), 404
+        response = _public_task(task, include_result=False)
+        response["resume_token"] = resume_token
+        response["queued_for_resume"] = queued
+        return jsonify(response), 202 if queued else 200
+
     @app.get("/api/v1/tasks/<task_id>/result")
     def get_task_result(task_id: str):
         """仅在终态返回结果清单和受控的相对结果目录。"""
         if not TASK_ID_RE.fullmatch(task_id):
             return jsonify({"error": "invalid_task_id"}), 400
-        task = task_store.get_task(task_id)
+        task = task_store.get_task_result_record(task_id)
         if task is None:
             return jsonify({"error": "not_found", "message": "任务不存在"}), 404
         if task["status"] not in TERMINAL_STATUSES:
@@ -429,12 +519,15 @@ def create_app(
                 409,
             )
         result = _result_with_items(task["result"])
+        compact = request.args.get("compact", "false").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
         return jsonify(
             {
                 "task_id": task_id,
                 "status": task["status"],
                 "error": task["error"],
-                "items": result.get("items", []) if result else [],
+                **({} if compact else {"items": result.get("items", []) if result else []}),
                 "result": result,
                 "local_result_dir": f"tasks/{task_id}",
             }
@@ -445,7 +538,7 @@ def create_app(
         """按字节偏移增量读取日志，避免一次返回超大文本。"""
         if not TASK_ID_RE.fullmatch(task_id):
             return jsonify({"error": "invalid_task_id"}), 400
-        task = task_store.get_task(task_id)
+        task = task_store.get_task_status(task_id)
         if task is None:
             return jsonify({"error": "not_found", "message": "任务不存在"}), 404
 

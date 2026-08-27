@@ -1,13 +1,13 @@
 # Encrypted Traffic Capture System
 
-本项目把浏览器访问、PCAP 抓取和后处理封装为 Worker Agent，并由主控 Flask 与
-Vue 前端统一管理多台子机器。
+本项目把浏览器访问与 PCAP/TLS keylog 采集封装为 Worker Agent，并由主控 Flask
+与 Vue 前端统一管理多台子机器。HTML、抓取报告和后处理均为显式可选项。
 
 ```text
 Vue 前端 :5173 -> 主控 Flask :5200 -> Worker Agent :5100
                                              |-> 浏览器访问
                                              |-> TShark / PCAP
-                                             `-> extract / classify / infer
+                                             `-> 可选 HTML / 报告 / 后处理
 ```
 
 本文重点说明子机器 Worker 的完整部署顺序，并分别标记 Windows、Linux、macOS
@@ -458,7 +458,7 @@ curl --fail --show-error \
 - `browsers` 中至少有一个浏览器。
 - `capture.pcap` 为 `true`。
 - `capture.tshark_path` 指向真实文件。
-- `analysis.scripts_ready` 为 `true`。
+- 只有需要后处理时才要求 `analysis.scripts_ready` 为 `true`。
 
 ## 7. 跨网络连接
 
@@ -524,10 +524,31 @@ WORKER_DATA_DIR/tasks/<task_id>/
 `-- fetch_output/
 ```
 
-`wiki_fetcher.py` 生成 HTML、PCAP、TLS keylog 和报告；`batch_process.py` 运行后才会
-生成 `capture_*_flows/` 和 `capture_*_inferred/` 等后处理目录。
+默认任务只把 PCAP 与 TLS keylog 作为实验产物保存和校验。页面 HTML、逐 URL/批次
+报告，以及 `batch_process.py` 生成的 TSV、`capture_*_flows/`、
+`capture_*_inferred/` 等后处理产物，只有在创建任务时显式启用才会生成。
 
-## 9. 常见问题
+## 9. 大批量、断点续跑与 24 小时运行
+
+- 单个任务默认最多 `100000` 个 URL，请求体上限为 `256 MiB`；Worker 的总任务
+  超时默认为 `0`，表示不因运行数天而主动终止任务。
+- 每个“URL + 浏览器”只有在 TLS keylog、PCAP（启用时）及其他显式要求的产物
+  均非空后，才原子写入 `capture_<browser>.complete.json`。进程中断时，当前半截
+  URL 不会被当作成功；服务恢复后会重抓当前单元，已提交检查点的单元会跳过。
+- `capture_progress.json` 记录最近处理位置，实际续跑判据始终是逐单元完成标记，
+  因此即使最后一个 URL 在写文件过程中断电，也不会误跳过损坏的 PCAP。
+- 抓取脚本非零退出时，Worker 每 5 秒自动重启并从检查点继续；Worker 重启会把
+  未完成任务重新排队；Worker 暂时离线时，主控保持任务为
+  `WAITING_FOR_WORKER`，不会因一次网络波动直接判失败。
+- 代码恢复不能代替进程保活。服务器部署必须用 systemd、Windows 服务管理器或
+  容器的 restart policy 同时托管 Master 和 Worker；程序收到 `SIGTERM` 时会先
+  终止当前抓包子进程并保留可恢复状态。
+
+百万 URL 不建议作为一个请求直接提交：当前代码层面的单任务上限是 10 万。
+百万级应按稳定、不可变的输入分片（建议每片 1 万至 5 万），每片使用独立
+`job_id`，并先完成目标服务器的磁盘容量估算和至少一轮同规模长稳测试。
+
+## 10. 常见问题
 
 ### 端口被占用
 
@@ -560,12 +581,13 @@ EDGE_BINARY=<绝对路径>
 FIREFOX_BINARY=<绝对路径>
 ```
 
-### PCAP 或后处理产物缺失
+### PCAP、TLS keylog 或可选后处理产物缺失
 
-先运行 `tshark -D` 确认抓包权限。注意 `capture_*_flows/` 和
+先运行 `tshark -D` 确认抓包权限，并检查浏览器是否实际写出了 `tls_keys_*.log`。
+注意 `capture_*_flows/` 和
 `capture_*_inferred/` 只有在 `batch_process.py` 对抓包结果完成后处理后才会出现。
 
-## 10. 官方参考
+## 11. 官方参考
 
 - [Python venv 文档](https://docs.python.org/3/library/venv.html)
 - [Wireshark 安装文档](https://www.wireshark.org/docs/wsug_html_chunked/ChapterBuildInstall.html)

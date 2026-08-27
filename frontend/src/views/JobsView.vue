@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref } from 'vue'
-import { Ban, ChevronRight, FileText, RefreshCw, ScrollText } from '@lucide/vue'
+import { Ban, ChevronRight, FileText, Play, RefreshCw, RotateCcw, ScrollText } from '@lucide/vue'
 import StatusPill from '../components/StatusPill.vue'
 
 const props = defineProps({
@@ -8,12 +8,26 @@ const props = defineProps({
   selectedJob: { type: Object, default: null },
   logs: { type: Array, default: () => [] },
 })
-const emit = defineEmits(['select', 'cancel', 'logs', 'refresh'])
+const emit = defineEmits(['select', 'cancel', 'resume', 'restart', 'logs', 'refresh'])
 const statusFilter = ref('ALL')
 
 const terminal = ['SUCCEEDED', 'PARTIAL', 'FAILED', 'CANCELED', 'INTERRUPTED']
 const filteredJobs = computed(() => statusFilter.value === 'ALL' ? props.jobs : props.jobs.filter((job) => job.status === statusFilter.value))
 const canCancel = computed(() => props.selectedJob && !terminal.includes(props.selectedJob.status))
+const canResume = computed(() => props.selectedJob && ['PARTIAL', 'FAILED', 'CANCELED', 'INTERRUPTED'].includes(props.selectedJob.status))
+const canRestart = computed(() => props.selectedJob && terminal.includes(props.selectedJob.status))
+
+function requestResume() {
+  if (window.confirm('继续后将沿用原任务目录，已完成 URL 会跳过，未完成 URL 会重新抓取。是否继续？')) {
+    emit('resume', props.selectedJob.job_id)
+  }
+}
+
+function requestRestart() {
+  if (window.confirm('新一轮会创建全新任务和输出目录，不复用任何旧检查点。是否创建？')) {
+    emit('restart', props.selectedJob.job_id)
+  }
+}
 
 function displayTime(value) {
   if (!value) return '—'
@@ -25,7 +39,7 @@ function displayTime(value) {
   <div class="jobs-layout">
     <section class="panel jobs-list-panel">
       <div class="list-toolbar">
-        <div><h2>任务记录</h2><p>主控保存的全部实验及其聚合状态</p></div>
+        <div><h2>任务记录</h2><p>主控创建的实验及其聚合状态；Worker 直提任务不会自动导入</p></div>
         <button class="icon-button" @click="emit('refresh')"><RefreshCw :size="15" /></button>
       </div>
       <div class="filter-row">
@@ -52,6 +66,8 @@ function displayTime(value) {
         <StatusPill :status="selectedJob.status" />
         <div class="detail-actions">
           <button class="secondary-button" @click="emit('logs', selectedJob.job_id)"><ScrollText :size="15" />读取日志</button>
+          <button v-if="canResume" class="secondary-button" @click="requestResume"><Play :size="15" />从断点继续</button>
+          <button v-if="canRestart" class="secondary-button" @click="requestRestart"><RotateCcw :size="15" />重新开启新一轮</button>
           <button v-if="canCancel" class="danger-button" @click="emit('cancel', selectedJob.job_id)"><Ban :size="15" />取消任务</button>
         </div>
       </div>
@@ -64,7 +80,7 @@ function displayTime(value) {
       </div>
 
       <div class="panel result-panel">
-        <div class="panel-heading"><div><h3>URL 执行矩阵</h3><p>每一行对应一个 URL，每个卡片对应机器与浏览器组合</p></div></div>
+        <div class="panel-heading"><div><h3>URL 执行矩阵</h3><p>每一行对应一个 URL，每个卡片对应机器与浏览器组合<span v-if="selectedJob.page?.total > selectedJob.page?.returned">；当前显示前 {{ selectedJob.page.returned }} / {{ selectedJob.page.total }} 个执行单元</span></p></div></div>
         <div class="result-items">
           <article v-for="item in selectedJob.items" :key="item.id" class="result-item">
             <div class="result-url"><StatusPill :status="item.status" /><div><strong>{{ item.name }}</strong><a :href="item.url" target="_blank">{{ item.url }}</a></div></div>
@@ -74,7 +90,8 @@ function displayTime(value) {
                 <StatusPill :status="execution.status" />
                 <small>{{ execution.stage }}</small>
                 <p v-if="execution.error">{{ execution.error }}</p>
-                <code v-if="execution.result?.artifacts?.pcap?.path">{{ execution.result.artifacts.pcap.path }}</code>
+                <code v-if="execution.result?.artifacts?.pcap?.path">PCAP · {{ execution.result.artifacts.pcap.path }}</code>
+                <code v-if="execution.result?.artifacts?.tls_keylog?.path">TLS keylog · {{ execution.result.artifacts.tls_keylog.path }}</code>
               </div>
             </div>
           </article>

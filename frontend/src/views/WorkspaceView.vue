@@ -6,7 +6,7 @@ import StatusPill from '../components/StatusPill.vue'
 const props = defineProps({ machines: { type: Array, default: () => [] }, loading: Boolean })
 const emit = defineEmits(['submit', 'probe'])
 
-const DRAFT_KEY = 'flowlab.workspace.draft.v1'
+const DRAFT_KEY = 'flowlab.workspace.draft.v2'
 const defaultRows = [
   { id: '1', name: 'Example', url: 'https://example.com/' },
   { id: '2', name: 'Wikipedia', url: 'https://zh.wikipedia.org/wiki/钦东高速公路' },
@@ -36,7 +36,9 @@ let inputRowKey = restoredRows.length
 const inputRows = ref(restoredRows.map((row, index) => ({ key: index + 1, ...row })))
 const selectedFile = ref(null)
 const pcap = ref(typeof draft.pcap === 'boolean' ? draft.pcap : true)
-const steps = reactive({ extract: true, classify: true, infer: true, ...(draft.steps || {}) })
+const saveHtml = ref(typeof draft.saveHtml === 'boolean' ? draft.saveHtml : false)
+const saveReports = ref(typeof draft.saveReports === 'boolean' ? draft.saveReports : false)
+const steps = reactive({ extract: false, classify: false, infer: false, ...(draft.steps || {}) })
 const withCoframe = ref(typeof draft.withCoframe === 'boolean' ? draft.withCoframe : false)
 const sniSuffixes = ref(typeof draft.sniSuffixes === 'string' ? draft.sniSuffixes : '')
 const selections = reactive(draft.selections && typeof draft.selections === 'object' ? draft.selections : {})
@@ -64,13 +66,15 @@ watch(() => props.machines, (machines) => {
 
 // 保存可序列化的工作台草稿；浏览器禁止恢复本地文件选择，因此不保存 selectedFile。
 watch(
-  [jobName, inputRows, pcap, steps, withCoframe, sniSuffixes, selections],
+  [jobName, inputRows, pcap, saveHtml, saveReports, steps, withCoframe, sniSuffixes, selections],
   () => {
     try {
       window.localStorage.setItem(DRAFT_KEY, JSON.stringify({
         jobName: jobName.value,
         inputRows: inputRows.value.map(({ id, name, url }) => ({ id, name, url })),
         pcap: pcap.value,
+        saveHtml: saveHtml.value,
+        saveReports: saveReports.value,
         steps: { ...steps },
         withCoframe: withCoframe.value,
         sniSuffixes: sniSuffixes.value,
@@ -146,6 +150,7 @@ function submit() {
       with_coframe: withCoframe.value,
       sni_suffixes: sniSuffixes.value.split(',').map((value) => value.trim()).filter(Boolean),
     }
+    const outputs = { html: saveHtml.value, reports: saveReports.value }
     if (mode.value === 'file') {
       if (!selectedFile.value) throw new Error('请选择 UTF-8 编码的 TXT/TSV 文件')
       const form = new FormData()
@@ -153,6 +158,8 @@ function submit() {
       form.append('file', selectedFile.value)
       form.append('targets', JSON.stringify(targets))
       form.append('pcap', String(pcap.value))
+      form.append('save_html', String(outputs.html))
+      form.append('save_reports', String(outputs.reports))
       form.append('analysis_steps', analysis.steps.join(','))
       form.append('with_coframe', String(analysis.with_coframe))
       form.append('sni_suffixes', analysis.sni_suffixes.join(','))
@@ -161,7 +168,7 @@ function submit() {
     }
     const items = parseTableItems()
     if (!items.length) throw new Error('请输入至少一个 URL')
-    emit('submit', { kind: 'json', payload: { name: jobName.value, items, targets, pcap: pcap.value, analysis } })
+    emit('submit', { kind: 'json', payload: { name: jobName.value, items, targets, pcap: pcap.value, outputs, analysis } })
   } catch (reason) {
     localError.value = reason.message
   }
@@ -188,7 +195,7 @@ function submit() {
         <small class="table-tip">空白行会自动忽略；提交前会检查必填项、重复 ID 和 URL 格式。</small>
       </div>
       <label v-else class="upload-zone">
-        <FileUp :size="28" /><strong>{{ selectedFile?.name || '选择 TXT / TSV 文件' }}</strong><small>UTF-8 编码，最大 20 MiB；文件先上传到主控</small>
+        <FileUp :size="28" /><strong>{{ selectedFile?.name || '选择 TXT / TSV 文件' }}</strong><small>UTF-8 编码，大小与条数上限由主控配置；文件先上传到主控</small>
         <input type="file" accept=".txt,.tsv,text/plain,text/tab-separated-values" @change="selectedFile = $event.target.files[0]" />
       </label>
     </section>
@@ -217,10 +224,15 @@ function submit() {
     </section>
 
     <section class="panel options-panel">
-      <div class="section-heading"><div><span class="step-number">03</span><div><h2>采集与分析</h2><p>所有访问均使用全新浏览器 Profile，不复用缓存</p></div></div></div>
-      <div class="option-row"><div><strong>抓取 PCAP</strong><small>保存原始网络流量和 TLS 密钥</small></div><label class="switch"><input v-model="pcap" type="checkbox" /><span></span></label></div>
+      <div class="section-heading"><div><span class="step-number">03</span><div><h2>采集与可选产物</h2><p>默认只保留 PCAP 与 TLS keylog；所有访问均使用全新 Profile</p></div></div></div>
+      <div class="option-row"><div><strong>抓取 PCAP</strong><small>TLS keylog 固定保存；PCAP 默认开启</small></div><label class="switch"><input v-model="pcap" type="checkbox" /><span></span></label></div>
       <div class="analysis-steps">
-        <span>分析流水线</span>
+        <span>其他抓取产物（可选）</span>
+        <label><input v-model="saveHtml" type="checkbox" />页面 HTML</label>
+        <label><input v-model="saveReports" type="checkbox" />抓取报告</label>
+      </div>
+      <div class="analysis-steps">
+        <span>后处理流水线（可选）</span>
         <label v-for="label in ['extract', 'classify', 'infer']" :key="label"><input v-model="steps[label]" :disabled="!pcap" type="checkbox" />{{ label }}</label>
       </div>
       <div class="options-two">

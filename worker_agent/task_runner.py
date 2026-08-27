@@ -47,6 +47,12 @@ class TaskTimedOutError(RuntimeError):
     pass
 
 
+class TaskServiceStoppingError(RuntimeError):
+    """Worker 正在退出，当前任务应保留为可恢复状态。"""
+
+    pass
+
+
 class TaskManager:
     """管理单消费者队列，并把任务映射为现有命令行流水线。"""
 
@@ -54,7 +60,9 @@ class TaskManager:
         """恢复异常中断状态，并按需启动后台执行线程。"""
         self.config = config
         self.store = store
-        self._queue: queue.Queue[str | None] = queue.Queue(config.max_queue_size)
+        # 持久化任务必须在重启后全部恢复，因此内存队列不设置硬上限；
+        # max_queue_size 只用于拒绝新的提交。
+        self._queue: queue.Queue[str | None] = queue.Queue()
         self._stop_event = threading.Event()
         self._active_lock = threading.Lock()
         self._active_task_id: str | None = None
@@ -64,7 +72,9 @@ class TaskManager:
             name="worker-task-runner",
             daemon=True,
         )
-        self.store.mark_incomplete_interrupted()
+        self.recovered_task_count = self.store.recover_incomplete_tasks()
+        for task_id in self.store.queued_task_ids():
+            self._queue.put_nowait(task_id)
         if autostart:
             self.start()
 
@@ -98,10 +108,10 @@ class TaskManager:
     def submit(self, request_data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         """以 task_id 实现幂等提交，并创建专属任务目录。"""
         task_id = request_data["task_id"]
-        existing = self.store.get_task(task_id)
+        existing = self.store.get_task_status(task_id)
         if existing:
             return existing, False
-        if self._queue.full():
+        if self.queue_size >= self.config.max_queue_size:
             raise QueueFullError("Worker 本地任务队列已满")
 
         task_dir = self.config.tasks_dir / task_id
@@ -110,7 +120,7 @@ class TaskManager:
                 f"任务目录已经存在但数据库中没有对应记录：{task_id}"
             )
         if not self.store.create_task(request_data):
-            existing = self.store.get_task(task_id)
+            existing = self.store.get_task_status(task_id)
             if existing:
                 return existing, False
             raise TaskConflictError(f"任务 ID 冲突：{task_id}")
@@ -127,7 +137,7 @@ class TaskManager:
                 finished_at=utc_now(),
             )
             raise
-        return self.store.get_task(task_id) or {}, True
+        return self.store.get_task_status(task_id) or {}, True
 
     def cancel(self, task_id: str) -> dict[str, Any] | None:
         """取消排队任务，或请求终止正在运行的任务进程树。"""
@@ -150,6 +160,17 @@ class TaskManager:
             self.store.update_task(task_id, status="CANCELING", stage="CANCELING")
             self.cancel_active_process()
         return self.store.get_task(task_id)
+
+    def resume(
+        self, task_id: str, resume_token: str
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """以幂等令牌恢复原任务目录，保留已提交的 URL 检查点。"""
+        exists, should_enqueue = self.store.resume_task(task_id, resume_token)
+        if not exists:
+            return None, False
+        if should_enqueue:
+            self._queue.put_nowait(task_id)
+        return self.store.get_task_status(task_id), should_enqueue
 
     def cancel_active_process(self) -> None:
         """关闭当前活跃子进程，供取消和服务退出复用。"""
@@ -195,7 +216,11 @@ class TaskManager:
         request_data = task["request"]
         task_dir = self.config.tasks_dir / task_id
         log_path = task_dir / "worker.log"
-        deadline = time.monotonic() + self.config.task_timeout_seconds
+        deadline = (
+            time.monotonic() + self.config.task_timeout_seconds
+            if self.config.task_timeout_seconds > 0
+            else None
+        )
         errors: list[str] = []
 
         try:
@@ -214,6 +239,7 @@ class TaskManager:
             )
 
             output_dir = task_dir / "fetch_output"
+            output_options = request_data.get("outputs") or {}
             capture_command = [
                 str(self.config.python_executable),
                 str(self.config.project_root / "wiki_fetcher.py"),
@@ -226,15 +252,28 @@ class TaskManager:
             ]
             if request_data["pcap"]:
                 capture_command.append("--pcap")
+            if output_options.get("html", False):
+                capture_command.append("--save-html")
+            if output_options.get("reports", False):
+                capture_command.append("--save-reports")
 
             self.store.update_task(
                 task_id, status="CAPTURING", stage="CAPTURING"
             )
-            capture_code = self._run_command(
-                task_id, capture_command, log_path, deadline
-            )
-            if capture_code != 0:
-                errors.append(f"wiki_fetcher.py 退出码：{capture_code}")
+            capture_attempt = 0
+            while True:
+                capture_attempt += 1
+                capture_code = self._run_command(
+                    task_id, capture_command, log_path, deadline
+                )
+                if capture_code == 0:
+                    break
+                self._append_log(
+                    log_path,
+                    f"wiki_fetcher.py 退出码={capture_code}; "
+                    f"第 {capture_attempt} 次重启后将从 URL 检查点续跑",
+                )
+                self._wait_interruptibly(task_id, 5.0, deadline)
 
             steps = request_data["analysis"]["steps"]
             if steps and capture_code == 0:
@@ -267,10 +306,8 @@ class TaskManager:
                 task_id, status="VALIDATING", stage="VALIDATING"
             )
             manifest = self._build_manifest(task_dir, request_data, errors)
-            (task_dir / "manifest.json").write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            with (task_dir / "manifest.json").open("w", encoding="utf-8") as stream:
+                json.dump(manifest, stream, ensure_ascii=False, indent=2)
             final_status = manifest["status"]
             final_error = "; ".join(errors) if errors else None
             self.store.update_task(
@@ -306,6 +343,16 @@ class TaskManager:
                 finished_at=utc_now(),
             )
             self._append_log(log_path, f"task={task_id} timed out: {exc}")
+        except TaskServiceStoppingError:
+            self.store.update_task(
+                task_id,
+                status="QUEUED",
+                stage="RESUMING",
+                error="Worker 服务停止，等待下次启动从 URL 检查点继续",
+                pid=None,
+                finished_at=None,
+            )
+            self._append_log(log_path, f"task={task_id} paused for service restart")
         except Exception as exc:
             self.store.update_task(
                 task_id,
@@ -323,29 +370,24 @@ class TaskManager:
     @staticmethod
     def _write_task_inputs(task_dir: Path, request_data: dict[str, Any]) -> None:
         """落盘规范化请求，并生成旧抓取脚本所需的 input.tsv。"""
-        (task_dir / "request.json").write_text(
-            json.dumps(request_data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        lines = [
-            f"{item['id']}\t{item['name']}\t{item['url']}"
-            for item in request_data["items"]
-        ]
-        (task_dir / "input.tsv").write_text(
-            "\n".join(lines) + "\n", encoding="utf-8"
-        )
+        with (task_dir / "request.json").open("w", encoding="utf-8") as stream:
+            json.dump(request_data, stream, ensure_ascii=False, indent=2)
+        with (task_dir / "input.tsv").open("w", encoding="utf-8", newline="\n") as stream:
+            for item in request_data["items"]:
+                stream.write(f"{item['id']}\t{item['name']}\t{item['url']}\n")
 
     def _run_command(
         self,
         task_id: str,
         command: list[str],
         log_path: Path,
-        deadline: float,
+        deadline: float | None,
     ) -> int:
         """在剩余超时内运行命令，并持续响应数据库中的取消标记。"""
         self._raise_if_canceled(task_id)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if self._stop_event.is_set():
+            raise TaskServiceStoppingError()
+        if deadline is not None and deadline - time.monotonic() <= 0:
             raise TaskTimedOutError(
                 f"任务超过 {self.config.task_timeout_seconds} 秒限制"
             )
@@ -393,7 +435,7 @@ class TaskManager:
                     if self.store.is_cancel_requested(task_id):
                         self._terminate_process_tree(process)
                         raise TaskCanceledError()
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         self._terminate_process_tree(process)
                         raise TaskTimedOutError(
                             f"任务超过 {self.config.task_timeout_seconds} 秒限制"
@@ -409,6 +451,21 @@ class TaskManager:
         """把持久化取消标记转换为控制流异常。"""
         if self.store.is_cancel_requested(task_id):
             raise TaskCanceledError()
+
+    def _wait_interruptibly(
+        self, task_id: str, seconds: float, deadline: float | None
+    ) -> None:
+        """重启退避期间仍响应取消、服务关闭和可选总超时。"""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            self._raise_if_canceled(task_id)
+            if self._stop_event.is_set():
+                raise TaskServiceStoppingError()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TaskTimedOutError(
+                    f"任务超过 {self.config.task_timeout_seconds} 秒限制"
+                )
+            time.sleep(min(0.5, max(0.0, end - time.monotonic())))
 
     @staticmethod
     def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
@@ -451,23 +508,58 @@ class TaskManager:
     ) -> dict[str, Any]:
         """根据真实产物而非脚本退出码，生成 URL 和浏览器两级结果。"""
         output_dir = task_dir / "fetch_output"
+        output_options = request_data.get("outputs") or {}
         units: list[dict[str, Any]] = []
+        units_by_item: dict[str, list[dict[str, Any]]] = {}
+
+        item_dirs: dict[str, Path] = {}
+        if output_dir.is_dir():
+            for candidate in output_dir.iterdir():
+                if not candidate.is_dir():
+                    continue
+                for marker in candidate.glob("capture_*.complete.json"):
+                    try:
+                        payload = json.loads(marker.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeError, json.JSONDecodeError):
+                        continue
+                    item_id = payload.get("item_id")
+                    if isinstance(item_id, str):
+                        item_dirs.setdefault(item_id, candidate)
+                        break
 
         for item in request_data["items"]:
-            candidates = sorted(output_dir.glob(f"{item['id']}-wiki-*"))
-            item_dir = candidates[0] if candidates else None
+            item_dir = item_dirs.get(item["id"])
+            if item_dir is None:
+                candidates = list(output_dir.glob(f"{item['id']}-wiki-*"))
+                item_dir = candidates[0] if candidates else None
             for browser in request_data["browsers"]:
                 checks: dict[str, bool] = {}
                 artifacts: dict[str, dict[str, Any] | None] = {}
 
-                body = item_dir / f"body_{browser}.html" if item_dir else None
-                checks["body"] = self._file_has_data(body)
-                artifacts["body"] = self._artifact_info(task_dir, body)
+                key_log = item_dir / f"tls_keys_{browser}.log" if item_dir else None
+                checks["tls_keylog"] = self._file_has_data(key_log)
+                artifacts["tls_keylog"] = self._artifact_info(task_dir, key_log)
+
+                checkpoint = (
+                    item_dir / f"capture_{browser}.complete.json"
+                    if item_dir else None
+                )
+                checks["checkpoint"] = self._file_has_data(checkpoint)
 
                 if request_data["pcap"]:
                     pcap = item_dir / f"capture_{browser}.pcap" if item_dir else None
                     checks["pcap"] = self._file_has_data(pcap)
                     artifacts["pcap"] = self._artifact_info(task_dir, pcap)
+
+                if output_options.get("html", False):
+                    body = item_dir / f"body_{browser}.html" if item_dir else None
+                    checks["html"] = self._file_has_data(body)
+                    artifacts["html"] = self._artifact_info(task_dir, body)
+
+                if output_options.get("reports", False):
+                    report = item_dir / "report.txt" if item_dir else None
+                    checks["report"] = self._file_has_data(report)
+                    artifacts["report"] = self._artifact_info(task_dir, report)
 
                 for step in request_data["analysis"]["steps"]:
                     if step == "extract":
@@ -490,8 +582,7 @@ class TaskManager:
                     status = "PARTIAL"
                 else:
                     status = "FAILED"
-                units.append(
-                    {
+                unit = {
                         "item_id": item["id"],
                         "name": item["name"],
                         "url": item["url"],
@@ -500,11 +591,12 @@ class TaskManager:
                         "checks": checks,
                         "artifacts": artifacts,
                     }
-                )
+                units.append(unit)
+                units_by_item.setdefault(item["id"], []).append(unit)
 
         items: list[dict[str, Any]] = []
         for item in request_data["items"]:
-            item_units = [unit for unit in units if unit["item_id"] == item["id"]]
+            item_units = units_by_item.get(item["id"], [])
             item_status = self._aggregate_statuses(
                 [unit["status"] for unit in item_units]
             )
@@ -536,7 +628,7 @@ class TaskManager:
 
         file_count = 0
         total_bytes = 0
-        for path in sorted(task_dir.rglob("*")):
+        for path in task_dir.rglob("*"):
             if path.is_file():
                 file_count += 1
                 total_bytes += path.stat().st_size
@@ -561,7 +653,8 @@ class TaskManager:
             "cache_policy": {
                 "enabled": False,
                 "fresh_browser_profile": True,
-                "reuse_existing_results": False,
+                "reuse_completed_capture_units": True,
+                "atomic_url_checkpoints": True,
                 "supported_browsers": list(self.config.allowed_browsers),
             },
             "process_errors": list(process_errors),

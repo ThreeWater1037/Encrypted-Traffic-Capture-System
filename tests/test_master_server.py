@@ -15,6 +15,7 @@ from master_server.store import MasterStore
 class FakeWorkerClient:
     def __init__(self) -> None:
         self.task_id = ""
+        self.resume_tokens = []
 
     def health(self):
         return {"status": "ok", "worker_id": "worker-local", "busy": False}
@@ -54,6 +55,10 @@ class FakeWorkerClient:
     def cancel_task(self, task_id):
         return {"task_id": task_id, "status": "CANCELED", "stage": "DONE"}
 
+    def resume_task(self, task_id, resume_token):
+        self.resume_tokens.append(resume_token)
+        return {"task_id": task_id, "status": "QUEUED", "stage": "RESUMING"}
+
 
 class MasterServerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -69,10 +74,11 @@ class MasterServerTests(unittest.TestCase):
         )
         self.config.prepare()
         self.store = MasterStore(self.config.database_path)
+        self.fake_worker = FakeWorkerClient()
         self.dispatcher = JobDispatcher(
             self.config,
             self.store,
-            client_factory=lambda _machine: FakeWorkerClient(),
+            client_factory=lambda _machine: self.fake_worker,
             autostart=False,
         )
         self.app = create_app(
@@ -184,6 +190,34 @@ class MasterServerTests(unittest.TestCase):
         self.assertEqual(len(data["items"]), 2)
         self.assertNotIn("source_path", data)
 
+    def test_job_detail_is_paginated_and_summary_remains_global(self):
+        payload = self.payload("paged-job-001")
+        payload["items"].append(
+            {"id": "3", "name": "Third", "url": "https://example.net/"}
+        )
+        self.store.create_job(payload)
+
+        response = self.client.get("/api/v1/jobs/paged-job-001?offset=1&limit=1")
+        data = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["summary"]["total"], 3)
+        self.assertEqual(data["page"], {"offset": 1, "limit": 1, "returned": 1, "total": 3})
+        self.assertEqual(len(data["executions"]), 1)
+
+    def test_default_job_disables_optional_outputs_and_analysis(self):
+        payload = self.payload("capture-defaults-001")
+        payload.pop("pcap")
+        payload.pop("analysis")
+
+        response = self.client.post("/api/v1/jobs", json=payload)
+
+        self.assertEqual(response.status_code, 202)
+        request_data = self.store.get_job("capture-defaults-001")["request"]
+        self.assertTrue(request_data["pcap"])
+        self.assertEqual(request_data["outputs"], {"html": False, "reports": False})
+        self.assertEqual(request_data["analysis"]["steps"], [])
+
     def test_file_upload_is_saved_under_master_data(self):
         content = b"1\tExample\thttps://example.com/\n"
         response = self.client.post(
@@ -199,6 +233,8 @@ class MasterServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         job = self.store.get_job("upload-master-001")
         self.assertEqual(job["source_filename"], "urls.txt")
+        self.assertEqual(job["request"]["outputs"], {"html": False, "reports": False})
+        self.assertEqual(job["request"]["analysis"]["steps"], [])
         self.assertTrue((self.config.uploads_dir / "upload-master-001" / "urls.txt").is_file())
 
     def test_dispatcher_aggregates_each_url_result(self):
@@ -209,6 +245,38 @@ class MasterServerTests(unittest.TestCase):
         self.assertEqual(job["items"][0]["status"], "SUCCEEDED")
         self.assertEqual(job["items"][1]["status"], "FAILED")
         self.assertEqual(job["summary"]["progress"], 100)
+
+    def test_resume_job_reuses_worker_task_with_idempotency_token(self):
+        job_id = "resume-master-001"
+        self.store.create_job(self.payload(job_id))
+        self.store.update_worker_executions(job_id, "worker-local", status="FAILED")
+        self.store.update_job(job_id, status="FAILED", stage="DONE")
+
+        response = self.client.post(f"/api/v1/jobs/{job_id}/resume")
+        self.assertEqual(response.status_code, 202)
+        token = self.store.get_job_control(job_id)["resume_token"]
+        self.assertTrue(token.startswith("resume-"))
+
+        self.dispatcher._run_job(job_id)
+
+        self.assertEqual(self.fake_worker.resume_tokens, [token])
+        self.assertEqual(self.store.get_job_status(job_id)["status"], "PARTIAL")
+
+    def test_restart_job_creates_fresh_job_id_and_same_request(self):
+        job_id = "restart-master-001"
+        original = self.payload(job_id)
+        self.store.create_job(original)
+        self.store.update_worker_executions(job_id, "worker-local", status="SUCCEEDED")
+        self.store.update_job(job_id, status="SUCCEEDED", stage="DONE")
+
+        response = self.client.post(f"/api/v1/jobs/{job_id}/restart", json={})
+        data = response.get_json()
+
+        self.assertEqual(response.status_code, 202)
+        self.assertNotEqual(data["job_id"], job_id)
+        cloned = self.store.get_job_control(data["job_id"])["request"]
+        self.assertEqual(cloned["items"], original["items"])
+        self.assertEqual(cloned["targets"], original["targets"])
 
     def test_unknown_machine_is_rejected_before_job_creation(self):
         payload = self.payload("unknown-machine-001")

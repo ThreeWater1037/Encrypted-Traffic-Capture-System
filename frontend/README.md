@@ -4,7 +4,7 @@ Vue 3 + Vite 页面已连接主控 Flask，不再使用 Mock 数据。页面支�
 
 - 粘贴 URL 或直接上传 UTF-8 TXT/TSV。
 - 按 Worker 实际能力选择机器和 Chrome、Edge、Firefox。
-- 配置 PCAP、分析步骤、SNI 后缀和 coframe。
+- 默认只保存 PCAP 与 TLS keylog，并可选开启 HTML、报告、分析步骤、SNI 后缀和 coframe。
 - 查看总任务及每个 `URL × 机器 × 浏览器` 的实时状态。
 - 查看 Worker 本地实验路径与增量日志。
 - 添加和探测子机器；Worker Token 不会显示在页面中。

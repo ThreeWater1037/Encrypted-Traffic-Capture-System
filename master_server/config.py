@@ -174,8 +174,8 @@ class MasterConfig:
     port: int
     token: str
     data_dir: Path
-    max_content_length: int = 20_971_520
-    max_items: int = 10_000
+    max_content_length: int = 268_435_456
+    max_items: int = 100_000
     max_queue_size: int = 100
     worker_request_timeout: float = 15.0
     poll_interval: float = 2.0
@@ -237,7 +237,7 @@ class MasterConfig:
                     "limits",
                     "max_content_length",
                     "MASTER_MAX_CONTENT_LENGTH",
-                    20_971_520,
+                    268_435_456,
                 ),
                 "limits.max_content_length",
             ),
@@ -247,7 +247,7 @@ class MasterConfig:
                     "limits",
                     "max_items",
                     "MASTER_MAX_ITEMS",
-                    10_000,
+                    100_000,
                 ),
                 "limits.max_items",
             ),

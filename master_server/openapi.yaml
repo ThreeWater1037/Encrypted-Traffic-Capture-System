@@ -170,6 +170,8 @@ paths:
                   description: MachineTarget 数组的 JSON 字符串
                   example: '[{"machine_id":"worker-local","browsers":["chrome","edge"]}]'
                 pcap: { type: boolean, default: true }
+                save_html: { type: boolean, default: false }
+                save_reports: { type: boolean, default: false }
                 analysis_steps: { type: string, example: extract,classify,infer }
                 with_coframe: { type: boolean, default: false }
                 sni_suffixes: { type: string, example: wikipedia.org,wikimedia.org }
@@ -190,6 +192,14 @@ paths:
       operationId: getJob
       summary: 查询任务及 URL 执行矩阵
       security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+        - in: query
+          name: limit
+          description: 单次最多返回 5000 个执行单元
+          schema: { type: integer, minimum: 1, maximum: 5000, default: 500 }
       responses:
         '200':
           description: 任务详情
@@ -212,6 +222,48 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Job' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/jobs/{job_id}/resume:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [Jobs]
+      operationId: resumeJob
+      summary: 沿用原 Worker 目录从 URL 检查点继续
+      security: [{ bearerAuth: [] }]
+      responses:
+        '202':
+          description: 任务已进入断点恢复队列
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/jobs/{job_id}/restart:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [Jobs]
+      operationId: restartJob
+      summary: 复制任务配置并开启全新一轮
+      description: 新任务使用新的 job_id 和 Worker 输出目录，不复用旧检查点。
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                job_id: { type: string, description: 可选；省略时自动生成 }
+                name: { type: string, description: 可选的新任务名称 }
+      responses:
+        '202':
+          description: 新一轮任务已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /api/v1/jobs/{job_id}/results:
     parameters:
       - $ref: '#/components/parameters/JobId'
@@ -220,6 +272,13 @@ paths:
       operationId: getJobResults
       summary: 查询结构化结果与 Worker 本地路径
       security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 5000, default: 500 }
       responses:
         '200':
           description: 结构化任务结果
@@ -345,17 +404,25 @@ components:
         items:
           type: array
           minItems: 1
+          maxItems: 100000
           items: { $ref: '#/components/schemas/TaskItem' }
         targets:
           type: array
           minItems: 1
           items: { $ref: '#/components/schemas/MachineTarget' }
         pcap: { type: boolean, default: true }
+        outputs:
+          type: object
+          description: HTML 与抓取报告均为可选辅助产物；TLS keylog 固定保存。
+          properties:
+            html: { type: boolean, default: false }
+            reports: { type: boolean, default: false }
         analysis:
           type: object
           properties:
             steps:
               type: array
+              default: []
               items: { type: string, enum: [extract, classify, infer] }
             with_coframe: { type: boolean, default: false }
             sni_suffixes:
@@ -407,6 +474,13 @@ components:
         executions:
           type: array
           items: { $ref: '#/components/schemas/Execution' }
+        page:
+          type: object
+          properties:
+            offset: { type: integer, minimum: 0 }
+            limit: { type: integer, minimum: 1 }
+            returned: { type: integer, minimum: 0 }
+            total: { type: integer, minimum: 0 }
     Error:
       type: object
       required: [error]

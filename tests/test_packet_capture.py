@@ -3,10 +3,11 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
-from wiki_fetcher import PacketCapture
+from wiki_fetcher import PacketCapture, UrlEntry, WikiFetcher
 
 
 class _ExitedProcess:
@@ -135,6 +136,44 @@ class PacketCaptureTests(unittest.TestCase):
     def test_linux_tcpdump_fallback_uses_any_interface(self) -> None:
         with patch("wiki_fetcher.platform.system", return_value="Linux"):
             self.assertEqual(PacketCapture._default_iface_tcpdump(), "any")
+
+    def test_nonempty_partial_files_are_not_a_valid_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fetcher = WikiFetcher(Path(temp_dir), ["chrome"], True)
+            entry = UrlEntry(id="1", name="Example", url="https://example.com/")
+            item_dir = fetcher._url_dir("1-wiki-Example")
+            fetcher._key_log_path(item_dir, "chrome").write_text(
+                "CLIENT_RANDOM key", encoding="utf-8"
+            )
+            fetcher._pcap_path(item_dir, "chrome").write_bytes(b"partial-pcap")
+
+            self.assertFalse(fetcher._checkpoint_valid(entry, item_dir, "chrome"))
+
+    def test_valid_checkpoint_requires_matching_url_and_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fetcher = WikiFetcher(Path(temp_dir), ["chrome"], True)
+            entry = UrlEntry(id="1", name="Example", url="https://example.com/")
+            item_dir = fetcher._url_dir("1-wiki-Example")
+            fetcher._key_log_path(item_dir, "chrome").write_text(
+                "CLIENT_RANDOM key", encoding="utf-8"
+            )
+            fetcher._pcap_path(item_dir, "chrome").write_bytes(b"pcap")
+            fetcher._completion_marker_path(item_dir, "chrome").write_text(
+                json.dumps(
+                    {
+                        "item_id": "1",
+                        "url": "https://example.com/",
+                        "browser": "chrome",
+                        "artifacts": {
+                            "tls_keys_chrome.log": len("CLIENT_RANDOM key"),
+                            "capture_chrome.pcap": len(b"pcap"),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(fetcher._checkpoint_valid(entry, item_dir, "chrome"))
 
 
 if __name__ == "__main__":

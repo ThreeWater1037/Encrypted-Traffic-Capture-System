@@ -24,6 +24,7 @@ ACTIVE_STATUSES = {
     "ANALYZING",
     "VALIDATING",
     "RUNNING",
+    "WAITING_FOR_WORKER",
     "CANCELING",
 }
 
@@ -91,6 +92,7 @@ class MasterStore:
                     created_at TEXT NOT NULL,
                     started_at TEXT,
                     finished_at TEXT,
+                    resume_token TEXT,
                     updated_at TEXT NOT NULL
                 );
 
@@ -120,6 +122,12 @@ class MasterStore:
                     ON executions(worker_task_id);
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "resume_token" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN resume_token TEXT")
 
     def machine_count(self) -> int:
         with self._connection() as connection:
@@ -235,32 +243,38 @@ class MasterStore:
                     now,
                 ),
             )
-            for target in request_data["targets"]:
-                worker_task_id = self.worker_task_id(
+            worker_task_ids = {
+                target["machine_id"]: self.worker_task_id(
                     request_data["job_id"], target["machine_id"]
                 )
-                for item in request_data["items"]:
-                    for browser in target["browsers"]:
-                        connection.execute(
-                            """
-                            INSERT INTO executions (
-                                job_id, machine_id, worker_task_id,
-                                item_id, item_name, url, browser,
-                                status, stage, created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'CREATED', 'CREATED', ?, ?)
-                            """,
-                            (
-                                request_data["job_id"],
-                                target["machine_id"],
-                                worker_task_id,
-                                item["id"],
-                                item["name"],
-                                item["url"],
-                                browser,
-                                now,
-                                now,
-                            ),
-                        )
+                for target in request_data["targets"]
+            }
+            rows = (
+                (
+                    request_data["job_id"],
+                    target["machine_id"],
+                    worker_task_ids[target["machine_id"]],
+                    item["id"],
+                    item["name"],
+                    item["url"],
+                    browser,
+                    now,
+                    now,
+                )
+                for target in request_data["targets"]
+                for item in request_data["items"]
+                for browser in target["browsers"]
+            )
+            connection.executemany(
+                """
+                INSERT INTO executions (
+                    job_id, machine_id, worker_task_id,
+                    item_id, item_name, url, browser,
+                    status, stage, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'CREATED', 'CREATED', ?, ?)
+                """,
+                rows,
+            )
 
     @staticmethod
     def worker_task_id(job_id: str, machine_id: str) -> str:
@@ -272,9 +286,37 @@ class MasterStore:
     def list_jobs(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+                """
+                SELECT job_id, name, status, stage, error, cancel_requested,
+                       resume_token, created_at, started_at, finished_at, updated_at
+                  FROM jobs ORDER BY created_at DESC LIMIT ?
+                """,
+                (limit,),
             ).fetchall()
-        return [self._job_with_executions(row) for row in rows]
+            job_ids = [str(row["job_id"]) for row in rows]
+            counts: dict[str, dict[str, int]] = {job_id: {} for job_id in job_ids}
+            if job_ids:
+                placeholders = ",".join("?" for _ in job_ids)
+                count_rows = connection.execute(
+                    f"""
+                    SELECT job_id, status, COUNT(*) AS count
+                      FROM executions
+                     WHERE job_id IN ({placeholders})
+                     GROUP BY job_id, status
+                    """,
+                    job_ids,
+                ).fetchall()
+                for item in count_rows:
+                    counts[str(item["job_id"])][str(item["status"])] = int(
+                        item["count"]
+                    )
+        jobs = []
+        for row in rows:
+            job = dict(row)
+            job["cancel_requested"] = bool(job["cancel_requested"])
+            job["execution_counts"] = counts[str(job["job_id"])]
+            jobs.append(job)
+        return jobs
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
@@ -282,6 +324,84 @@ class MasterStore:
                 "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
         return self._job_with_executions(row) if row else None
+
+    def get_job_control(self, job_id: str) -> dict[str, Any] | None:
+        """读取任务请求与控制状态，但不加载数万条 execution。"""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return self._job(row) if row else None
+
+    def get_job_status(self, job_id: str) -> dict[str, Any] | None:
+        """只读轮询控制字段，避免每次解析包含数万 URL 的 request_json。"""
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT job_id, name, status, stage, error, cancel_requested,
+                       created_at, started_at, finished_at, updated_at
+                  FROM jobs WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        value["cancel_requested"] = bool(value["cancel_requested"])
+        return value
+
+    def get_job_page(
+        self, job_id: str, *, offset: int = 0, limit: int = 500
+    ) -> dict[str, Any] | None:
+        """分页读取任务明细，避免前端轮询一次加载数万条 execution。"""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            executions = connection.execute(
+                """
+                SELECT e.*, m.name AS machine_name, m.base_url AS machine_url
+                  FROM executions e
+                  JOIN machines m ON m.machine_id = e.machine_id
+                 WHERE e.job_id = ?
+                 ORDER BY e.execution_id
+                 LIMIT ? OFFSET ?
+                """,
+                (job_id, limit, offset),
+            ).fetchall()
+            count_rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                  FROM executions WHERE job_id = ? GROUP BY status
+                """,
+                (job_id,),
+            ).fetchall()
+        value = dict(row)
+        value.pop("request_json", None)
+        value.pop("resume_token", None)
+        value["cancel_requested"] = bool(value["cancel_requested"])
+        value["executions"] = [self._execution(item) for item in executions]
+        value["execution_counts"] = {
+            str(item["status"]): int(item["count"]) for item in count_rows
+        }
+        value["page"] = {
+            "offset": offset,
+            "limit": limit,
+            "returned": len(executions),
+            "total": sum(value["execution_counts"].values()),
+        }
+        return value
+
+    def execution_status_counts(self, job_id: str) -> dict[str, int]:
+        """在 SQLite 内聚合执行状态，避免轮询时加载全部执行明细。"""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT status, COUNT(*) FROM executions WHERE job_id = ? GROUP BY status",
+                (job_id,),
+            ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
 
     def _job_with_executions(self, row: sqlite3.Row) -> dict[str, Any]:
         job = self._job(row)
@@ -307,6 +427,7 @@ class MasterStore:
             "cancel_requested",
             "started_at",
             "finished_at",
+            "resume_token",
         }
         if set(fields) - allowed:
             raise ValueError("包含不允许更新的任务字段")
@@ -322,6 +443,34 @@ class MasterStore:
                 f"UPDATE jobs SET {assignments} WHERE job_id = ?",
                 (*values.values(), job_id),
             )
+
+    def resume_job(self, job_id: str, resume_token: str) -> bool:
+        """原子重置终态任务和执行矩阵，保留原请求供检查点续跑。"""
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                   SET status = 'CREATED', stage = 'RESUMING', error = NULL,
+                       cancel_requested = 0, finished_at = NULL,
+                       resume_token = ?, updated_at = ?
+                 WHERE job_id = ?
+                   AND status IN ('PARTIAL','FAILED','CANCELED','INTERRUPTED')
+                """,
+                (resume_token, now, job_id),
+            )
+            if cursor.rowcount != 1:
+                return False
+            connection.execute(
+                """
+                UPDATE executions
+                   SET status = 'RESUMING', stage = 'RESUMING',
+                       error = NULL, result_json = NULL, updated_at = ?
+                 WHERE job_id = ?
+                """,
+                (now, job_id),
+            )
+            return True
 
     def update_worker_executions(
         self,
@@ -370,6 +519,58 @@ class MasterStore:
                     item_id,
                     browser,
                 ),
+            )
+
+    def update_worker_results(
+        self,
+        job_id: str,
+        machine_id: str,
+        *,
+        top_status: str,
+        units: list[dict[str, Any]],
+        error: str | None,
+    ) -> None:
+        """在单事务中写入一个 Worker 的全部 URL 结果。"""
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE executions
+                   SET status = ?, stage = 'DONE', error = ?,
+                       result_json = NULL, updated_at = ?
+                 WHERE job_id = ? AND machine_id = ?
+                """,
+                (top_status, error, now, job_id, machine_id),
+            )
+            rows = []
+            for unit in units:
+                item_id = unit.get("item_id")
+                browser = unit.get("browser")
+                if not isinstance(item_id, str) or not isinstance(browser, str):
+                    continue
+                status = str(unit.get("status") or top_status)
+                if status not in TERMINAL_STATUSES:
+                    status = "FAILED"
+                rows.append(
+                    (
+                        status,
+                        json.dumps(unit, ensure_ascii=False),
+                        now,
+                        job_id,
+                        machine_id,
+                        item_id,
+                        browser,
+                    )
+                )
+            connection.executemany(
+                """
+                UPDATE executions
+                   SET status = ?, stage = 'DONE', error = NULL,
+                       result_json = ?, updated_at = ?
+                 WHERE job_id = ? AND machine_id = ?
+                   AND item_id = ? AND browser = ?
+                """,
+                rows,
             )
 
     def request_cancel(self, job_id: str) -> bool:

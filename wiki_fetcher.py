@@ -11,6 +11,7 @@
 """
 
 import os
+import json
 import platform
 import time
 import signal
@@ -25,7 +26,7 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterable, Iterator, Optional
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -696,8 +697,16 @@ def _entry_slug(entry: "UrlEntry") -> str:
 
 
 class WikiFetcher:
-    """按 URL 和浏览器顺序执行抓取，并维护汇总报告。"""
-    def __init__(self, output_dir: Path, browsers: list[str], capture_pcap: bool):
+    """按 URL 和浏览器顺序抓取核心流量，并按需保存辅助产物。"""
+    def __init__(
+        self,
+        output_dir: Path,
+        browsers: list[str],
+        capture_pcap: bool,
+        *,
+        save_html: bool = False,
+        save_reports: bool = False,
+    ):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.browsers = browsers
@@ -706,6 +715,8 @@ class WikiFetcher:
             os.getenv("BROWSER_PROXY_URL"),
             name="BROWSER_PROXY_URL",
         )
+        self.save_html = save_html
+        self.save_reports = save_reports
         self.all_records: list[SessionRecord] = []   # flat list across all URLs
 
     # ------------------------------------------------------------------
@@ -722,6 +733,110 @@ class WikiFetcher:
 
     def _pcap_path(self, url_dir: Path, browser_key: str) -> Path:
         return url_dir / f"capture_{browser_key}.pcap"
+
+    def _completion_marker_path(self, url_dir: Path, browser_key: str) -> Path:
+        return url_dir / f"capture_{browser_key}.complete.json"
+
+    def _expected_artifacts(self, url_dir: Path, browser_key: str) -> list[Path]:
+        paths = [self._key_log_path(url_dir, browser_key)]
+        if self.capture_pcap:
+            paths.append(self._pcap_path(url_dir, browser_key))
+        if self.save_html:
+            paths.append(url_dir / f"body_{browser_key}.html")
+        return paths
+
+    def _checkpoint_valid(
+        self, entry: "UrlEntry", url_dir: Path, browser_key: str
+    ) -> bool:
+        """仅在原子标记和全部预期文件均有效时跳过采集单元。"""
+        marker = self._completion_marker_path(url_dir, browser_key)
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        if payload.get("item_id") != entry.id or payload.get("url") != entry.url:
+            return False
+        if payload.get("browser") != browser_key:
+            return False
+        sizes = payload.get("artifacts")
+        if not isinstance(sizes, dict):
+            return False
+        for path in self._expected_artifacts(url_dir, browser_key):
+            if not path.is_file() or path.stat().st_size <= 0:
+                return False
+            if sizes.get(path.name) != path.stat().st_size:
+                return False
+        return True
+
+    def _clear_incomplete_artifacts(self, url_dir: Path, browser_key: str) -> None:
+        """重抓前清理半截文件，防止旧非空 PCAP 被误判为新结果。"""
+        paths = self._expected_artifacts(url_dir, browser_key)
+        paths.append(self._completion_marker_path(url_dir, browser_key))
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise RuntimeError(f"无法清理未完成产物 {path}: {exc}") from exc
+
+    def _mark_complete(
+        self,
+        entry: "UrlEntry",
+        url_dir: Path,
+        browser_key: str,
+        record: SessionRecord,
+    ) -> bool:
+        """采集和文件落盘全部成功后，原子提交 URL/浏览器检查点。"""
+        expected = self._expected_artifacts(url_dir, browser_key)
+        if record.error or not all(
+            path.is_file() and path.stat().st_size > 0 for path in expected
+        ):
+            return False
+        marker = self._completion_marker_path(url_dir, browser_key)
+        temporary = marker.with_suffix(marker.suffix + ".tmp")
+        payload = {
+            "version": 1,
+            "item_id": entry.id,
+            "name": entry.name,
+            "url": entry.url,
+            "browser": browser_key,
+            "completed_at": datetime.now().isoformat(),
+            "artifacts": {path.name: path.stat().st_size for path in expected},
+        }
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(marker)
+        return True
+
+    def _write_progress(
+        self,
+        *,
+        position: int,
+        total: int,
+        entry: "UrlEntry",
+        completed_units: int,
+        skipped_units: int,
+        incomplete_units: int,
+        finished: bool = False,
+    ) -> None:
+        """原子更新批次进度；完成标记仍是续跑的最终依据。"""
+        path = self.output_dir / "capture_progress.json"
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        payload = {
+            "version": 1,
+            "status": "finished" if finished else "running",
+            "updated_at": datetime.now().isoformat(),
+            "last_processed_position": position,
+            "total_urls": total,
+            "last_item": {"id": entry.id, "name": entry.name, "url": entry.url},
+            "completed_units_this_run": completed_units,
+            "skipped_units_from_checkpoint": skipped_units,
+            "incomplete_units_this_run": incomplete_units,
+        }
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(path)
 
     # ------------------------------------------------------------------
     # Single browser fetch
@@ -816,8 +931,11 @@ class WikiFetcher:
 
             final_url = driver.current_url
             page_title = driver.title
+            # Keep page content in memory for browser-error detection even when
+            # HTML is not selected as an output artifact.
             html = driver.page_source
-            cookies = driver.get_cookies()
+            if self.save_reports:
+                cookies = driver.get_cookies()
 
             detected_error = _detect_browser_error_page(final_url, html)
             if detected_error:
@@ -853,7 +971,7 @@ class WikiFetcher:
         content_hash = hashlib.sha256(html.encode()).hexdigest() if html else ""
         html_length = len(html.encode())
 
-        if error_html:
+        if self.save_html and error_html:
             error_body_path = url_dir / f"error_{driver_key}.html"
             error_body_path.write_text(error_html, encoding="utf-8")
             log.info(
@@ -862,7 +980,7 @@ class WikiFetcher:
                 len(error_html.encode()),
             )
 
-        if html:
+        if self.save_html and html:
             body_path = url_dir / f"body_{driver_key}.html"
             body_path.write_text(html, encoding="utf-8")
             log.info("    Body → %s (%d bytes)", body_path, html_length)
@@ -886,32 +1004,58 @@ class WikiFetcher:
     # Single entry point
     # ------------------------------------------------------------------
 
-    def _run_entry(self, entry: "UrlEntry", position: int, total: int):
-        """依次运行当前词条选择的浏览器，并写入词条级 report.txt。"""
+    def _run_entry(
+        self, entry: "UrlEntry", position: int, total: int
+    ) -> tuple[int, int, int]:
+        """依次运行当前词条选择的浏览器，并按需写入辅助报告。"""
         slug = _entry_slug(entry)
         url_dir = self._url_dir(slug)
         url_records: list[SessionRecord] = []
+
+        completed_browsers: set[str] = set()
+        for key in self.browsers:
+            if key not in AVAILABLE_DRIVERS:
+                continue
+            if self._checkpoint_valid(entry, url_dir, key):
+                completed_browsers.add(key)
+
+        report_path = url_dir / "report.txt"
+        captured = 0
+        skipped = 0
+        incomplete = 0
 
         for key in self.browsers:
             if key not in AVAILABLE_DRIVERS:
                 log.warning("  Unknown browser '%s', skipping.", key)
                 continue
 
-            # 断点恢复：若该浏览器的输出文件已完整存在则跳过
-            body_path = url_dir / f"body_{key}.html"
-            if body_path.exists() and body_path.stat().st_size > 0:
-                log.info("  → %s [已完成，跳过]", AVAILABLE_DRIVERS[key].name)
+            if key in completed_browsers:
+                log.info("  → %s [检查点已完成，跳过]", AVAILABLE_DRIVERS[key].name)
+                skipped += 1
                 continue
 
             log.info("  → %s", AVAILABLE_DRIVERS[key].name)
+            self._clear_incomplete_artifacts(url_dir, key)
             record = self._fetch_with(entry.url, key, url_dir)
             url_records.append(record)
-            self.all_records.append(record)
-            print(record.summary())
-            print()
+            if self.save_reports:
+                self.all_records.append(record)
+            if self._mark_complete(entry, url_dir, key, record):
+                captured += 1
+            else:
+                incomplete += 1
+                log.warning("    URL 检查点未提交；下次启动会重新抓取该单元")
+            if self.save_reports:
+                print(record.summary())
+                print()
+            else:
+                log.info(
+                    "    Core artifacts: tls_keylog=%s pcap=%s",
+                    "saved" if record.key_log_path else "missing",
+                    "saved" if record.pcap_path else "disabled/missing",
+                )
 
-        if url_records:
-            report_path = url_dir / "report.txt"
+        if self.save_reports and url_records:
             lines = [
                 f"ID   : {entry.id}",
                 f"词条 : {entry.name}",
@@ -921,14 +1065,14 @@ class WikiFetcher:
             for r in url_records:
                 lines += [f"[{r.browser}]", r.summary(), ""]
             report_path.write_text("\n".join(lines), encoding="utf-8")
+        return captured, skipped, incomplete
 
     # ------------------------------------------------------------------
     # Batch entry point
     # ------------------------------------------------------------------
 
-    def run(self, entries: list["UrlEntry"]):
+    def run(self, entries: Iterable["UrlEntry"], *, total: int) -> bool:
         """执行完整批次；URL 之间保留固定间隔以减少相互干扰。"""
-        total = len(entries)
         log.info("词条数 : %d", total)
         log.info("Output : %s", self.output_dir)
         log.info("pcap   : %s", "enabled" if self.capture_pcap else "disabled")
@@ -936,20 +1080,51 @@ class WikiFetcher:
             "Browser proxy: %s",
             self.proxy.display_url if self.proxy else "disabled",
         )
+        log.info("HTML   : %s", "enabled" if self.save_html else "disabled")
+        log.info("reports: %s", "enabled" if self.save_reports else "disabled")
         log.info("Interval between URLs: %.1f s", INTERVAL_BETWEEN_URLS)
         log.info("=" * 60)
 
+        completed_units = 0
+        skipped_units = 0
+        incomplete_units = 0
+        last_entry: Optional[UrlEntry] = None
         for pos, entry in enumerate(entries, start=1):
             log.info("[%d/%d] ID=%s  %s", pos, total, entry.id, entry.name)
             log.info("  %s", entry.url)
 
-            self._run_entry(entry, pos, total)
+            captured, skipped, incomplete = self._run_entry(entry, pos, total)
+            completed_units += captured
+            skipped_units += skipped
+            incomplete_units += incomplete
+            last_entry = entry
+            if captured or incomplete or pos % 1000 == 0 or pos == total:
+                self._write_progress(
+                    position=pos,
+                    total=total,
+                    entry=entry,
+                    completed_units=completed_units,
+                    skipped_units=skipped_units,
+                    incomplete_units=incomplete_units,
+                )
 
-            if pos < total:
+            if pos < total and (captured or incomplete):
                 log.info("  Waiting %.1f s ...", INTERVAL_BETWEEN_URLS)
                 time.sleep(INTERVAL_BETWEEN_URLS)
 
-        self._write_summary()
+        if self.save_reports:
+            self._write_summary()
+        if last_entry is not None:
+            self._write_progress(
+                position=total,
+                total=total,
+                entry=last_entry,
+                completed_units=completed_units,
+                skipped_units=skipped_units,
+                incomplete_units=incomplete_units,
+                finished=incomplete_units == 0,
+            )
+        return incomplete_units == 0
 
     # ------------------------------------------------------------------
     # Global summary report
@@ -976,17 +1151,16 @@ class WikiFetcher:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _load_entries(txt_path: str,
-                  id_start: Optional[int] = None,
-                  id_end: Optional[int] = None) -> list[UrlEntry]:
+def _iter_entries(
+    txt_path: str,
+    id_start: Optional[int] = None,
+    id_end: Optional[int] = None,
+) -> Iterator[UrlEntry]:
     """
     读取 urls.txt（制表符分隔：ID\\t词条名\\t完整URL）。
     跳过注释行（#）和空行。
     若指定 id_start / id_end，只返回 ID 在 [id_start, id_end] 区间内的词条。
     """
-    entries: list[UrlEntry] = []
-    skipped_range = 0
-
     with open(txt_path, encoding="utf-8") as fh:
         for raw in fh:
             line = raw.strip()
@@ -1005,17 +1179,20 @@ def _load_entries(txt_path: str,
 
             if numeric_id is not None:
                 if id_start is not None and numeric_id < id_start:
-                    skipped_range += 1
                     continue
                 if id_end is not None and numeric_id > id_end:
-                    skipped_range += 1
                     continue
 
-            entries.append(UrlEntry(id=entry_id, name=name, url=url))
+            yield UrlEntry(id=entry_id, name=name, url=url)
 
-    if skipped_range:
-        log.info("ID 范围过滤：跳过 %d 条（范围外）", skipped_range)
-    return entries
+
+def _load_entries(
+    txt_path: str,
+    id_start: Optional[int] = None,
+    id_end: Optional[int] = None,
+) -> list[UrlEntry]:
+    """兼容旧调用；大批量入口使用 _iter_entries 流式读取。"""
+    return list(_iter_entries(txt_path, id_start=id_start, id_end=id_end))
 
 
 def main():
@@ -1067,14 +1244,30 @@ def main():
             "需要 tshark（Wireshark）或 tcpdump 且有 BPF 读取权限。"
         ),
     )
+    parser.add_argument(
+        "--save-html", action="store_true",
+        help="可选：保存浏览器获取的完整 HTML 页面正文。",
+    )
+    parser.add_argument(
+        "--save-reports", action="store_true",
+        help="可选：保存逐 URL report.txt 和批次 summary.txt。",
+    )
     args = parser.parse_args()
 
     # 构建 UrlEntry 列表
     if args.input:
-        entries = _load_entries(args.input, id_start=args.id_start, id_end=args.id_end)
-        if not entries:
+        total = sum(
+            1
+            for _ in _iter_entries(
+                args.input, id_start=args.id_start, id_end=args.id_end
+            )
+        )
+        if total == 0:
             parser.error(f"{args.input} 中未找到符合条件的词条")
-        log.info("加载词条：%d 条（来自 %s）", len(entries), args.input)
+        entries: Iterable[UrlEntry] = _iter_entries(
+            args.input, id_start=args.id_start, id_end=args.id_end
+        )
+        log.info("加载词条：%d 条（来自 %s）", total, args.input)
         if args.id_start or args.id_end:
             log.info("ID 范围：[%s, %s]",
                      args.id_start if args.id_start else "起始",
@@ -1082,13 +1275,18 @@ def main():
     else:
         # 单个 URL：ID 和名称留空
         entries = [UrlEntry(id="0", name="manual", url=args.url)]
+        total = 1
 
     fetcher = WikiFetcher(
         output_dir=Path(args.output_dir),
         browsers=args.browsers,
         capture_pcap=args.pcap,
+        save_html=args.save_html,
+        save_reports=args.save_reports,
     )
-    fetcher.run(entries)
+    if not fetcher.run(entries, total=total):
+        log.error("仍有采集单元未完成；退出码 2 将触发 Worker 检查点重试")
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

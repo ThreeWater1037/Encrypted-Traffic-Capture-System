@@ -102,6 +102,19 @@ class WorkerAgentApiTests(unittest.TestCase):
         self.assertEqual(second.get_json()["duplicate"], True)
         self.assertEqual(self.manager.queue_size, 1)
 
+    def test_default_task_keeps_only_core_capture_outputs(self) -> None:
+        payload = self.payload("capture-defaults-001")
+        payload.pop("pcap")
+        payload.pop("analysis")
+
+        response = self.client.post("/api/v1/tasks", json=payload, headers=self.auth)
+
+        self.assertEqual(response.status_code, 202)
+        request_data = response.get_json()["request"]
+        self.assertTrue(request_data["pcap"])
+        self.assertEqual(request_data["outputs"], {"html": False, "reports": False})
+        self.assertEqual(request_data["analysis"]["steps"], [])
+
     def test_status_endpoint_adds_per_url_status_to_legacy_result(self) -> None:
         payload = self.payload("legacy-result-001")
         self.store.create_task(payload)
@@ -255,8 +268,9 @@ class WorkerAgentApiTests(unittest.TestCase):
         task_dir = self.config.tasks_dir / payload["task_id"]
         item_dir = task_dir / "fetch_output" / "1-wiki-Example"
         item_dir.mkdir(parents=True)
-        (item_dir / "body_chrome.html").write_text("ok", encoding="utf-8")
+        (item_dir / "tls_keys_chrome.log").write_text("CLIENT_RANDOM key", encoding="utf-8")
         (item_dir / "capture_chrome.pcap").write_bytes(b"pcap")
+        (item_dir / "capture_chrome.complete.json").write_text("{}", encoding="utf-8")
         (item_dir / "capture_chrome.tsv").write_text("row", encoding="utf-8")
         (item_dir / "capture_chrome_flows").mkdir()
         (item_dir / "capture_chrome_flows" / "flow.tsv").write_text(
@@ -271,7 +285,7 @@ class WorkerAgentApiTests(unittest.TestCase):
 
         self.assertEqual(manifest["status"], "SUCCEEDED")
         self.assertNotIn("files", manifest)
-        self.assertEqual(manifest["storage"]["file_count"], 5)
+        self.assertEqual(manifest["storage"]["file_count"], 6)
         self.assertGreater(manifest["storage"]["total_bytes"], 0)
 
     def test_manifest_returns_status_for_each_url(self) -> None:
@@ -287,8 +301,9 @@ class WorkerAgentApiTests(unittest.TestCase):
 
         first_dir = task_dir / "fetch_output" / "1-wiki-Example"
         first_dir.mkdir(parents=True)
-        (first_dir / "body_chrome.html").write_text("ok", encoding="utf-8")
+        (first_dir / "tls_keys_chrome.log").write_text("CLIENT_RANDOM key", encoding="utf-8")
         (first_dir / "capture_chrome.pcap").write_bytes(b"pcap")
+        (first_dir / "capture_chrome.complete.json").write_text("{}", encoding="utf-8")
         (first_dir / "capture_chrome.tsv").write_text("row", encoding="utf-8")
         (first_dir / "capture_chrome_flows").mkdir()
         (first_dir / "capture_chrome_flows" / "flow.tsv").write_text(
@@ -301,8 +316,9 @@ class WorkerAgentApiTests(unittest.TestCase):
 
         second_dir = task_dir / "fetch_output" / "2-wiki-Second"
         second_dir.mkdir(parents=True)
-        (second_dir / "body_chrome.html").write_text("ok", encoding="utf-8")
+        (second_dir / "tls_keys_chrome.log").write_text("CLIENT_RANDOM key", encoding="utf-8")
         (second_dir / "capture_chrome.pcap").write_bytes(b"pcap")
+        (second_dir / "capture_chrome.complete.json").write_text("{}", encoding="utf-8")
         (second_dir / "capture_chrome.tsv").write_text("header", encoding="utf-8")
 
         manifest = self.manager._build_manifest(task_dir, payload, [])
@@ -317,6 +333,111 @@ class WorkerAgentApiTests(unittest.TestCase):
             manifest["items"][0]["browser_statuses"],
             [{"browser": "chrome", "status": "SUCCEEDED"}],
         )
+
+    def test_manifest_defaults_to_tls_keylog_and_pcap_checks(self) -> None:
+        payload = self.payload("core-manifest-001")
+        payload["outputs"] = {"html": False, "reports": False}
+        payload["analysis"] = {"steps": [], "with_coframe": False, "sni_suffixes": []}
+        task_dir = self.config.tasks_dir / payload["task_id"]
+        item_dir = task_dir / "fetch_output" / "1-wiki-Example"
+        item_dir.mkdir(parents=True)
+        (item_dir / "tls_keys_chrome.log").write_text("CLIENT_RANDOM key", encoding="utf-8")
+        (item_dir / "capture_chrome.pcap").write_bytes(b"pcap")
+        (item_dir / "capture_chrome.complete.json").write_text("{}", encoding="utf-8")
+
+        manifest = self.manager._build_manifest(task_dir, payload, [])
+
+        unit = manifest["units"][0]
+        self.assertEqual(manifest["status"], "SUCCEEDED")
+        self.assertEqual(
+            unit["checks"],
+            {"tls_keylog": True, "checkpoint": True, "pcap": True},
+        )
+        self.assertEqual(set(unit["artifacts"]), {"tls_keylog", "pcap"})
+
+    def test_worker_restart_requeues_active_task_for_checkpoint_resume(self) -> None:
+        payload = self.payload("resume-after-restart-001")
+        self.store.create_task(payload)
+        self.store.update_task(
+            payload["task_id"], status="CAPTURING", stage="CAPTURING", pid=1234
+        )
+
+        recovered = TaskManager(self.config, self.store, autostart=False)
+        try:
+            task = self.store.get_task(payload["task_id"])
+            self.assertEqual(recovered.recovered_task_count, 1)
+            self.assertEqual(recovered.queue_size, 1)
+            self.assertEqual(task["status"], "QUEUED")
+            self.assertEqual(task["stage"], "RESUMING")
+            self.assertIsNone(task["pid"])
+        finally:
+            recovered.shutdown()
+
+    def test_worker_restart_does_not_resume_canceled_task(self) -> None:
+        payload = self.payload("canceled-before-restart-001")
+        self.store.create_task(payload)
+        self.store.update_task(
+            payload["task_id"],
+            status="CANCELING",
+            stage="CANCELING",
+            cancel_requested=True,
+        )
+
+        recovered = TaskManager(self.config, self.store, autostart=False)
+        try:
+            task = self.store.get_task(payload["task_id"])
+            self.assertEqual(recovered.recovered_task_count, 0)
+            self.assertEqual(task["status"], "CANCELED")
+            self.assertEqual(recovered.queue_size, 0)
+        finally:
+            recovered.shutdown()
+
+    def test_resume_terminal_task_is_idempotent(self) -> None:
+        payload = self.payload("manual-resume-001")
+        self.store.create_task(payload)
+        self.store.update_task(
+            payload["task_id"],
+            status="FAILED",
+            stage="DONE",
+            error="simulated failure",
+            finished_at="2026-08-27T00:00:00+00:00",
+        )
+        body = {"resume_token": "resume-token-001"}
+
+        first = self.client.post(
+            "/api/v1/tasks/manual-resume-001/resume",
+            json=body,
+            headers=self.auth,
+        )
+        second = self.client.post(
+            "/api/v1/tasks/manual-resume-001/resume",
+            json=body,
+            headers=self.auth,
+        )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertTrue(first.get_json()["queued_for_resume"])
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(second.get_json()["queued_for_resume"])
+        self.assertEqual(self.manager.queue_size, 1)
+        self.assertEqual(self.store.get_task(payload["task_id"])["status"], "QUEUED")
+
+    def test_compact_status_omits_large_request_and_result(self) -> None:
+        self.client.post(
+            "/api/v1/tasks?include_request=false&include_result=false",
+            json=self.payload("compact-status-001"),
+            headers=self.auth,
+        )
+
+        response = self.client.get(
+            "/api/v1/tasks/compact-status-001?compact=true&include_result=false",
+            headers=self.auth,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("request", response.get_json())
+        self.assertNotIn("result", response.get_json())
+        self.assertNotIn("items", response.get_json())
 
 
 if __name__ == "__main__":

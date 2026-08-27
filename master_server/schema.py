@@ -86,7 +86,7 @@ def validate_machine(payload: Any, *, existing_token: str | None = None) -> dict
 def validate_job(payload: Any, *, max_items: int) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValidationError("请求体必须是 JSON 对象")
-    allowed = {"job_id", "name", "items", "targets", "pcap", "analysis"}
+    allowed = {"job_id", "name", "items", "targets", "pcap", "outputs", "analysis"}
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise ValidationError(f"不支持的任务参数：{', '.join(unknown)}")
@@ -149,10 +149,24 @@ def validate_job(payload: Any, *, max_items: int) -> dict[str, Any]:
     pcap = payload.get("pcap", True)
     if not isinstance(pcap, bool):
         raise ValidationError("pcap 必须是布尔值")
+    outputs = payload.get("outputs", {})
+    if outputs is None:
+        outputs = {}
+    if not isinstance(outputs, dict):
+        raise ValidationError("outputs 必须是对象")
+    unknown_outputs = sorted(set(outputs) - {"html", "reports"})
+    if unknown_outputs:
+        raise ValidationError(f"outputs 包含不支持的字段：{', '.join(unknown_outputs)}")
+    save_html = outputs.get("html", False)
+    save_reports = outputs.get("reports", False)
+    if not isinstance(save_html, bool):
+        raise ValidationError("outputs.html 必须是布尔值")
+    if not isinstance(save_reports, bool):
+        raise ValidationError("outputs.reports 必须是布尔值")
     analysis = payload.get("analysis") or {}
     if not isinstance(analysis, dict):
         raise ValidationError("analysis 必须是对象")
-    steps = analysis.get("steps", list(ALLOWED_STEPS) if pcap else [])
+    steps = analysis.get("steps", [])
     if not isinstance(steps, list) or any(step not in ALLOWED_STEPS for step in steps):
         raise ValidationError("analysis.steps 只允许 extract、classify、infer")
     steps = list(dict.fromkeys(steps))
@@ -172,6 +186,7 @@ def validate_job(payload: Any, *, max_items: int) -> dict[str, Any]:
         "items": items,
         "targets": targets,
         "pcap": pcap,
+        "outputs": {"html": save_html, "reports": save_reports},
         "analysis": {
             "steps": steps,
             "with_coframe": with_coframe,

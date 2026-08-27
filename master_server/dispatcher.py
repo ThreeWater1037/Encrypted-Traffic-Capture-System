@@ -30,6 +30,64 @@ def public_machine(machine: dict[str, Any]) -> dict[str, Any]:
 
 def summarize_job(job: dict[str, Any]) -> dict[str, Any]:
     """生成前端需要的进度、URL 汇总和目标汇总。"""
+    if isinstance(job.get("execution_counts"), dict):
+        public = {
+            key: value
+            for key, value in job.items()
+            if key not in {"execution_counts", "source_path"}
+        }
+        counts = job["execution_counts"]
+        total = sum(counts.values())
+        terminal_count = sum(
+            count for status, count in counts.items() if status in TERMINAL_STATUSES
+        )
+        public["summary"] = {
+            "total": total,
+            "completed": terminal_count,
+            "progress": round(terminal_count * 100 / total) if total else 0,
+            "succeeded": counts.get("SUCCEEDED", 0),
+            "partial": counts.get("PARTIAL", 0),
+            "failed": counts.get("FAILED", 0) + counts.get("INTERRUPTED", 0),
+            "canceled": counts.get("CANCELED", 0),
+            "statuses": counts,
+        }
+        executions = job.get("executions", [])
+        if executions:
+            item_groups: dict[str, list[dict[str, Any]]] = {}
+            target_groups: dict[str, list[dict[str, Any]]] = {}
+            for execution in executions:
+                item_groups.setdefault(execution["item_id"], []).append(execution)
+                target_groups.setdefault(execution["machine_id"], []).append(execution)
+            public["items"] = []
+            for item_id, units in item_groups.items():
+                first = units[0]
+                public["items"].append(
+                    {
+                        "id": item_id,
+                        "name": first["item_name"],
+                        "url": first["url"],
+                        "status": _aggregate_execution_statuses(
+                            [unit["status"] for unit in units]
+                        ),
+                        "executions": units,
+                    }
+                )
+            public["targets"] = []
+            for machine_id, units in target_groups.items():
+                first = units[0]
+                public["targets"].append(
+                    {
+                        "machine_id": machine_id,
+                        "machine_name": first.get("machine_name", machine_id),
+                        "machine_url": first.get("machine_url"),
+                        "worker_task_id": first.get("worker_task_id"),
+                        "status": _aggregate_execution_statuses(
+                            [unit["status"] for unit in units]
+                        ),
+                    }
+                )
+        return public
+
     public = {key: value for key, value in job.items() if key != "source_path"}
     executions = job.get("executions", [])
     counts: dict[str, int] = {}
@@ -96,7 +154,9 @@ def _aggregate_execution_statuses(statuses: list[str]) -> str:
             "CAPTURING",
             "VALIDATING",
             "PREPARING",
+            "RESUMING",
             "QUEUED",
+            "WAITING_FOR_WORKER",
             "DISPATCHING",
             "CREATED",
         ):
@@ -210,7 +270,7 @@ class JobDispatcher:
                 self._queue.task_done()
 
     def _run_job(self, job_id: str) -> None:
-        job = self.store.get_job(job_id)
+        job = self.store.get_job_control(job_id)
         if job is None or job["status"] in TERMINAL_STATUSES:
             return
         if job["cancel_requested"]:
@@ -231,7 +291,13 @@ class JobDispatcher:
         targets = job["request"]["targets"]
         with ThreadPoolExecutor(max_workers=max(1, len(targets))) as executor:
             futures = {
-                executor.submit(self._run_target, job_id, target): target
+                executor.submit(
+                    self._run_target,
+                    job_id,
+                    target,
+                    job["request"],
+                    job.get("resume_token"),
+                ): target
                 for target in targets
             }
             for future in as_completed(futures):
@@ -246,9 +312,16 @@ class JobDispatcher:
                         error=f"主控内部调度错误：{type(exc).__name__}: {exc}",
                     )
                 self._sync_job_status(job_id)
-        self._sync_job_status(job_id, finished=True)
+        if not self._stop.is_set():
+            self._sync_job_status(job_id, finished=True)
 
-    def _run_target(self, job_id: str, target: dict[str, Any]) -> None:
+    def _run_target(
+        self,
+        job_id: str,
+        target: dict[str, Any],
+        request_data: dict[str, Any],
+        resume_token: str | None,
+    ) -> None:
         machine_id = target["machine_id"]
         machine = self.store.get_machine(machine_id)
         if machine is None or not machine["enabled"]:
@@ -258,57 +331,146 @@ class JobDispatcher:
             )
             return
         client = self._client_factory(machine)
-        try:
-            health = client.health()
-            capabilities = client.capabilities()
-            available = {item["name"] for item in capabilities.get("browsers", [])}
-            missing = sorted(set(target["browsers"]) - available)
-            if missing:
-                self.store.update_worker_executions(
-                    job_id,
-                    machine_id,
-                    status="FAILED",
-                    error=f"Worker 缺少所选浏览器：{', '.join(missing)}",
-                )
-                return
-            self.store.update_machine_probe(
-                machine_id,
-                status="BUSY" if health.get("busy") else "ONLINE",
-                health=health,
-                capabilities=capabilities,
-            )
-            job = self.store.get_job(job_id)
+        worker_task_id = MasterStore.worker_task_id(job_id, machine_id)
+        task: dict[str, Any] | None = None
+        last_progress: tuple[str, str, str | None] | None = None
+
+        while task is None and not self._stop.is_set():
+            job = self.store.get_job_status(job_id)
             if job is None:
                 return
-            worker_task_id = MasterStore.worker_task_id(job_id, machine_id)
-            worker_payload = {
-                "task_id": worker_task_id,
-                "items": job["request"]["items"],
-                "browsers": target["browsers"],
-                "pcap": job["request"]["pcap"],
-                "analysis": job["request"]["analysis"],
-            }
-            task = client.submit_task(worker_payload)
-            self._apply_worker_progress(job_id, machine_id, task)
-            cancel_sent = False
-            while task.get("status") not in TERMINAL_STATUSES:
-                current = self.store.get_job(job_id)
-                if current and current["cancel_requested"] and not cancel_sent:
-                    task = client.cancel_task(worker_task_id)
-                    cancel_sent = True
-                    self._apply_worker_progress(job_id, machine_id, task)
+            if job["cancel_requested"]:
+                self.store.update_worker_executions(
+                    job_id, machine_id, status="CANCELED"
+                )
+                return
+            try:
+                health = client.health()
+                capabilities = client.capabilities()
+                available = {
+                    item["name"] for item in capabilities.get("browsers", [])
+                }
+                missing = sorted(set(target["browsers"]) - available)
+                if missing:
+                    self.store.update_worker_executions(
+                        job_id,
+                        machine_id,
+                        status="FAILED",
+                        error=f"Worker 缺少所选浏览器：{', '.join(missing)}",
+                    )
+                    return
+                self.store.update_machine_probe(
+                    machine_id,
+                    status="BUSY" if health.get("busy") else "ONLINE",
+                    health=health,
+                    capabilities=capabilities,
+                )
+                task = client.submit_task(
+                    {
+                        "task_id": worker_task_id,
+                        "items": request_data["items"],
+                        "browsers": target["browsers"],
+                        "pcap": request_data["pcap"],
+                        "outputs": request_data.get(
+                            "outputs", {"html": False, "reports": False}
+                        ),
+                        "analysis": request_data["analysis"],
+                    }
+                )
+                if resume_token:
+                    task = client.resume_task(worker_task_id, resume_token)
+            except WorkerRequestError as exc:
+                message = str(exc)
+                self.store.update_machine_probe(
+                    machine_id, status="OFFLINE", error=message
+                )
+                progress = ("WAITING_FOR_WORKER", "WAITING_FOR_WORKER", message)
+                if progress != last_progress:
+                    self.store.update_worker_executions(
+                        job_id,
+                        machine_id,
+                        status=progress[0],
+                        stage=progress[1],
+                        error=progress[2],
+                    )
+                    self._sync_job_status(job_id)
+                    last_progress = progress
                 if self._stop.wait(self.config.poll_interval):
                     return
-                task = client.get_task(worker_task_id)
+
+        if task is None:
+            return
+
+        cancel_sent = False
+        while task.get("status") not in TERMINAL_STATUSES:
+            progress = (
+                str(task.get("status") or "RUNNING"),
+                str(task.get("stage") or task.get("status") or "RUNNING"),
+                task.get("error"),
+            )
+            if progress != last_progress:
                 self._apply_worker_progress(job_id, machine_id, task)
-            self._apply_worker_result(job_id, machine_id, task)
-        except WorkerRequestError as exc:
-            self.store.update_machine_probe(
-                machine_id, status="OFFLINE", error=str(exc)
-            )
-            self.store.update_worker_executions(
-                job_id, machine_id, status="FAILED", error=str(exc)
-            )
+                last_progress = progress
+            if self._stop.wait(self.config.poll_interval):
+                return
+            current = self.store.get_job_status(job_id)
+            if current is None:
+                return
+            try:
+                if current["cancel_requested"] and not cancel_sent:
+                    task = client.cancel_task(worker_task_id)
+                    cancel_sent = True
+                else:
+                    task = client.get_task(worker_task_id)
+            except WorkerRequestError as exc:
+                message = str(exc)
+                self.store.update_machine_probe(
+                    machine_id, status="OFFLINE", error=message
+                )
+                waiting = ("WAITING_FOR_WORKER", "WAITING_FOR_WORKER", message)
+                if waiting != last_progress:
+                    self.store.update_worker_executions(
+                        job_id,
+                        machine_id,
+                        status=waiting[0],
+                        stage=waiting[1],
+                        error=waiting[2],
+                    )
+                    self._sync_job_status(job_id)
+                    last_progress = waiting
+                continue
+
+        while not isinstance(task.get("result"), dict) and not self._stop.is_set():
+            try:
+                result_response = client.get_result(worker_task_id)
+                task = {
+                    **task,
+                    "result": result_response.get("result"),
+                    "error": result_response.get("error") or task.get("error"),
+                }
+                break
+            except WorkerRequestError as exc:
+                message = str(exc)
+                self.store.update_machine_probe(
+                    machine_id, status="OFFLINE", error=message
+                )
+                waiting = ("WAITING_FOR_WORKER", "WAITING_FOR_WORKER", message)
+                if waiting != last_progress:
+                    self.store.update_worker_executions(
+                        job_id,
+                        machine_id,
+                        status=waiting[0],
+                        stage=waiting[1],
+                        error=waiting[2],
+                    )
+                    self._sync_job_status(job_id)
+                    last_progress = waiting
+                if self._stop.wait(self.config.poll_interval):
+                    return
+
+        if self._stop.is_set():
+            return
+        self._apply_worker_result(job_id, machine_id, task)
 
     def _apply_worker_progress(
         self, job_id: str, machine_id: str, task: dict[str, Any]
@@ -330,36 +492,22 @@ class JobDispatcher:
         top_status = str(task.get("status") or "FAILED")
         result = task.get("result") if isinstance(task.get("result"), dict) else {}
         units = result.get("units", []) if isinstance(result, dict) else []
-        indexed = {
-            (str(unit.get("item_id")), str(unit.get("browser"))): unit
-            for unit in units
-            if isinstance(unit, dict)
-        }
-        job = self.store.get_job(job_id)
-        if job is None:
-            return
-        for execution in job["executions"]:
-            if execution["machine_id"] != machine_id:
-                continue
-            unit = indexed.get((execution["item_id"], execution["browser"]))
-            unit_status = str(unit.get("status")) if unit else top_status
-            if unit_status not in TERMINAL_STATUSES:
-                unit_status = "FAILED"
-            self.store.update_execution_result(
-                job_id,
-                machine_id,
-                execution["item_id"],
-                execution["browser"],
-                status=unit_status,
-                result=unit,
-                error=task.get("error") if unit is None else None,
-            )
+        if top_status not in TERMINAL_STATUSES:
+            top_status = "FAILED"
+        self.store.update_worker_results(
+            job_id,
+            machine_id,
+            top_status=top_status,
+            units=[unit for unit in units if isinstance(unit, dict)],
+            error=task.get("error"),
+        )
 
     def _sync_job_status(self, job_id: str, *, finished: bool = False) -> None:
-        job = self.store.get_job(job_id)
+        job = self.store.get_job_status(job_id)
         if job is None:
             return
-        statuses = [item["status"] for item in job["executions"]]
+        counts = self.store.execution_status_counts(job_id)
+        statuses = list(counts)
         aggregated = _aggregate_execution_statuses(statuses)
         if aggregated in TERMINAL_STATUSES:
             self.store.update_job(

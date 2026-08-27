@@ -25,8 +25,10 @@ ALLOWED_TOP_LEVEL_KEYS = {
     "items",
     "browsers",
     "pcap",
+    "outputs",
     "analysis",
 }
+ALLOWED_OUTPUT_KEYS = {"html", "reports"}
 ALLOWED_ANALYSIS_KEYS = {"steps", "with_coframe", "sni_suffixes"}
 
 
@@ -142,6 +144,23 @@ def validate_task_payload(payload: Any, config: WorkerConfig) -> dict[str, Any]:
     if not isinstance(pcap, bool):
         raise ValidationError("pcap 必须是布尔值")
 
+    raw_outputs = payload.get("outputs", {})
+    if raw_outputs is None:
+        raw_outputs = {}
+    if not isinstance(raw_outputs, dict):
+        raise ValidationError("outputs 必须是对象")
+    unknown_output_keys = sorted(set(raw_outputs) - ALLOWED_OUTPUT_KEYS)
+    if unknown_output_keys:
+        raise ValidationError(
+            f"outputs 包含不支持的字段：{', '.join(unknown_output_keys)}"
+        )
+    save_html = raw_outputs.get("html", False)
+    save_reports = raw_outputs.get("reports", False)
+    if not isinstance(save_html, bool):
+        raise ValidationError("outputs.html 必须是布尔值")
+    if not isinstance(save_reports, bool):
+        raise ValidationError("outputs.reports 必须是布尔值")
+
     raw_analysis = payload.get("analysis", {})
     if raw_analysis is None:
         raw_analysis = {}
@@ -153,8 +172,7 @@ def validate_task_payload(payload: Any, config: WorkerConfig) -> dict[str, Any]:
             f"analysis 包含不支持的字段：{', '.join(unknown_analysis_keys)}"
         )
 
-    default_steps = list(ALLOWED_STEPS) if pcap else []
-    raw_steps = raw_analysis.get("steps", default_steps)
+    raw_steps = raw_analysis.get("steps", [])
     if not isinstance(raw_steps, list):
         raise ValidationError("analysis.steps 必须是数组")
     steps: list[str] = []
@@ -189,6 +207,10 @@ def validate_task_payload(payload: Any, config: WorkerConfig) -> dict[str, Any]:
         "items": items,
         "browsers": browsers,
         "pcap": pcap,
+        "outputs": {
+            "html": save_html,
+            "reports": save_reports,
+        },
         "analysis": {
             "steps": steps,
             "with_coframe": with_coframe,

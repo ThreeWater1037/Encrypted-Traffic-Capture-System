@@ -159,9 +159,9 @@ class WorkerConfig:
     python_executable: Path
     data_dir: Path
     max_queue_size: int = 10
-    max_items: int = 10_000
-    task_timeout_seconds: int = 21_600
-    max_content_length: int = 20_971_520
+    max_items: int = 100_000
+    task_timeout_seconds: int = 0
+    max_content_length: int = 268_435_456
     allowed_browsers: tuple[str, ...] = ("chrome", "edge", "firefox")
     allowed_origins: tuple[str, ...] = (
         "http://localhost:5173",
@@ -255,7 +255,7 @@ class WorkerConfig:
                 "limits.max_queue_size",
             ),
             max_items=_integer(
-                _value(settings, "limits", "max_items", "MAX_ITEMS", 10_000),
+                _value(settings, "limits", "max_items", "MAX_ITEMS", 100_000),
                 "limits.max_items",
             ),
             task_timeout_seconds=_integer(
@@ -264,9 +264,10 @@ class WorkerConfig:
                     "limits",
                     "task_timeout_seconds",
                     "TASK_TIMEOUT_SECONDS",
-                    21_600,
+                    0,
                 ),
                 "limits.task_timeout_seconds",
+                minimum=0,
             ),
             max_content_length=_integer(
                 _value(
@@ -274,7 +275,7 @@ class WorkerConfig:
                     "limits",
                     "max_content_length",
                     "MAX_CONTENT_LENGTH",
-                    20_971_520,
+                    268_435_456,
                 ),
                 "limits.max_content_length",
             ),

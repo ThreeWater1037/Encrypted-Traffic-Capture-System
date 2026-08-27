@@ -30,6 +30,8 @@ class WorkerClient:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         data = None
         headers = {"Accept": "application/json"}
@@ -42,7 +44,7 @@ class WorkerClient:
             f"{self.base_url}{path}", data=data, headers=headers, method=method
         )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with urlopen(request, timeout=timeout or self.timeout) as response:
                 body = response.read().decode("utf-8")
                 return json.loads(body) if body else {}
         except HTTPError as exc:
@@ -64,13 +66,35 @@ class WorkerClient:
         return self._request("GET", "/api/v1/capabilities")
 
     def submit_task(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", "/api/v1/tasks", payload)
+        return self._request(
+            "POST",
+            "/api/v1/tasks?include_request=false&include_result=false",
+            payload,
+            timeout=max(self.timeout, 600.0),
+        )
 
     def get_task(self, task_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/api/v1/tasks/{task_id}")
+        return self._request(
+            "GET",
+            f"/api/v1/tasks/{task_id}?compact=true&include_result=false",
+        )
+
+    def get_result(self, task_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/v1/tasks/{task_id}/result?compact=true",
+            timeout=max(self.timeout, 600.0),
+        )
 
     def cancel_task(self, task_id: str) -> dict[str, Any]:
         return self._request("POST", f"/api/v1/tasks/{task_id}/cancel")
+
+    def resume_task(self, task_id: str, resume_token: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/tasks/{task_id}/resume",
+            {"resume_token": resume_token},
+        )
 
     def get_log(self, task_id: str, *, offset: int = 0, limit: int = 65_536) -> dict[str, Any]:
         query = urlencode({"offset": offset, "limit": limit})
