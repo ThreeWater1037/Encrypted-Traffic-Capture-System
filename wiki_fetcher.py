@@ -23,6 +23,7 @@ import re
 import tempfile
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -692,7 +693,11 @@ def _entry_slug(entry: "UrlEntry") -> str:
     safe_name = entry.name.replace("/", "／").replace("\\", "＼").replace(":", "：")
     safe_name = safe_name.replace("*", "＊").replace("?", "？").replace('"', "＂")
     safe_name = safe_name.replace("<", "＜").replace(">", "＞").replace("|", "｜")
-    safe_name = safe_name[:80]   # 防止超长路径
+    # Windows 会在创建目录时静默裁掉末尾的点和空格。如果继续使用原始路径
+    # 写 PCAP/keylog，后续 open() 会指向一个并不存在的目录。
+    safe_name = safe_name[:80].rstrip(" .")   # 防止超长路径和 Windows 路径归一化
+    if not safe_name:
+        safe_name = "item"
     return f"{entry.id}-wiki-{safe_name}"
 
 
@@ -717,6 +722,7 @@ class WikiFetcher:
         )
         self.save_html = save_html
         self.save_reports = save_reports
+        self.progress_run_id = uuid.uuid4().hex
         self.all_records: list[SessionRecord] = []   # flat list across all URLs
 
     # ------------------------------------------------------------------
@@ -794,7 +800,8 @@ class WikiFetcher:
         marker = self._completion_marker_path(url_dir, browser_key)
         temporary = marker.with_suffix(marker.suffix + ".tmp")
         payload = {
-            "version": 1,
+            "version": 2,
+            "run_id": self.progress_run_id,
             "item_id": entry.id,
             "name": entry.name,
             "url": entry.url,

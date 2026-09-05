@@ -23,6 +23,9 @@ from .config import WorkerConfig
 from .task_store import TERMINAL_STATUSES, TaskStore, utc_now
 
 
+MAX_CAPTURE_RETRIES = 5
+
+
 class QueueFullError(RuntimeError):
     """任务队列达到配置容量。"""
 
@@ -260,18 +263,23 @@ class TaskManager:
             self.store.update_task(
                 task_id, status="CAPTURING", stage="CAPTURING"
             )
-            capture_attempt = 0
+            capture_retries = 0
             while True:
-                capture_attempt += 1
                 capture_code = self._run_command(
                     task_id, capture_command, log_path, deadline
                 )
                 if capture_code == 0:
                     break
+                if capture_retries >= MAX_CAPTURE_RETRIES:
+                    raise RuntimeError(
+                        f"wiki_fetcher.py 退出码={capture_code}; "
+                        f"已达到自动重试上限 {MAX_CAPTURE_RETRIES} 次"
+                    )
+                capture_retries += 1
                 self._append_log(
                     log_path,
                     f"wiki_fetcher.py 退出码={capture_code}; "
-                    f"第 {capture_attempt} 次重启后将从 URL 检查点续跑",
+                    f"第 {capture_retries}/{MAX_CAPTURE_RETRIES} 次重试将从 URL 检查点续跑",
                 )
                 self._wait_interruptibly(task_id, 5.0, deadline)
 
@@ -499,6 +507,149 @@ class TaskManager:
         timestamp = datetime.now(timezone.utc).isoformat()
         with log_path.open("a", encoding="utf-8") as stream:
             stream.write(f"[{timestamp}] {message}\n")
+
+    def capture_progress(
+        self,
+        task_id: str,
+        *,
+        run_id: str | None = None,
+        after_position: int = 0,
+        limit: int = 1000,
+    ) -> dict[str, Any] | None:
+        """从原子检查点生成逐 URL 采集进度，不等待整批 manifest。"""
+        if self.store.get_task_status(task_id) is None:
+            return None
+        task_dir = self.config.tasks_dir / task_id
+        output_dir = task_dir / "fetch_output"
+        progress_path = output_dir / "capture_progress.json"
+
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {
+                "task_id": task_id,
+                "run_id": None,
+                "next_position": 0,
+                "observed_position": 0,
+                "total_urls": 0,
+                "has_more": False,
+                "units": [],
+            }
+
+        raw_position = progress.get("last_processed_position", 0)
+        observed_position = (
+            raw_position if isinstance(raw_position, int) and not isinstance(raw_position, bool) else 0
+        )
+        raw_total = progress.get("total_urls", 0)
+        total_urls = raw_total if isinstance(raw_total, int) and not isinstance(raw_total, bool) else 0
+        total_urls = max(0, total_urls)
+        observed_position = min(max(0, observed_position), total_urls)
+        current_run_id = progress.get("run_id")
+        if not isinstance(current_run_id, str) or not current_run_id:
+            current_run_id = f"legacy-{progress.get('updated_at', 'unknown')}"
+        start = after_position if run_id == current_run_id else 0
+        start = min(max(0, start), observed_position)
+        end = min(observed_position, start + limit)
+        if start >= end:
+            return {
+                "task_id": task_id,
+                "run_id": current_run_id,
+                "next_position": end,
+                "observed_position": observed_position,
+                "total_urls": total_urls,
+                "has_more": False,
+                "units": [],
+            }
+
+        task = self.store.get_task(task_id)
+        request_data = task.get("request") if task else {}
+        request_data = request_data or {}
+        items = request_data.get("items") or []
+        observed_position = min(observed_position, len(items))
+        end = min(observed_position, start + limit)
+
+        units: list[dict[str, Any]] = []
+        for item in items[start:end]:
+            for browser in request_data.get("browsers") or []:
+                marker_payload: dict[str, Any] | None = None
+                marker_dir: Path | None = None
+                if output_dir.is_dir():
+                    for candidate in output_dir.glob(f"{item['id']}-wiki-*"):
+                        marker = candidate / f"capture_{browser}.complete.json"
+                        try:
+                            loaded = json.loads(marker.read_text(encoding="utf-8"))
+                        except (OSError, UnicodeError, json.JSONDecodeError):
+                            continue
+                        if (
+                            loaded.get("item_id") == item["id"]
+                            and loaded.get("url") == item["url"]
+                            and loaded.get("browser") == browser
+                        ):
+                            marker_payload = loaded
+                            marker_dir = candidate
+                            break
+                if marker_payload is None or marker_dir is None:
+                    continue
+
+                sizes = marker_payload.get("artifacts")
+                if not isinstance(sizes, dict):
+                    continue
+                artifacts: dict[str, dict[str, Any]] = {}
+                checks = {"checkpoint": True}
+                valid = True
+                for filename, expected_size in sizes.items():
+                    if (
+                        not isinstance(filename, str)
+                        or Path(filename).name != filename
+                        or not isinstance(expected_size, int)
+                        or isinstance(expected_size, bool)
+                        or expected_size <= 0
+                    ):
+                        valid = False
+                        break
+                    artifact_path = marker_dir / filename
+                    if not artifact_path.is_file() or artifact_path.stat().st_size != expected_size:
+                        valid = False
+                        break
+                    if filename.startswith("tls_keys_"):
+                        artifact_key = "tls_keylog"
+                    elif filename.endswith(".pcap"):
+                        artifact_key = "pcap"
+                    elif filename.startswith("body_"):
+                        artifact_key = "html"
+                    else:
+                        artifact_key = filename
+                    checks[artifact_key] = True
+                    artifacts[artifact_key] = {
+                        "path": artifact_path.relative_to(task_dir).as_posix(),
+                        "kind": "file",
+                        "size": expected_size,
+                    }
+                if not valid:
+                    continue
+                units.append(
+                    {
+                        "item_id": item["id"],
+                        "name": item["name"],
+                        "url": item["url"],
+                        "browser": browser,
+                        "status": "CAPTURED",
+                        "stage": "CAPTURED",
+                        "checks": checks,
+                        "artifacts": artifacts,
+                        "completed_at": marker_payload.get("completed_at"),
+                    }
+                )
+
+        return {
+            "task_id": task_id,
+            "run_id": current_run_id,
+            "next_position": end,
+            "observed_position": observed_position,
+            "total_urls": len(items),
+            "has_more": end < observed_position,
+            "units": units,
+        }
 
     def _build_manifest(
         self,

@@ -14,6 +14,7 @@ from .worker_client import WorkerClient, WorkerRequestError
 
 
 ClientFactory = Callable[[dict[str, Any]], WorkerClient]
+PROGRESS_COMPLETED_STATUSES = TERMINAL_STATUSES | {"CAPTURED"}
 
 
 class QueueFullError(RuntimeError):
@@ -39,7 +40,7 @@ def summarize_job(job: dict[str, Any]) -> dict[str, Any]:
         counts = job["execution_counts"]
         total = sum(counts.values())
         terminal_count = sum(
-            count for status, count in counts.items() if status in TERMINAL_STATUSES
+            count for status, count in counts.items() if status in PROGRESS_COMPLETED_STATUSES
         )
         public["summary"] = {
             "total": total,
@@ -94,7 +95,7 @@ def summarize_job(job: dict[str, Any]) -> dict[str, Any]:
     for execution in executions:
         counts[execution["status"]] = counts.get(execution["status"], 0) + 1
     terminal_count = sum(
-        count for status, count in counts.items() if status in TERMINAL_STATUSES
+        count for status, count in counts.items() if status in PROGRESS_COMPLETED_STATUSES
     )
     total = len(executions)
     public["summary"] = {
@@ -152,6 +153,7 @@ def _aggregate_execution_statuses(statuses: list[str]) -> str:
         for preferred in (
             "ANALYZING",
             "CAPTURING",
+            "CAPTURED",
             "VALIDATING",
             "PREPARING",
             "RESUMING",
@@ -334,6 +336,8 @@ class JobDispatcher:
         worker_task_id = MasterStore.worker_task_id(job_id, machine_id)
         task: dict[str, Any] | None = None
         last_progress: tuple[str, str, str | None] | None = None
+        progress_run_id: str | None = None
+        progress_position = 0
 
         while task is None and not self._stop.is_set():
             job = self.store.get_job_status(job_id)
@@ -411,6 +415,19 @@ class JobDispatcher:
             if progress != last_progress:
                 self._apply_worker_progress(job_id, machine_id, task)
                 last_progress = progress
+            if progress[1] in {"QUEUED", "PREPARING", "RESUMING", "CAPTURING"}:
+                try:
+                    progress_run_id, progress_position = self._sync_worker_capture_progress(
+                        client,
+                        worker_task_id,
+                        job_id,
+                        machine_id,
+                        run_id=progress_run_id,
+                        position=progress_position,
+                    )
+                except WorkerRequestError:
+                    # 任务状态轮询仍是主链路；短暂的进度端点失败交给下一轮补齐。
+                    pass
             if self._stop.wait(self.config.poll_interval):
                 return
             current = self.store.get_job_status(job_id)
@@ -471,6 +488,49 @@ class JobDispatcher:
         if self._stop.is_set():
             return
         self._apply_worker_result(job_id, machine_id, task)
+
+    def _sync_worker_capture_progress(
+        self,
+        client: WorkerClient,
+        worker_task_id: str,
+        job_id: str,
+        machine_id: str,
+        *,
+        run_id: str | None,
+        position: int,
+    ) -> tuple[str | None, int]:
+        """分页拉取 Worker 原子检查点，并增量更新执行矩阵。"""
+        while True:
+            snapshot = client.get_capture_progress(
+                worker_task_id,
+                run_id=run_id,
+                after_position=position,
+                limit=1000,
+            )
+            snapshot_run_id = snapshot.get("run_id")
+            if isinstance(snapshot_run_id, str) and snapshot_run_id:
+                if snapshot_run_id != run_id:
+                    position = 0
+                run_id = snapshot_run_id
+            units = snapshot.get("units")
+            valid_units = (
+                [unit for unit in units if isinstance(unit, dict)]
+                if isinstance(units, list)
+                else []
+            )
+            if valid_units:
+                self.store.update_worker_capture_progress(
+                    job_id, machine_id, valid_units
+                )
+                self._sync_job_status(job_id)
+            next_position = snapshot.get("next_position")
+            if not isinstance(next_position, int) or isinstance(next_position, bool):
+                break
+            previous_position = position
+            position = max(0, next_position)
+            if not snapshot.get("has_more") or position <= previous_position:
+                break
+        return run_id, position
 
     def _apply_worker_progress(
         self, job_id: str, machine_id: str, task: dict[str, Any]

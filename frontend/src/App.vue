@@ -36,6 +36,8 @@ const machines = ref([])
 const jobs = ref([])
 const selectedJob = ref(null)
 const selectedLogs = ref([])
+const selectedLogJobId = ref('')
+const logsLoading = ref(false)
 const loading = ref(false)
 const message = ref('')
 const error = ref('')
@@ -100,6 +102,8 @@ async function handleSubmit(submission) {
       : await createJsonJob(submission.payload)
     await loadJobs()
     selectedJob.value = job
+    selectedLogs.value = []
+    selectedLogJobId.value = ''
     activeView.value = 'jobs'
     notify(`任务 ${job.job_id} 已提交`)
   } catch (reason) {
@@ -113,6 +117,7 @@ async function handleSelectJob(jobId) {
   try {
     selectedJob.value = await getJob(jobId)
     selectedLogs.value = []
+    selectedLogJobId.value = ''
   } catch (reason) {
     showError(reason)
   }
@@ -147,6 +152,8 @@ async function handleRestart(jobId) {
     const job = await restartJob(jobId)
     await loadJobs()
     selectedJob.value = job
+    selectedLogs.value = []
+    selectedLogJobId.value = ''
     notify(`新一轮任务 ${job.job_id} 已创建`)
   } catch (reason) {
     showError(reason)
@@ -155,12 +162,47 @@ async function handleRestart(jobId) {
   }
 }
 
-async function handleLogs(jobId) {
+async function loadSelectedLogs(jobId, { reset = false, drain = false } = {}) {
+  if (logsLoading.value) return
+  logsLoading.value = true
   try {
-    selectedLogs.value = (await getJobLogs(jobId)).logs
+    const merged = new Map(
+      (reset ? [] : selectedLogs.value).map((entry) => [entry.machine_id, { ...entry }]),
+    )
+    let page = 0
+    let hasMore = false
+    do {
+      const offsets = Object.fromEntries(
+        [...merged.values()].map((entry) => [entry.machine_id, entry.next_offset || 0]),
+      )
+      const response = await getJobLogs(jobId, offsets)
+      hasMore = false
+      for (const entry of response.logs) {
+        const previous = merged.get(entry.machine_id)
+        const requestedOffset = offsets[entry.machine_id] || 0
+        const streamReset = previous && Number(entry.next_offset || 0) < requestedOffset
+        merged.set(entry.machine_id, {
+          ...previous,
+          ...entry,
+          error: entry.error || '',
+          text: streamReset ? (entry.text || '') : `${previous?.text || ''}${entry.text || ''}`,
+        })
+        if (!entry.error && entry.eof === false) hasMore = true
+      }
+      page += 1
+    } while (drain && hasMore && page < 256)
+    if (selectedLogJobId.value === jobId) selectedLogs.value = [...merged.values()]
   } catch (reason) {
     showError(reason)
+  } finally {
+    logsLoading.value = false
   }
+}
+
+async function handleLogs(jobId) {
+  const reset = selectedLogJobId.value !== jobId
+  selectedLogJobId.value = jobId
+  await loadSelectedLogs(jobId, { reset, drain: true })
 }
 
 async function handleProbe(machineId) {
@@ -202,6 +244,9 @@ onMounted(() => {
     try {
       await loadJobs()
       if (selectedJob.value) selectedJob.value = await getJob(selectedJob.value.job_id)
+      if (selectedJob.value && selectedLogJobId.value === selectedJob.value.job_id) {
+        await loadSelectedLogs(selectedJob.value.job_id)
+      }
     } catch {
       // 短暂网络波动交给下一轮轮询恢复，避免连续弹出提示。
     }
@@ -266,6 +311,7 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
           :jobs="jobs"
           :selected-job="selectedJob"
           :logs="selectedLogs"
+          :logs-loading="logsLoading"
           @select="handleSelectJob"
           @cancel="handleCancel"
           @resume="handleResume"

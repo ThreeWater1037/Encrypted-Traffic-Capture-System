@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from worker_agent.app import create_app
 from worker_agent.config import WorkerConfig
@@ -263,6 +265,73 @@ class WorkerAgentApiTests(unittest.TestCase):
         self.assertGreater(data["next_offset"], 0)
         self.assertTrue(data["text"])
 
+    def test_progress_endpoint_returns_new_atomic_checkpoints(self) -> None:
+        payload = self.payload("live-progress-001")
+        self.manager.submit(payload)
+        task_dir = self.config.tasks_dir / payload["task_id"]
+        item_dir = task_dir / "fetch_output" / "1-wiki-Example"
+        item_dir.mkdir(parents=True)
+        keylog = item_dir / "tls_keys_chrome.log"
+        pcap = item_dir / "capture_chrome.pcap"
+        keylog.write_bytes(b"key")
+        pcap.write_bytes(b"pcap")
+        (item_dir / "capture_chrome.complete.json").write_text(
+            json.dumps(
+                {
+                    "item_id": "1",
+                    "name": "Example",
+                    "url": "https://example.com/",
+                    "browser": "chrome",
+                    "completed_at": "2026-09-01T15:00:00",
+                    "artifacts": {
+                        keylog.name: keylog.stat().st_size,
+                        pcap.name: pcap.stat().st_size,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (task_dir / "fetch_output" / "capture_progress.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "run_id": "run-live-001",
+                    "last_processed_position": 1,
+                    "total_urls": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        response = self.client.get(
+            f"/api/v1/tasks/{payload['task_id']}/progress",
+            headers=self.auth,
+        )
+        data = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["run_id"], "run-live-001")
+        self.assertEqual(data["next_position"], 1)
+        self.assertFalse(data["has_more"])
+        self.assertEqual(data["units"][0]["status"], "CAPTURED")
+        self.assertEqual(
+            set(data["units"][0]["artifacts"]), {"tls_keylog", "pcap"}
+        )
+
+        caught_up = self.client.get(
+            f"/api/v1/tasks/{payload['task_id']}/progress"
+            "?run_id=run-live-001&after_position=1",
+            headers=self.auth,
+        ).get_json()
+        self.assertEqual(caught_up["units"], [])
+
+        new_run = self.client.get(
+            f"/api/v1/tasks/{payload['task_id']}/progress"
+            "?run_id=older-run&after_position=1",
+            headers=self.auth,
+        ).get_json()
+        self.assertEqual(len(new_run["units"]), 1)
+
     def test_manifest_reports_compact_storage_summary(self) -> None:
         payload = self.payload("manifest-test-001")
         task_dir = self.config.tasks_dir / payload["task_id"]
@@ -372,6 +441,23 @@ class WorkerAgentApiTests(unittest.TestCase):
             self.assertIsNone(task["pid"])
         finally:
             recovered.shutdown()
+
+    def test_capture_failure_stops_after_five_retries(self) -> None:
+        payload = self.payload("capture-retry-limit-001")
+        self.manager.submit(payload)
+        task = self.store.get_task(payload["task_id"])
+
+        with (
+            patch.object(self.manager, "_run_command", return_value=1) as run_command,
+            patch.object(self.manager, "_wait_interruptibly") as wait_interruptibly,
+        ):
+            self.manager._run_task(task)
+
+        failed = self.store.get_task(payload["task_id"])
+        self.assertEqual(run_command.call_count, 6)
+        self.assertEqual(wait_interruptibly.call_count, 5)
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertIn("自动重试上限 5 次", failed["error"])
 
     def test_worker_restart_does_not_resume_canceled_task(self) -> None:
         payload = self.payload("canceled-before-restart-001")

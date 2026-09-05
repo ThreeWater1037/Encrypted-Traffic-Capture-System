@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from wiki_fetcher import PacketCapture, UrlEntry, WikiFetcher
+from wiki_fetcher import PacketCapture, UrlEntry, WikiFetcher, _entry_slug
 
 
 class _ExitedProcess:
@@ -16,6 +16,20 @@ class _ExitedProcess:
 
 
 class PacketCaptureTests(unittest.TestCase):
+    def test_entry_slug_removes_windows_unsafe_trailing_dots_and_spaces(self) -> None:
+        entry = UrlEntry(
+            id="132",
+            name="总务处/... ",
+            url="https://example.com/",
+        )
+
+        self.assertEqual(_entry_slug(entry), "132-wiki-总务处／")
+
+    def test_entry_slug_uses_fallback_when_name_is_only_dots(self) -> None:
+        entry = UrlEntry(id="1", name="...", url="https://example.com/")
+
+        self.assertEqual(_entry_slug(entry), "1-wiki-item")
+
     def test_linux_tshark_uses_only_any_interface(self) -> None:
         with (
             patch("wiki_fetcher.platform.system", return_value="Linux"),

@@ -6,7 +6,8 @@ Vue 3 + Vite 页面已连接主控 Flask，不再使用 Mock 数据。页面支�
 - 按 Worker 实际能力选择机器和 Chrome、Edge、Firefox。
 - 默认只保存 PCAP 与 TLS keylog，并可选开启 HTML、报告、分析步骤、SNI 后缀和 coframe。
 - 查看总任务及每个 `URL × 机器 × 浏览器` 的实时状态。
-- 查看 Worker 本地实验路径与增量日志。
+- 在 URL 矩阵上方查看 Worker 增量日志；页面按偏移连续加载并每 2 秒追加新内容。
+- 采集期间根据逐 URL 原子检查点实时显示 `CAPTURED`，无需等待整批完成。
 - 添加和探测子机器；Worker Token 不会显示在页面中。
 
 ## 本地运行

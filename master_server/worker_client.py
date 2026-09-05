@@ -79,6 +79,25 @@ class WorkerClient:
             f"/api/v1/tasks/{task_id}?compact=true&include_result=false",
         )
 
+    def get_capture_progress(
+        self,
+        task_id: str,
+        *,
+        run_id: str | None = None,
+        after_position: int = 0,
+        limit: int = 1000,
+    ) -> dict[str, Any]:
+        query_values: dict[str, Any] = {
+            "after_position": after_position,
+            "limit": limit,
+        }
+        if run_id:
+            query_values["run_id"] = run_id
+        return self._request(
+            "GET",
+            f"/api/v1/tasks/{task_id}/progress?{urlencode(query_values)}",
+        )
+
     def get_result(self, task_id: str) -> dict[str, Any]:
         return self._request(
             "GET",

@@ -521,6 +521,45 @@ class MasterStore:
                 ),
             )
 
+    def update_worker_capture_progress(
+        self,
+        job_id: str,
+        machine_id: str,
+        units: list[dict[str, Any]],
+    ) -> None:
+        """增量写入 Worker 已提交检查点的 URL/浏览器采集状态。"""
+        now = utc_now()
+        rows = []
+        for unit in units:
+            item_id = unit.get("item_id")
+            browser = unit.get("browser")
+            if not isinstance(item_id, str) or not isinstance(browser, str):
+                continue
+            rows.append(
+                (
+                    json.dumps(unit, ensure_ascii=False),
+                    now,
+                    job_id,
+                    machine_id,
+                    item_id,
+                    browser,
+                )
+            )
+        if not rows:
+            return
+        with self._connection() as connection:
+            connection.executemany(
+                """
+                UPDATE executions
+                   SET status = 'CAPTURED', stage = 'CAPTURED', error = NULL,
+                       result_json = ?, updated_at = ?
+                 WHERE job_id = ? AND machine_id = ?
+                   AND item_id = ? AND browser = ?
+                   AND status NOT IN ('SUCCEEDED','PARTIAL','FAILED','CANCELED','INTERRUPTED')
+                """,
+                rows,
+            )
+
     def update_worker_results(
         self,
         job_id: str,

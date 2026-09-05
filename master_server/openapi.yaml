@@ -294,6 +294,15 @@ paths:
       operationId: getJobLogs
       summary: 汇总各目标 Worker 日志
       security: [{ bearerAuth: [] }]
+      parameters:
+        - name: offsets
+          in: query
+          description: JSON 对象，键为机器 ID，值为下一次读取的字节偏移
+          schema: { type: string, default: '{}' }
+        - name: limit
+          in: query
+          description: 每台 Worker 单次最多读取的字节数
+          schema: { type: integer, minimum: 1, maximum: 65536, default: 65536 }
       responses:
         '200':
           description: Worker 日志数组

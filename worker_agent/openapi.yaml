@@ -253,6 +253,36 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /api/v1/tasks/{task_id}/progress:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      tags: [Tasks]
+      summary: 增量查询逐 URL 采集检查点
+      operationId: getTaskProgress
+      parameters:
+        - name: run_id
+          in: query
+          description: 上次响应的采集进程 ID；变化时从头重新同步
+          schema: { type: string }
+        - name: after_position
+          in: query
+          description: 上次已处理的 URL 位置
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          description: 单次最多检查的 URL 数
+          schema: { type: integer, minimum: 1, maximum: 5000, default: 1000 }
+      responses:
+        '200':
+          description: 已原子提交的采集单元
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaptureProgressResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /api/v1/tasks/{task_id}/resume:
     parameters:
       - $ref: '#/components/parameters/TaskId'
@@ -891,6 +921,20 @@ components:
         cache_policy:
           type: object
           additionalProperties: true
+
+    CaptureProgressResponse:
+      type: object
+      required: [task_id, next_position, observed_position, total_urls, has_more, units]
+      properties:
+        task_id: { type: string }
+        run_id: { type: string, nullable: true }
+        next_position: { type: integer, minimum: 0 }
+        observed_position: { type: integer, minimum: 0 }
+        total_urls: { type: integer, minimum: 0 }
+        has_more: { type: boolean }
+        units:
+          type: array
+          items: { type: object, additionalProperties: true }
 
     LogResponse:
       type: object

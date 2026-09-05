@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { Ban, ChevronRight, FileText, Play, RefreshCw, RotateCcw, ScrollText } from '@lucide/vue'
 import StatusPill from '../components/StatusPill.vue'
 
@@ -7,6 +7,7 @@ const props = defineProps({
   jobs: { type: Array, default: () => [] },
   selectedJob: { type: Object, default: null },
   logs: { type: Array, default: () => [] },
+  logsLoading: { type: Boolean, default: false },
 })
 const emit = defineEmits(['select', 'cancel', 'resume', 'restart', 'logs', 'refresh'])
 const statusFilter = ref('ALL')
@@ -16,6 +17,27 @@ const filteredJobs = computed(() => statusFilter.value === 'ALL' ? props.jobs : 
 const canCancel = computed(() => props.selectedJob && !terminal.includes(props.selectedJob.status))
 const canResume = computed(() => props.selectedJob && ['PARTIAL', 'FAILED', 'CANCELED', 'INTERRUPTED'].includes(props.selectedJob.status))
 const canRestart = computed(() => props.selectedJob && terminal.includes(props.selectedJob.status))
+const logElements = new Map()
+
+function setLogElement(machineId, element) {
+  if (element) logElements.set(machineId, element)
+  else logElements.delete(machineId)
+}
+
+function loadedSize(entry) {
+  const bytes = Number(entry.next_offset || 0)
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`
+}
+
+watch(
+  () => props.logs.map((entry) => `${entry.machine_id}:${entry.next_offset}`).join('|'),
+  async () => {
+    await nextTick()
+    for (const element of logElements.values()) element.scrollTop = element.scrollHeight
+  },
+)
 
 function requestResume() {
   if (window.confirm('继续后将沿用原任务目录，已完成 URL 会跳过，未完成 URL 会重新抓取。是否继续？')) {
@@ -65,7 +87,7 @@ function displayTime(value) {
         </div>
         <StatusPill :status="selectedJob.status" />
         <div class="detail-actions">
-          <button class="secondary-button" @click="emit('logs', selectedJob.job_id)"><ScrollText :size="15" />读取日志</button>
+          <button class="secondary-button" :disabled="logsLoading" @click="emit('logs', selectedJob.job_id)"><ScrollText :size="15" />{{ logsLoading ? '读取中…' : (logs.length ? '刷新日志' : '读取日志') }}</button>
           <button v-if="canResume" class="secondary-button" @click="requestResume"><Play :size="15" />从断点继续</button>
           <button v-if="canRestart" class="secondary-button" @click="requestRestart"><RotateCcw :size="15" />重新开启新一轮</button>
           <button v-if="canCancel" class="danger-button" @click="emit('cancel', selectedJob.job_id)"><Ban :size="15" />取消任务</button>
@@ -77,6 +99,14 @@ function displayTime(value) {
         <div class="metric-card success"><span>成功</span><strong>{{ selectedJob.summary.succeeded }}</strong><small>完整产物</small></div>
         <div class="metric-card warning"><span>部分成功</span><strong>{{ selectedJob.summary.partial }}</strong><small>部分产物缺失</small></div>
         <div class="metric-card danger"><span>失败</span><strong>{{ selectedJob.summary.failed }}</strong><small>需要检查日志</small></div>
+      </div>
+
+      <div v-if="logs.length" class="panel logs-panel">
+        <div class="panel-heading"><div><h3>Worker 日志</h3><p>位于 URL 矩阵之前；打开后每 2 秒增量同步，不再截断为首个 64 KiB</p></div></div>
+        <article v-for="entry in logs" :key="entry.machine_id">
+          <div class="log-meta"><strong>{{ entry.machine_name }}</strong><span>已读取 {{ loadedSize(entry) }} · {{ entry.eof ? '已追上最新日志' : '继续加载中' }}</span></div>
+          <pre :ref="(element) => setLogElement(entry.machine_id, element)">{{ entry.error || entry.text || '暂无日志' }}</pre>
+        </article>
       </div>
 
       <div class="panel result-panel">
@@ -98,10 +128,6 @@ function displayTime(value) {
         </div>
       </div>
 
-      <div v-if="logs.length" class="panel logs-panel">
-        <div class="panel-heading"><div><h3>Worker 日志</h3><p>当前读取每台目标机器的最新日志内容</p></div></div>
-        <article v-for="entry in logs" :key="entry.machine_id"><strong>{{ entry.machine_name }}</strong><pre>{{ entry.error || entry.text || '暂无日志' }}</pre></article>
-      </div>
     </section>
 
     <section v-else class="panel empty-detail"><FileText :size="34" /><h2>选择一个任务</h2><p>查看 URL、机器和浏览器级别的实时状态与本地结果路径。</p></section>

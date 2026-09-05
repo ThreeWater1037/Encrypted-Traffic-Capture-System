@@ -396,6 +396,19 @@ def create_app(
         job = master_store.get_job_control(job_id)
         if job is None:
             return jsonify({"error": "not_found", "message": "任务不存在"}), 404
+        try:
+            offsets = json.loads(request.args.get("offsets", "{}"))
+            limit = min(65_536, max(1, int(request.args.get("limit", "65536"))))
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValidationError("offsets 或 limit 格式错误") from exc
+        if not isinstance(offsets, dict) or any(
+            not isinstance(machine_id, str)
+            or not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+            for machine_id, offset in offsets.items()
+        ):
+            raise ValidationError("offsets 必须是机器 ID 到非负整数偏移的对象")
         logs = []
         for target in job["request"]["targets"]:
             machine = master_store.get_machine(target["machine_id"])
@@ -406,7 +419,11 @@ def create_app(
                 machine["base_url"], machine["token"], timeout=master_config.worker_request_timeout
             )
             try:
-                entry = client.get_log(worker_task_id)
+                entry = client.get_log(
+                    worker_task_id,
+                    offset=offsets.get(machine["machine_id"], 0),
+                    limit=limit,
+                )
                 logs.append({"machine_id": machine["machine_id"], "machine_name": machine["name"], **entry})
             except WorkerRequestError as exc:
                 logs.append({"machine_id": machine["machine_id"], "machine_name": machine["name"], "text": "", "error": str(exc)})

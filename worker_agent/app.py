@@ -460,6 +460,26 @@ def create_app(
             )
         )
 
+    @app.get("/api/v1/tasks/<task_id>/progress")
+    def get_task_progress(task_id: str):
+        """返回已提交原子检查点的逐 URL 采集进度。"""
+        if not TASK_ID_RE.fullmatch(task_id):
+            return jsonify({"error": "invalid_task_id"}), 400
+        try:
+            after_position = max(0, int(request.args.get("after_position", "0")))
+            limit = min(5000, max(1, int(request.args.get("limit", "1000"))))
+        except ValueError:
+            return jsonify({"error": "invalid_pagination"}), 400
+        progress = task_manager.capture_progress(
+            task_id,
+            run_id=request.args.get("run_id") or None,
+            after_position=after_position,
+            limit=limit,
+        )
+        if progress is None:
+            return jsonify({"error": "not_found", "message": "任务不存在"}), 404
+        return jsonify(progress)
+
     @app.post("/api/v1/tasks/<task_id>/cancel")
     def cancel_task(task_id: str):
         """请求取消排队或正在运行的任务。"""

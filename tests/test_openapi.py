@@ -21,6 +21,7 @@ class WorkerOpenApiTests(unittest.TestCase):
             "/api/v1/tasks": {"post"},
             "/api/v1/tasks/from-file": {"post"},
             "/api/v1/tasks/{task_id}": {"get"},
+            "/api/v1/tasks/{task_id}/progress": {"get"},
             "/api/v1/tasks/{task_id}/cancel": {"post"},
             "/api/v1/tasks/{task_id}/resume": {"post"},
             "/api/v1/tasks/{task_id}/result": {"get"},

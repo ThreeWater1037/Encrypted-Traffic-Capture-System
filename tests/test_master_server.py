@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from master_server.app import create_app
 from master_server.config import MasterConfig
@@ -16,6 +17,7 @@ class FakeWorkerClient:
     def __init__(self) -> None:
         self.task_id = ""
         self.resume_tokens = []
+        self.log_requests = []
 
     def health(self):
         return {"status": "ok", "worker_id": "worker-local", "busy": False}
@@ -50,6 +52,25 @@ class FakeWorkerClient:
                     {"item_id": "2", "browser": "chrome", "status": "FAILED"},
                 ]
             },
+        }
+
+    def get_capture_progress(self, task_id, *, run_id=None, after_position=0, limit=1000):
+        return {
+            "task_id": task_id,
+            "run_id": run_id,
+            "next_position": after_position,
+            "observed_position": after_position,
+            "has_more": False,
+            "units": [],
+        }
+
+    def get_log(self, task_id, *, offset=0, limit=65_536):
+        self.log_requests.append((task_id, offset, limit))
+        return {
+            "task_id": task_id,
+            "text": f"chunk@{offset}",
+            "next_offset": offset + 10,
+            "eof": True,
         }
 
     def cancel_task(self, task_id):
@@ -245,6 +266,50 @@ class MasterServerTests(unittest.TestCase):
         self.assertEqual(job["items"][0]["status"], "SUCCEEDED")
         self.assertEqual(job["items"][1]["status"], "FAILED")
         self.assertEqual(job["summary"]["progress"], 100)
+
+    def test_live_capture_progress_updates_one_url_immediately(self):
+        job_id = "live-capture-master-001"
+        self.store.create_job(self.payload(job_id))
+        self.store.update_worker_executions(
+            job_id, "worker-local", status="CAPTURING", stage="CAPTURING"
+        )
+        self.store.update_worker_capture_progress(
+            job_id,
+            "worker-local",
+            [
+                {
+                    "item_id": "1",
+                    "browser": "chrome",
+                    "status": "CAPTURED",
+                    "stage": "CAPTURED",
+                    "artifacts": {
+                        "pcap": {"path": "fetch_output/1/capture_chrome.pcap"}
+                    },
+                }
+            ],
+        )
+
+        job = self.client.get(f"/api/v1/jobs/{job_id}").get_json()
+
+        self.assertEqual(job["summary"]["completed"], 1)
+        self.assertEqual(job["summary"]["progress"], 50)
+        self.assertEqual(job["items"][0]["status"], "CAPTURED")
+        self.assertEqual(job["items"][1]["status"], "CAPTURING")
+
+    def test_job_logs_forward_per_machine_offsets(self):
+        job_id = "paged-logs-001"
+        self.store.create_job(self.payload(job_id))
+
+        with patch("master_server.app.WorkerClient", return_value=self.fake_worker):
+            response = self.client.get(
+                f"/api/v1/jobs/{job_id}/logs",
+                query_string={"offsets": '{"worker-local":65536}', "limit": "4096"},
+            )
+        data = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data["logs"][0]["text"], "chunk@65536")
+        self.assertEqual(self.fake_worker.log_requests[-1][1:], (65536, 4096))
 
     def test_resume_job_reuses_worker_task_with_idempotency_token(self):
         job_id = "resume-master-001"

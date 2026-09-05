@@ -107,6 +107,7 @@ OpenAPI/Swagger → 文件导入”，然后选择该文件。导入后在项目
 | `POST` | `/api/v1/tasks` | 创建任务，立即返回 `202` |
 | `POST` | `/api/v1/tasks/from-file` | 通过 multipart 直接上传 `.txt/.tsv` 创建任务 |
 | `GET` | `/api/v1/tasks/{task_id}` | 查询任务状态 |
+| `GET` | `/api/v1/tasks/{task_id}/progress` | 分页读取已提交的逐 URL 原子采集检查点 |
 | `GET` | `/api/v1/tasks/{task_id}/log` | 按字节偏移增量读取日志 |
 | `GET` | `/api/v1/tasks/{task_id}/result` | 查询本地结果清单 |
 | `POST` | `/api/v1/tasks/{task_id}/cancel` | 取消任务和整个子进程树 |
@@ -229,10 +230,12 @@ URL，包含该 URL 的汇总 `status` 和 `browser_statuses[]`；顶层 `status
 默认 `TASK_TIMEOUT_SECONDS=0`，即不设置整批任务总超时。每个采集单元成功落盘后会
 原子生成 `capture_<browser>.complete.json`；只有标记中的 URL、浏览器和各产物精确
 大小都匹配时，续跑才会跳过该单元。中断时正在写入的 URL 会清理半截文件并重抓，
-此前已完成的 URL 不会重复访问。
+此前已完成的 URL 不会重复访问。`progress` 接口使用每次采集进程的 `run_id` 和 URL
+位置分页返回新检查点，供 Master 在整批完成前就将单个执行单元标记为 `CAPTURED`。
 
-`wiki_fetcher.py` 非零退出后，Worker 每 5 秒重启一次采集进程；Worker 自身重启后，
-SQLite 中的未完成任务会恢复为 `QUEUED / RESUMING`。健康接口字段
+`wiki_fetcher.py` 非零退出后，Worker 每 5 秒从 URL 检查点重试，最多自动重试
+5 次；超过上限后任务进入 `FAILED`。Worker 自身重启后，SQLite 中的未完成任务
+会恢复为 `QUEUED / RESUMING`。健康接口字段
 `recovered_tasks_on_startup` 可用于监控本次启动恢复了多少任务。
 
 默认容量目标是单任务 10 万 URL。百万级输入应拆成 1 万至 5 万 URL 的独立任务，
