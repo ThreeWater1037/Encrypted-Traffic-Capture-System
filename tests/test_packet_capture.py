@@ -5,9 +5,12 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from wiki_fetcher import PacketCapture, UrlEntry, WikiFetcher, _entry_slug
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
+
+from wiki_fetcher import PacketCapture, UrlEntry, WikiFetcher, _entry_slug, _prepare_navigation
 
 
 class _ExitedProcess:
@@ -16,6 +19,48 @@ class _ExitedProcess:
 
 
 class PacketCaptureTests(unittest.TestCase):
+    def test_hit_legacy_resources_only_blocked_on_exact_hit_host(self) -> None:
+        driver = MagicMock(spec=webdriver.Chrome)
+        _prepare_navigation(driver, "https://today.hit.edu.cn/article/1266")
+        driver.execute_cdp_cmd.assert_any_call("Network.setBlockedURLs", {
+            "urls": ["http://today2.hit.edu.cn/*", "https://today2.hit.edu.cn/*"],
+        })
+        driver.set_page_load_timeout.assert_called_once_with(90)
+
+    def test_other_sites_keep_all_image_sources_enabled(self) -> None:
+        for url in (
+            "https://en.wikipedia.org/wiki/Computer",
+            "https://example.com/?next=https://today.hit.edu.cn/",
+            "https://today.hit.edu.cn.example.com/",
+        ):
+            with self.subTest(url=url):
+                driver = MagicMock(spec=webdriver.Chrome)
+                _prepare_navigation(driver, url)
+                driver.execute_cdp_cmd.assert_not_called()
+
+    def test_navigation_timeout_stops_capture_before_quit_and_is_not_success(self) -> None:
+        events = []
+        driver = MagicMock(spec=webdriver.Chrome)
+        driver.command_executor = MagicMock()
+        driver.get.side_effect = TimeoutException("page load timed out")
+        driver.quit.side_effect = lambda: events.append("quit")
+        capture = MagicMock()
+        capture.stop.side_effect = lambda: events.append("stop")
+        builder = MagicMock()
+        builder.build.return_value = driver
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("wiki_fetcher.PacketCapture", return_value=capture),
+            patch.dict("wiki_fetcher.AVAILABLE_DRIVERS", {"chrome": builder}),
+        ):
+            fetcher = WikiFetcher(Path(temp_dir), ["chrome"], True)
+            entry = UrlEntry(id="1", name="Slow", url="https://example.com/")
+            item_dir = fetcher._url_dir("slow")
+            record = fetcher._fetch_with(entry.url, "chrome", item_dir)
+            self.assertIn("page load timed out", record.error)
+            self.assertFalse(fetcher._mark_complete(entry, item_dir, "chrome", record))
+        self.assertEqual(events, ["stop", "quit"])
+
     def test_entry_slug_removes_windows_unsafe_trailing_dots_and_spaces(self) -> None:
         entry = UrlEntry(
             id="132",

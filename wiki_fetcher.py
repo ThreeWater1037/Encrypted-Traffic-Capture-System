@@ -28,6 +28,7 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator, Optional
+from urllib.parse import urlsplit
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -52,6 +53,24 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
+    """保留正常加载策略，仅在今日哈工大页面跳过已失效的旧站资源。"""
+    # Must be shorter than the WebDriver HTTP transport timeout (120s).
+    driver.set_page_load_timeout(90)
+    if (
+        isinstance(driver, (webdriver.Chrome, webdriver.Edge))
+        and urlsplit(url).hostname == "today.hit.edu.cn"
+    ):
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd("Network.setBlockedURLs", {
+            "urls": ["http://today2.hit.edu.cn/*", "https://today2.hit.edu.cn/*"],
+        })
+        log.warning(
+            "    Skipping unavailable legacy resources from today2.hit.edu.cn "
+            "on this HIT page; other image sources remain enabled"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +910,7 @@ class WikiFetcher:
                     }
                 })
 
+            _prepare_navigation(driver, url)
             driver.get(url)
 
             # Stage 1: wait for document.readyState == "complete"
@@ -961,8 +981,17 @@ class WikiFetcher:
             error_msg = str(exc)
             log.warning("    Error: %s", exc)
         finally:
+            # Stop recording before any potentially blocking browser cleanup.
+            # Keep this before key-log copying/profile removal too: either may fail.
+            if capture:
+                saved = capture.stop()
+                actual_pcap_path = str(saved) if saved else None
             if driver:
                 try:
+                    # Bound the quit HTTP request if the renderer is unresponsive.
+                    client_config = getattr(driver.command_executor, "client_config", None)
+                    if client_config is not None:
+                        client_config.timeout = 5
                     driver.quit()
                 except Exception:
                     pass
@@ -970,10 +999,6 @@ class WikiFetcher:
                 shutil.copy2(browser_key_log, key_log)
             shutil.rmtree(profile_dir, ignore_errors=True)
             os.environ.pop("SSLKEYLOGFILE", None)
-
-            if capture:
-                saved = capture.stop()
-                actual_pcap_path = str(saved) if saved else None
 
         content_hash = hashlib.sha256(html.encode()).hexdigest() if html else ""
         html_length = len(html.encode())
