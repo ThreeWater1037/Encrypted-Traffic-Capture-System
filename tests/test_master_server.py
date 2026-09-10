@@ -250,6 +250,49 @@ class MasterServerTests(unittest.TestCase):
         self.assertEqual(empty["page"]["total"], 0)
         self.assertEqual(empty["executions"], [])
 
+    def test_uploaded_url_order_is_preserved_across_pages_and_filters(self):
+        self.store.upsert_machine({
+            "machine_id": "worker-second", "name": "Second worker",
+            "base_url": "http://127.0.0.1:5301", "token": "", "enabled": True,
+        })
+        # Deliberately neither numeric nor lexicographic order, with skipped lines.
+        ids = ["2", "10", "1", "z-last", "a-first"]
+        content = "# input order\n\n" + "\n".join(
+            f"{item_id}\tOrdered URL {item_id}\thttps://example.com/{item_id}" for item_id in ids
+        )
+        response = self.client.post(
+            "/api/v1/jobs/from-file",
+            data={
+                "job_id": "upload-order-001", "name": "Upload order",
+                "targets": '[{"machine_id":"worker-local","browsers":["chrome","edge"]},{"machine_id":"worker-second","browsers":["edge"]}]',
+                "file": (io.BytesIO(content.encode()), "ordered.txt"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 202)
+        # Simulate reopening an existing database; no re-upload or migration needed.
+        reopened = MasterStore(self.config.database_path)
+        self.assertEqual([item["id"] for item in reopened.get_job("upload-order-001")["request"]["items"]], ids)
+        with self.store._connection() as connection:
+            connection.execute(
+                """UPDATE executions SET status = 'FAILED' WHERE job_id = 'upload-order-001'
+                    AND ((item_id = '2' AND machine_id = 'worker-second')
+                      OR (item_id IN ('10', 'a-first') AND machine_id = 'worker-local' AND browser = 'chrome'))"""
+            )
+        base = "/api/v1/jobs/upload-order-001?unit=url&limit=2"
+        for suffix, expected in [("", ids), ("&query=ORDERED", ids), ("&status=FAILED", ["2", "10", "a-first"])]:
+            with self.subTest(filter=suffix):
+                actual = []
+                for offset in range(0, len(expected), 2):
+                    data = self.client.get(f"{base}&offset={offset}{suffix}").get_json()
+                    actual.extend(item["id"] for item in data["items"])
+                    self.assertEqual(data["page"]["total"], len(expected))
+                    self.assertTrue(all(len(item["executions"]) == 3 for item in data["items"]))
+                self.assertEqual(actual, expected)
+        # Stored status updates and a fresh store preserve the same first page.
+        page = reopened.get_job_page("upload-order-001", unit="url", limit=2)
+        self.assertEqual(list(dict.fromkeys(e["item_id"] for e in page["executions"])), ids[:2])
+
     def test_ten_thousand_urls_are_accessible_without_loading_all_executions(self):
         payload = self.payload("large-url-job")
         payload["items"] = [{"id": f"{i:05d}", "name": f"URL {i}", "url": f"https://example.com/{i}"} for i in range(10000)]

@@ -375,9 +375,15 @@ class MasterStore:
                     f"SELECT COUNT(DISTINCT item_id) FROM executions WHERE {conditions}", params,
                 ).fetchone()[0]
                 offset = min(offset, max(0, (total - 1) // limit) * limit)
+                # create_job inserts each target's items in upload order. Use the
+                # first execution across ALL targets, including when filtering by
+                # status: the first matching target may differ between URLs.
                 item_ids = [entry[0] for entry in connection.execute(
-                    f"SELECT DISTINCT item_id FROM executions WHERE {conditions} ORDER BY item_id LIMIT ? OFFSET ?",
-                    [*params, limit, offset],
+                    f"""SELECT item_id FROM executions WHERE job_id = ?
+                         GROUP BY item_id
+                        HAVING MAX(CASE WHEN {conditions} THEN 1 ELSE 0 END) = 1
+                         ORDER BY MIN(execution_id) LIMIT ? OFFSET ?""",
+                    [job_id, *params, limit, offset],
                 ).fetchall()]
                 placeholders = ",".join("?" for _ in item_ids)
                 executions = connection.execute(
@@ -387,6 +393,8 @@ class MasterStore:
                          ORDER BY e.item_id, e.machine_id, e.browser""",
                     [job_id, *item_ids],
                 ).fetchall() if item_ids else []
+                item_positions = {item_id: position for position, item_id in enumerate(item_ids)}
+                executions.sort(key=lambda execution: item_positions[execution["item_id"]])
                 item_page = {"unit": "url", "offset": offset, "limit": limit,
                              "returned": len(item_ids), "total": total}
             else:
