@@ -528,6 +528,24 @@ WORKER_DATA_DIR/tasks/<task_id>/
 报告，以及 `batch_process.py` 生成的 TSV、`capture_*_flows/`、
 `capture_*_inferred/` 等后处理产物，只有在创建任务时显式启用才会生成。
 
+Chrome/Edge 访问 `today.hit.edu.cn` 时采用专用资源等待策略，其他网站仍使用原有
+加载逻辑：保留 `today2.hit.edu.cn`、`myweb.hit.edu.cn` 的 HTTP/HTTPS 资源隔离；
+正文 DOM 就绪后，只有剩余资源都连续 5 秒没有响应或数据传输进展，才停止剩余加载。
+正在持续下载的图片允许超过 5 秒；资源等待另有 90 秒兜底，触发时按失败处理。
+
+受影响页面会保留可供补抓的标记，即使没有启用 HTML/报告输出：
+
+- 每个 URL 目录的 `resource_status_<browser>.json` 保存最近一次结果，包含页面 URL、
+  `needs_recapture`、`resource_status`、被跳过资源的完整 URL、原因和时间。
+- 输出根目录的 `pages_needing_recapture.jsonl` 追加记录所有需补抓的尝试，包含产物目录
+  和 `run_id`；这是历史清单，可能有同一页面的多次记录，最新状态以逐 URL 文件为准。
+- 完成检查点也包含 `skipped_resources`、`needs_recapture` 和 `resource_status`。
+  `partial` 表示正文采集完成但有资源缺失，批次可以继续；不代表图片全部加载成功。
+  `isolated_legacy_host` 表示旧域名隔离，`no_progress_for_5_seconds` 表示停滞跳过。
+
+以上五秒策略及资源标记仅适用于 Chrome/Edge 的今日哈工大页面，Firefox/Safari
+保留原有加载逻辑。已有产物不会被追溯修改。
+
 ## 9. 大批量、断点续跑与 24 小时运行
 
 - 单个任务默认最多 `100000` 个 URL，请求体上限为 `256 MiB`；Worker 的总任务

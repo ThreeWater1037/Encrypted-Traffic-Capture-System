@@ -23,7 +23,8 @@ class PacketCaptureTests(unittest.TestCase):
         driver = MagicMock(spec=webdriver.Chrome)
         _prepare_navigation(driver, "https://today.hit.edu.cn/article/1266")
         driver.execute_cdp_cmd.assert_any_call("Network.setBlockedURLs", {
-            "urls": ["http://today2.hit.edu.cn/*", "https://today2.hit.edu.cn/*"],
+            "urls": ["http://myweb.hit.edu.cn/*", "https://myweb.hit.edu.cn/*",
+                     "http://today2.hit.edu.cn/*", "https://today2.hit.edu.cn/*"],
         })
         driver.set_page_load_timeout.assert_called_once_with(90)
 
@@ -60,6 +61,48 @@ class PacketCaptureTests(unittest.TestCase):
             self.assertIn("page load timed out", record.error)
             self.assertFalse(fetcher._mark_complete(entry, item_dir, "chrome", record))
         self.assertEqual(events, ["stop", "quit"])
+
+    def test_wiki_uses_original_wait_without_hit_policy_or_skip_report(self) -> None:
+        driver = MagicMock(spec=webdriver.Chrome)
+        driver.command_executor = MagicMock()
+        driver.current_url = "https://en.wikipedia.org/wiki/Test"
+        driver.title = "Test"
+        driver.page_source = "<html><body>Wiki</body></html>"
+        builder = MagicMock()
+        builder.build.return_value = driver
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict("wiki_fetcher.AVAILABLE_DRIVERS", {"chrome": builder}), \
+             patch("wiki_fetcher.wait_for_resources") as resource_wait, \
+             patch.object(WikiFetcher, "_wait_for_normal_page") as normal_wait, \
+             patch("wiki_fetcher.time.sleep"):
+            fetcher = WikiFetcher(Path(tmp), ["chrome"], False)
+            item_dir = fetcher._url_dir("wiki")
+            result = fetcher._fetch_with(driver.current_url, "chrome", item_dir)
+            self.assertIsNone(result.error)
+            self.assertEqual(builder.build.call_args.kwargs, {})
+            normal_wait.assert_called_once_with(driver)
+            resource_wait.assert_not_called()
+            self.assertFalse((item_dir / "resource_status_chrome.json").exists())
+
+    def test_partial_capture_checkpoint_keeps_recapture_flag(self) -> None:
+        from wiki_fetcher import SessionRecord
+        with tempfile.TemporaryDirectory() as tmp:
+            fetcher = WikiFetcher(Path(tmp), ["chrome"], True)
+            entry = UrlEntry(id="3", name="HIT", url="https://today.hit.edu.cn/article/1266")
+            item_dir = fetcher._url_dir("hit")
+            for path in fetcher._expected_artifacts(item_dir, "chrome"):
+                path.write_bytes(b"fixture")
+            skipped = [{"url": "https://today2.hit.edu.cn/old.png",
+                        "reason": "isolated_legacy_host"}]
+            record = SessionRecord(browser="Chrome", url=entry.url, timestamp="now",
+                final_url=entry.url, page_title="HIT", html_length=1, response_time_ms=1,
+                content_hash="hash", cookies=[], key_log_path=None, pcap_path=None,
+                skipped_resources=skipped)
+            self.assertTrue(fetcher._mark_complete(entry, item_dir, "chrome", record))
+            marker = json.loads(fetcher._completion_marker_path(item_dir, "chrome").read_text("utf-8"))
+            self.assertTrue(marker["needs_recapture"])
+            self.assertEqual(marker["resource_status"], "partial")
+            self.assertEqual(marker["skipped_resources"], skipped)
 
     def test_entry_slug_removes_windows_unsafe_trailing_dots_and_spaces(self) -> None:
         entry = UrlEntry(

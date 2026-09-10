@@ -46,6 +46,7 @@ from webdriver_manager.core.driver_cache import DriverCacheManager
 
 from browser_discovery import discover_browser
 from browser_proxy import BrowserProxy, parse_browser_proxy
+from browser_loading import HIT_LEGACY_HOSTS, wait_for_resources
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,7 +57,7 @@ log = logging.getLogger(__name__)
 
 
 def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
-    """保留正常加载策略，仅在今日哈工大页面跳过已失效的旧站资源。"""
+    """设置导航兜底；今日哈工大资源等待在 DOM 就绪后单独处理。"""
     # Must be shorter than the WebDriver HTTP transport timeout (120s).
     driver.set_page_load_timeout(90)
     if (
@@ -65,12 +66,10 @@ def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
     ):
         driver.execute_cdp_cmd("Network.enable", {})
         driver.execute_cdp_cmd("Network.setBlockedURLs", {
-            "urls": ["http://today2.hit.edu.cn/*", "https://today2.hit.edu.cn/*"],
+            "urls": [f"{scheme}://{host}/*"
+                     for host in sorted(HIT_LEGACY_HOSTS) for scheme in ("http", "https")],
         })
-        log.warning(
-            "    Skipping unavailable legacy resources from today2.hit.edu.cn "
-            "on this HIT page; other image sources remain enabled"
-        )
+        driver.get_log("performance")  # discard new-tab events before navigation
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +383,7 @@ class SessionRecord:
     pcap_path: Optional[str]
     request_id: str = field(default_factory=lambda: secrets.token_hex(8))
     error: Optional[str] = None
+    skipped_resources: list[dict] = field(default_factory=list)
 
     def summary(self) -> str:
         """生成便于写入 report.txt 的人类可读摘要。"""
@@ -403,6 +403,8 @@ class SessionRecord:
         ]
         if self.error:
             lines.append(f"  ERROR          : {self.error}")
+        if self.skipped_resources:
+            lines.append(f"  Skipped stalled resources: {len(self.skipped_resources)}")
         return "\n".join(lines)
 
 
@@ -500,9 +502,13 @@ class ChromeDriver(BrowserDriver):
         key_log_path: Path,
         profile_dir: Path,
         proxy: BrowserProxy | None = None,
+        *, skip_stalled_resources: bool = False,
     ) -> webdriver.Chrome:
         """配置 Chrome 启动参数、驱动服务和 CDP 无缓存设置。"""
         opts = ChromeOptions()
+        if skip_stalled_resources:
+            opts.page_load_strategy = "eager"
+            opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
         binary = self._find_binary()
         if not binary:
             raise RuntimeError("Google Chrome/Chromium not found")
@@ -554,6 +560,7 @@ class EdgeDriver(BrowserDriver):
         key_log_path: Path,
         profile_dir: Path,
         proxy: BrowserProxy | None = None,
+        *, skip_stalled_resources: bool = False,
     ) -> webdriver.Edge:
         """配置 Edge 启动参数、驱动服务和 CDP 无缓存设置。"""
         binary = self._find_binary()
@@ -561,6 +568,9 @@ class EdgeDriver(BrowserDriver):
             raise RuntimeError("Microsoft Edge not found")
 
         opts = EdgeOptions()
+        if skip_stalled_resources:
+            opts.page_load_strategy = "eager"
+            opts.set_capability("ms:loggingPrefs", {"performance": "ALL"})
         opts.binary_location = binary
         opts.add_argument(f"--user-data-dir={profile_dir}")
         opts.add_argument("--disable-application-cache")
@@ -827,6 +837,9 @@ class WikiFetcher:
             "browser": browser_key,
             "completed_at": datetime.now().isoformat(),
             "artifacts": {path.name: path.stat().st_size for path in expected},
+            "skipped_resources": record.skipped_resources,
+            "needs_recapture": bool(record.skipped_resources),
+            "resource_status": "partial" if record.skipped_resources else "complete",
         }
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -895,10 +908,16 @@ class WikiFetcher:
         cookies = []
         response_time_ms = 0.0
         error_html = ""
+        skipped_resources = []
+        skip_stalled = (
+            driver_key in {"chrome", "edge"}
+            and urlsplit(url).hostname == "today.hit.edu.cn"
+        )
 
         try:
             log.info("    Starting %s ...", bd.name)
-            driver = bd.build(browser_key_log, profile_dir, self.proxy)
+            build_options = {"skip_stalled_resources": True} if skip_stalled else {}
+            driver = bd.build(browser_key_log, profile_dir, self.proxy, **build_options)
 
             t0 = time.perf_counter()
 
@@ -913,68 +932,27 @@ class WikiFetcher:
             _prepare_navigation(driver, url)
             driver.get(url)
 
-            # Stage 1: wait for document.readyState == "complete"
-            # (Selenium's default page load strategy already does this,
-            #  but we make it explicit and observable)
-            WebDriverWait(driver, 30).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-
-            # Stage 2: wait for network to go idle — no new requests for
-            # NETWORK_IDLE_THRESHOLD consecutive seconds.
-            # This covers async JS, lazy-loaded images, XHR/fetch calls, etc.
-            NETWORK_IDLE_THRESHOLD = 2.0   # seconds of silence = "done"
-            NETWORK_IDLE_TIMEOUT   = 15.0  # give up after this long regardless
-
-            if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
-                # Track in-flight request count via CDP Network events (Chromium only)
-                driver.execute_cdp_cmd("Network.enable", {})
-                driver.execute_script("""
-                    window.__inflight = 0;
-                    window.__lastActivity = Date.now();
-                    const orig_fetch = window.fetch;
-                    window.fetch = function(...args) {
-                        window.__inflight++;
-                        window.__lastActivity = Date.now();
-                        return orig_fetch.apply(this, args).finally(() => {
-                            window.__inflight = Math.max(0, window.__inflight - 1);
-                            window.__lastActivity = Date.now();
-                        });
-                    };
-                """)
-                idle_deadline = time.perf_counter() + NETWORK_IDLE_TIMEOUT
-                while time.perf_counter() < idle_deadline:
-                    time.sleep(0.3)
-                    idle_ms = driver.execute_script(
-                        "return Date.now() - (window.__lastActivity || 0);"
-                    )
-                    if idle_ms >= NETWORK_IDLE_THRESHOLD * 1000:
-                        break
+            if skip_stalled:
+                wait_for_resources(driver, skipped_resources)
             else:
-                # Firefox: no CDP — fall back to a fixed settle delay
-                time.sleep(NETWORK_IDLE_THRESHOLD)
+                self._wait_for_normal_page(driver)
 
             response_time_ms = (time.perf_counter() - t0) * 1000
 
             final_url = driver.current_url
             page_title = driver.title
-            # Keep page content in memory for browser-error detection even when
-            # HTML is not selected as an output artifact.
             html = driver.page_source
             if self.save_reports:
                 cookies = driver.get_cookies()
 
             detected_error = _detect_browser_error_page(final_url, html)
             if detected_error:
-                # 错误页单独保存供排查，但不能作为成功正文参与 Worker 状态判断。
                 error_msg = detected_error
                 error_html = html
                 html = ""
                 cookies = []
                 log.warning("    Error: %s", detected_error)
 
-            # Stage 3: let the browser flush any remaining in-flight responses
-            # before we call quit() and terminate all connections.
             time.sleep(0.5)
 
         except Exception as exc:
@@ -982,13 +960,11 @@ class WikiFetcher:
             log.warning("    Error: %s", exc)
         finally:
             # Stop recording before any potentially blocking browser cleanup.
-            # Keep this before key-log copying/profile removal too: either may fail.
             if capture:
                 saved = capture.stop()
                 actual_pcap_path = str(saved) if saved else None
             if driver:
                 try:
-                    # Bound the quit HTTP request if the renderer is unresponsive.
                     client_config = getattr(driver.command_executor, "client_config", None)
                     if client_config is not None:
                         client_config.timeout = 5
@@ -1003,14 +979,36 @@ class WikiFetcher:
         content_hash = hashlib.sha256(html.encode()).hexdigest() if html else ""
         html_length = len(html.encode())
 
+        if skip_stalled:
+            # Always overwrite the per-page assessment, including a clean re-run.
+            # Also keep append-only history for later filtering or recapture.
+            assessment = {
+                "page_url": url, "final_url": final_url, "browser": driver_key,
+                "run_id": self.progress_run_id,
+                "recorded_at": datetime.now().astimezone().isoformat(),
+                "needs_recapture": bool(skipped_resources) or bool(error_msg),
+                "error": error_msg, "skipped_resources": skipped_resources,
+                "resource_status": "failed" if error_msg else (
+                    "partial" if skipped_resources else "complete"),
+            }
+            assessment_path = url_dir / f"resource_status_{driver_key}.json"
+            temporary = assessment_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(assessment, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+            temporary.replace(assessment_path)
+            if assessment["needs_recapture"]:
+                assessment["artifact_dir"] = str(url_dir)
+                with (self.output_dir / "pages_needing_recapture.jsonl").open(
+                    "a", encoding="utf-8"
+                ) as stream:
+                    stream.write(json.dumps(assessment, ensure_ascii=False) + "\n")
+                log.warning("    Page marked for recapture: %s → %s", url, assessment_path)
+
         if self.save_html and error_html:
             error_body_path = url_dir / f"error_{driver_key}.html"
             error_body_path.write_text(error_html, encoding="utf-8")
-            log.info(
-                "    Browser error page → %s (%d bytes)",
-                error_body_path,
-                len(error_html.encode()),
-            )
+            log.info("    Browser error page → %s (%d bytes)", error_body_path,
+                     len(error_html.encode()))
 
         if self.save_html and html:
             body_path = url_dir / f"body_{driver_key}.html"
@@ -1018,19 +1016,57 @@ class WikiFetcher:
             log.info("    Body → %s (%d bytes)", body_path, html_length)
 
         return SessionRecord(
-            browser=bd.name,
-            url=url,
-            timestamp=timestamp,
-            final_url=final_url,
-            page_title=page_title,
-            html_length=html_length,
-            response_time_ms=response_time_ms,
-            content_hash=content_hash,
-            cookies=cookies,
-            key_log_path=str(key_log) if key_log.exists() else None,
-            pcap_path=actual_pcap_path,
-            error=error_msg,
+            browser=bd.name, url=url, timestamp=timestamp, final_url=final_url,
+            page_title=page_title, html_length=html_length,
+            response_time_ms=response_time_ms, content_hash=content_hash,
+            cookies=cookies, key_log_path=str(key_log) if key_log.exists() else None,
+            pcap_path=actual_pcap_path, error=error_msg,
+            skipped_resources=skipped_resources,
         )
+
+    @staticmethod
+    def _wait_for_normal_page(driver) -> None:
+        # Stage 1: wait for document.readyState == "complete"
+        # (Selenium's default page load strategy already does this,
+        #  but we make it explicit and observable)
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+
+        # Stage 2: wait for network to go idle — no new requests for
+        # NETWORK_IDLE_THRESHOLD consecutive seconds.
+        # This covers async JS, lazy-loaded images, XHR/fetch calls, etc.
+        NETWORK_IDLE_THRESHOLD = 2.0   # seconds of silence = "done"
+        NETWORK_IDLE_TIMEOUT   = 15.0  # give up after this long regardless
+
+        if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
+            # Track in-flight request count via CDP Network events (Chromium only)
+            driver.execute_cdp_cmd("Network.enable", {})
+            driver.execute_script("""
+                window.__inflight = 0;
+                window.__lastActivity = Date.now();
+                const orig_fetch = window.fetch;
+                window.fetch = function(...args) {
+                    window.__inflight++;
+                    window.__lastActivity = Date.now();
+                    return orig_fetch.apply(this, args).finally(() => {
+                        window.__inflight = Math.max(0, window.__inflight - 1);
+                        window.__lastActivity = Date.now();
+                    });
+                };
+            """)
+            idle_deadline = time.perf_counter() + NETWORK_IDLE_TIMEOUT
+            while time.perf_counter() < idle_deadline:
+                time.sleep(0.3)
+                idle_ms = driver.execute_script(
+                    "return Date.now() - (window.__lastActivity || 0);"
+                )
+                if idle_ms >= NETWORK_IDLE_THRESHOLD * 1000:
+                    break
+        else:
+            # Firefox: no CDP — fall back to a fixed settle delay
+            time.sleep(NETWORK_IDLE_THRESHOLD)
+
 
     # ------------------------------------------------------------------
     # Single entry point
