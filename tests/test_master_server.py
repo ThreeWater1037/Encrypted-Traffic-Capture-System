@@ -226,6 +226,43 @@ class MasterServerTests(unittest.TestCase):
         self.assertEqual(data["page"], {"offset": 1, "limit": 1, "returned": 1, "total": 3})
         self.assertEqual(len(data["executions"]), 1)
 
+    def test_url_paging_keeps_all_browsers_and_filters_across_job(self):
+        payload = self.payload("url-paging-001")
+        payload["targets"][0]["browsers"] = ["chrome", "edge"]
+        self.store.create_job(payload)
+        with self.store._connection() as connection:
+            connection.execute(
+                "UPDATE executions SET status = 'FAILED' WHERE job_id = ? AND item_id = '2' AND browser = 'edge'",
+                (payload["job_id"],),
+            )
+        base = "/api/v1/jobs/url-paging-001?unit=url&limit=1"
+        data = self.client.get(base + "&offset=1").get_json()
+        self.assertEqual(data["summary"]["total"], 4)
+        self.assertEqual(data["page"], {"unit": "url", "offset": 1, "limit": 1, "returned": 1, "total": 2})
+        self.assertEqual(data["items"][0]["id"], "2")
+        self.assertEqual(len(data["items"][0]["executions"]), 2)
+        filtered = self.client.get(base + "&status=FAILED&query=EXAMPLE.ORG&offset=999").get_json()
+        self.assertEqual(filtered["page"]["total"], 1)
+        self.assertEqual(filtered["page"]["offset"], 0)
+        self.assertEqual(len(filtered["items"][0]["executions"]), 2)
+        self.assertEqual(filtered["summary"]["total"], 4)
+        empty = self.client.get(base + "&query=does-not-exist").get_json()
+        self.assertEqual(empty["page"]["total"], 0)
+        self.assertEqual(empty["executions"], [])
+
+    def test_ten_thousand_urls_are_accessible_without_loading_all_executions(self):
+        payload = self.payload("large-url-job")
+        payload["items"] = [{"id": f"{i:05d}", "name": f"URL {i}", "url": f"https://example.com/{i}"} for i in range(10000)]
+        self.store.create_job(payload)
+        base = "/api/v1/jobs/large-url-job?unit=url&limit=20"
+        first = self.client.get(base).get_json()
+        last = self.client.get(base + "&offset=9980").get_json()
+        self.assertEqual(first["page"]["total"], 10000)
+        self.assertEqual(first["summary"]["total"], 10000)
+        self.assertEqual(len(first["items"]), 20)
+        self.assertEqual(len(last["executions"]), 20)
+        self.assertEqual(last["items"][-1]["id"], "09999")
+
     def test_default_job_disables_optional_outputs_and_analysis(self):
         payload = self.payload("capture-defaults-001")
         payload.pop("pcap")

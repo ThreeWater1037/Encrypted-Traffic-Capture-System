@@ -351,7 +351,8 @@ class MasterStore:
         return value
 
     def get_job_page(
-        self, job_id: str, *, offset: int = 0, limit: int = 500
+        self, job_id: str, *, offset: int = 0, limit: int = 500,
+        unit: str = "execution", query: str = "", status: str = "ALL",
     ) -> dict[str, Any] | None:
         """分页读取任务明细，避免前端轮询一次加载数万条 execution。"""
         with self._connection() as connection:
@@ -360,17 +361,46 @@ class MasterStore:
             ).fetchone()
             if row is None:
                 return None
-            executions = connection.execute(
-                """
-                SELECT e.*, m.name AS machine_name, m.base_url AS machine_url
-                  FROM executions e
-                  JOIN machines m ON m.machine_id = e.machine_id
-                 WHERE e.job_id = ?
-                 ORDER BY e.execution_id
-                 LIMIT ? OFFSET ?
-                """,
-                (job_id, limit, offset),
-            ).fetchall()
+            item_page = None
+            if unit == "url":
+                conditions = "job_id = ?"
+                params = [job_id]
+                if query.strip():
+                    conditions += " AND (instr(lower(item_id), lower(?)) > 0 OR instr(lower(item_name), lower(?)) > 0 OR instr(lower(url), lower(?)) > 0)"
+                    params.extend([query.strip()] * 3)
+                if status != "ALL":
+                    conditions += " AND status = ?"
+                    params.append(status)
+                total = connection.execute(
+                    f"SELECT COUNT(DISTINCT item_id) FROM executions WHERE {conditions}", params,
+                ).fetchone()[0]
+                offset = min(offset, max(0, (total - 1) // limit) * limit)
+                item_ids = [entry[0] for entry in connection.execute(
+                    f"SELECT DISTINCT item_id FROM executions WHERE {conditions} ORDER BY item_id LIMIT ? OFFSET ?",
+                    [*params, limit, offset],
+                ).fetchall()]
+                placeholders = ",".join("?" for _ in item_ids)
+                executions = connection.execute(
+                    f"""SELECT e.*, m.name AS machine_name, m.base_url AS machine_url
+                          FROM executions e JOIN machines m ON m.machine_id = e.machine_id
+                         WHERE e.job_id = ? AND e.item_id IN ({placeholders})
+                         ORDER BY e.item_id, e.machine_id, e.browser""",
+                    [job_id, *item_ids],
+                ).fetchall() if item_ids else []
+                item_page = {"unit": "url", "offset": offset, "limit": limit,
+                             "returned": len(item_ids), "total": total}
+            else:
+                executions = connection.execute(
+                    """
+                    SELECT e.*, m.name AS machine_name, m.base_url AS machine_url
+                      FROM executions e
+                      JOIN machines m ON m.machine_id = e.machine_id
+                     WHERE e.job_id = ?
+                     ORDER BY e.execution_id
+                     LIMIT ? OFFSET ?
+                    """,
+                    (job_id, limit, offset),
+                ).fetchall()
             count_rows = connection.execute(
                 """
                 SELECT status, COUNT(*) AS count
@@ -392,6 +422,8 @@ class MasterStore:
             "returned": len(executions),
             "total": sum(value["execution_counts"].values()),
         }
+        if item_page is not None:
+            value["page"] = item_page
         return value
 
     def execution_status_counts(self, job_id: str) -> dict[str, int]:

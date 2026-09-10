@@ -35,6 +35,26 @@ const health = ref(null)
 const machines = ref([])
 const jobs = ref([])
 const selectedJob = ref(null)
+const jobPageOptions = ref({})
+const jobPageLoading = ref(false)
+let jobRequestVersion = 0
+
+async function refreshSelectedJob(jobId = selectedJob.value?.job_id) {
+  if (!jobId) return
+  const version = ++jobRequestVersion
+  jobPageLoading.value = true
+  try {
+    const job = await getJob(jobId, jobPageOptions.value)
+    if (version === jobRequestVersion) selectedJob.value = job
+  } finally {
+    if (version === jobRequestVersion) jobPageLoading.value = false
+  }
+}
+
+async function handleJobPage(options) {
+  jobPageOptions.value = options
+  try { await refreshSelectedJob() } catch (reason) { showError(reason) }
+}
 const selectedLogs = ref([])
 const selectedLogJobId = ref('')
 const logsLoading = ref(false)
@@ -102,6 +122,8 @@ async function handleSubmit(submission) {
       : await createJsonJob(submission.payload)
     await loadJobs()
     selectedJob.value = job
+    jobPageOptions.value = {}
+    await refreshSelectedJob(job.job_id)
     selectedLogs.value = []
     selectedLogJobId.value = ''
     activeView.value = 'jobs'
@@ -115,7 +137,8 @@ async function handleSubmit(submission) {
 
 async function handleSelectJob(jobId) {
   try {
-    selectedJob.value = await getJob(jobId)
+    if (jobId !== selectedJob.value?.job_id) jobPageOptions.value = {}
+    await refreshSelectedJob(jobId)
     selectedLogs.value = []
     selectedLogJobId.value = ''
   } catch (reason) {
@@ -125,7 +148,8 @@ async function handleSelectJob(jobId) {
 
 async function handleCancel(jobId) {
   try {
-    selectedJob.value = await cancelJob(jobId)
+    await cancelJob(jobId)
+    await refreshSelectedJob(jobId)
     await loadJobs()
     notify('取消请求已发送')
   } catch (reason) {
@@ -136,7 +160,8 @@ async function handleCancel(jobId) {
 async function handleResume(jobId) {
   loading.value = true
   try {
-    selectedJob.value = await resumeJob(jobId)
+    await resumeJob(jobId)
+    await refreshSelectedJob(jobId)
     await loadJobs()
     notify('已从原任务检查点继续')
   } catch (reason) {
@@ -152,6 +177,8 @@ async function handleRestart(jobId) {
     const job = await restartJob(jobId)
     await loadJobs()
     selectedJob.value = job
+    jobPageOptions.value = {}
+    await refreshSelectedJob(job.job_id)
     selectedLogs.value = []
     selectedLogJobId.value = ''
     notify(`新一轮任务 ${job.job_id} 已创建`)
@@ -243,7 +270,7 @@ onMounted(() => {
     if (!runningCount.value && !selectedJob.value) return
     try {
       await loadJobs()
-      if (selectedJob.value) selectedJob.value = await getJob(selectedJob.value.job_id)
+      if (selectedJob.value && !jobPageLoading.value) await refreshSelectedJob()
       if (selectedJob.value && selectedLogJobId.value === selectedJob.value.job_id) {
         await loadSelectedLogs(selectedJob.value.job_id)
       }
@@ -307,11 +334,15 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
           @probe="handleProbe"
         />
         <JobsView
+          :key="selectedJob?.job_id || 'no-job'"
           v-if="activeView === 'jobs'"
           :jobs="jobs"
           :selected-job="selectedJob"
           :logs="selectedLogs"
           :logs-loading="logsLoading"
+          :page-loading="jobPageLoading"
+          :page-options="jobPageOptions"
+          @page="handleJobPage"
           @select="handleSelectJob"
           @cancel="handleCancel"
           @resume="handleResume"

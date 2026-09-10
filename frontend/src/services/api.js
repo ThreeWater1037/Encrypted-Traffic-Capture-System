@@ -19,7 +19,7 @@ export const probeMachine = (machineId) => request(`/machines/${encodeURICompone
 export const saveMachine = (payload) => request('/machines', { method: 'POST', body: JSON.stringify(payload) })
 export const deleteMachine = (machineId) => request(`/machines/${encodeURIComponent(machineId)}`, { method: 'DELETE' })
 export const getJobs = () => request('/jobs')
-export const getJob = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}`)
+export const getJob = (jobId, options = {}) => request(`/jobs/${encodeURIComponent(jobId)}?${new URLSearchParams({ unit: 'url', limit: 20, ...options })}`)
 export const cancelJob = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' })
 export const resumeJob = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/resume`, { method: 'POST' })
 export const restartJob = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/restart`, { method: 'POST', body: JSON.stringify({}) })

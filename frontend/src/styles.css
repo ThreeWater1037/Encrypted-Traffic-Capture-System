@@ -26,3 +26,20 @@ main { min-width: 0; }.topbar { height: 86px; display: flex; align-items: center
 .toast { position: fixed; right: 24px; bottom: 22px; z-index: 50; display: flex; align-items: center; gap: 8px; max-width: 420px; padding: 11px 14px; color: #fff; border-radius: 8px; box-shadow: 0 13px 30px rgba(15,28,47,.2); font-size: 10px; }.toast.success { background: #176b53; }.toast.error { bottom: 68px; background: #a63e48; }.toast-enter-active, .toast-leave-active { transition: .2s; }.toast-enter-from, .toast-leave-to { opacity: 0; transform: translateY(8px); }
 
 @media (max-width: 1300px) { .workspace-grid { grid-template-columns: 1fr 420px; }.machine-grid { grid-template-columns: repeat(2, minmax(300px, 1fr)); }.topbar-meta > span { display: none; } }
+
+/* Keep large URL jobs bounded, with controls outside the scrolling list. */
+.job-detail { min-width: 0; }
+.result-items { height: clamp(280px, 55vh, 640px); overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.result-url > div { min-width: 0; }
+.result-url a { max-width: 100%; }
+.result-url strong, .execution-card p { overflow-wrap: anywhere; }
+.execution-card { min-width: 0; }
+.url-toolbar, .url-pagination { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding: 12px 16px; font-size: 10px; color: #718096; }
+.url-toolbar { border-bottom: 1px solid var(--line); }
+.url-toolbar > input { flex: 1; min-width: 180px; }
+.url-toolbar label, .url-pagination label, .url-pagination > div { display: flex; align-items: center; gap: 7px; }
+.url-toolbar input, .url-toolbar select, .url-pagination input { padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: #34445b; font: inherit; }
+.url-pagination { border-top: 1px solid var(--line); }
+.url-pagination > div { flex-wrap: wrap; }
+.url-pagination input { width: 66px; }
+.url-pagination button:disabled { opacity: .45; cursor: not-allowed; }

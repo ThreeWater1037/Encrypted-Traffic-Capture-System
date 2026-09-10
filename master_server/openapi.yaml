@@ -194,11 +194,24 @@ paths:
       security: [{ bearerAuth: [] }]
       parameters:
         - in: query
+          name: unit
+          description: url 按 URL 分页并保留其全部机器和浏览器执行单元；默认保持按执行单元分页
+          schema: { type: string, enum: [execution, url], default: execution }
+        - in: query
+          name: query
+          description: unit=url 时，在整个任务内搜索 URL、名称或 ID（子串匹配）
+          schema: { type: string }
+        - in: query
+          name: status
+          description: unit=url 时，匹配任一执行单元具有此状态的 URL；ALL 表示全部
+          schema: { type: string, default: ALL }
+        - in: query
           name: offset
+          description: 跳过的执行单元或 URL 数；URL 模式超出范围时返回最后一页
           schema: { type: integer, minimum: 0, default: 0 }
         - in: query
           name: limit
-          description: 单次最多返回 5000 个执行单元
+          description: 单次最多返回 5000 个执行单元；unit=url 时最多返回 100 个 URL。响应 page 的 total 和 returned 使用对应单位，summary 始终统计整个任务。
           schema: { type: integer, minimum: 1, maximum: 5000, default: 500 }
       responses:
         '200':

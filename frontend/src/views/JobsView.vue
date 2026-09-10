@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { Ban, ChevronRight, FileText, Play, RefreshCw, RotateCcw, ScrollText } from '@lucide/vue'
 import StatusPill from '../components/StatusPill.vue'
 
@@ -8,9 +8,44 @@ const props = defineProps({
   selectedJob: { type: Object, default: null },
   logs: { type: Array, default: () => [] },
   logsLoading: { type: Boolean, default: false },
+  pageLoading: { type: Boolean, default: false },
+  pageOptions: { type: Object, default: () => ({}) },
 })
-const emit = defineEmits(['select', 'cancel', 'resume', 'restart', 'logs', 'refresh'])
+const emit = defineEmits(['select', 'cancel', 'resume', 'restart', 'logs', 'refresh', 'page'])
 const statusFilter = ref('ALL')
+const urlSearch = ref(props.pageOptions.query || '')
+const urlStatus = ref(props.pageOptions.status || 'ALL')
+const pageSize = ref(props.pageOptions.limit || 20)
+const urlPage = ref(1)
+const resultViewport = ref(null)
+const urlItems = computed(() => props.selectedJob?.items || [])
+const urlStatuses = ['CREATED', 'DISPATCHING', 'QUEUED', 'PREPARING', 'RESUMING', 'RUNNING', 'CAPTURING', 'CAPTURED', 'ANALYZING', 'VALIDATING', 'WAITING_FOR_WORKER', 'CANCELING', 'SUCCEEDED', 'PARTIAL', 'FAILED', 'CANCELED', 'INTERRUPTED']
+const totalUrls = computed(() => props.selectedJob?.page?.unit === 'url' ? props.selectedJob.page.total : urlItems.value.length)
+const pageCount = computed(() => Math.max(1, Math.ceil(totalUrls.value / pageSize.value)))
+const pageStart = computed(() => props.selectedJob?.page?.unit === 'url' ? props.selectedJob.page.offset : 0)
+const visibleItems = computed(() => urlItems.value.slice(0, pageSize.value))
+let searchTimer
+
+function requestPage(page = 1) {
+  clearTimeout(searchTimer)
+  emit('page', { offset: (page - 1) * pageSize.value, limit: pageSize.value, query: urlSearch.value.trim(), status: urlStatus.value })
+  if (resultViewport.value) resultViewport.value.scrollTop = 0
+}
+watch(urlSearch, () => {
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => requestPage(), 300)
+})
+watch([urlStatus, pageSize], () => requestPage())
+watch(() => props.selectedJob?.page, () => {
+  urlPage.value = Math.floor(pageStart.value / pageSize.value) + 1
+}, { immediate: true })
+onBeforeUnmount(() => clearTimeout(searchTimer))
+
+function goToPage(event) {
+  const value = Number(event.target.value)
+  if (Number.isFinite(value)) requestPage(Math.min(pageCount.value, Math.max(1, Math.trunc(value))))
+  event.target.value = urlPage.value
+}
 
 const terminal = ['SUCCEEDED', 'PARTIAL', 'FAILED', 'CANCELED', 'INTERRUPTED']
 const filteredJobs = computed(() => statusFilter.value === 'ALL' ? props.jobs : props.jobs.filter((job) => job.status === statusFilter.value))
@@ -110,9 +145,16 @@ function displayTime(value) {
       </div>
 
       <div class="panel result-panel">
-        <div class="panel-heading"><div><h3>URL 执行矩阵</h3><p>每一行对应一个 URL，每个卡片对应机器与浏览器组合<span v-if="selectedJob.page?.total > selectedJob.page?.returned">；当前显示前 {{ selectedJob.page.returned }} / {{ selectedJob.page.total }} 个执行单元</span></p></div></div>
-        <div class="result-items">
-          <article v-for="item in selectedJob.items" :key="item.id" class="result-item">
+        <div class="panel-heading"><div><h3>URL 执行矩阵</h3><p>每一行对应一个 URL，每个卡片对应机器与浏览器组合；按 URL 分页加载，状态筛选匹配任一执行单元</p></div></div>
+        <div class="url-toolbar">
+          <input v-model="urlSearch" type="search" aria-label="搜索 URL、名称或 ID" placeholder="搜索 URL、名称或 ID" />
+          <label>状态<select v-model="urlStatus"><option value="ALL">全部状态</option><option v-for="status in urlStatuses" :key="status" :value="status">{{ status }}</option></select></label>
+          <label>每页<select v-model.number="pageSize"><option :value="20">20 条</option><option :value="50">50 条</option><option :value="100">100 条</option></select></label>
+          <span>{{ pageLoading ? '加载中…' : `共 ${totalUrls} 个匹配 URL` }}</span>
+        </div>
+        <div ref="resultViewport" :aria-busy="pageLoading" class="result-items" tabindex="0" role="region" aria-label="当前页 URL 执行状态">
+          <div v-if="!visibleItems.length" class="empty-state"><p>暂无符合条件的 URL</p></div>
+          <article v-for="item in visibleItems" :key="item.id" class="result-item">
             <div class="result-url"><StatusPill :status="item.status" /><div><strong>{{ item.name }}</strong><a :href="item.url" target="_blank">{{ item.url }}</a></div></div>
             <div class="execution-grid">
               <div v-for="execution in item.executions" :key="execution.execution_id" class="execution-card">
@@ -126,6 +168,16 @@ function displayTime(value) {
             </div>
           </article>
         </div>
+        <nav class="url-pagination" aria-label="URL 分页">
+          <span>第 {{ totalUrls ? pageStart + 1 : 0 }}–{{ Math.min(pageStart + pageSize, totalUrls) }} 条 / 共 {{ totalUrls }} 条</span>
+          <div>
+            <button class="secondary-button" :disabled="pageLoading || urlPage === 1" @click="requestPage(1)">首页</button>
+            <button class="secondary-button" :disabled="pageLoading || urlPage === 1" @click="requestPage(urlPage - 1)">上一页</button>
+            <label>第 <input :value="urlPage" type="number" min="1" :max="pageCount" aria-label="跳转到 URL 页码" @change="goToPage" /> / {{ pageCount }} 页</label>
+            <button class="secondary-button" :disabled="pageLoading || urlPage === pageCount" @click="requestPage(urlPage + 1)">下一页</button>
+            <button class="secondary-button" :disabled="pageLoading || urlPage === pageCount" @click="requestPage(pageCount)">末页</button>
+          </div>
+        </nav>
       </div>
 
     </section>

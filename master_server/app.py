@@ -300,12 +300,18 @@ def create_app(
 
     @app.get("/api/v1/jobs/<job_id>")
     def get_job(job_id: str):
+        unit = request.args.get("unit", "execution")
+        if unit not in {"execution", "url"}:
+            raise ValidationError("unit 必须为 execution 或 url")
         try:
             offset = max(0, int(request.args.get("offset", "0")))
             limit = min(5000, max(1, int(request.args.get("limit", "500"))))
+            if unit == "url":
+                limit = min(100, limit)
         except ValueError:
             raise ValidationError("offset 和 limit 必须是整数")
-        job = master_store.get_job_page(job_id, offset=offset, limit=limit)
+        job = master_store.get_job_page(job_id, offset=offset, limit=limit, unit=unit,
+                                        query=request.args.get("query", ""), status=request.args.get("status", "ALL"))
         if job is None:
             return jsonify({"error": "not_found", "message": "任务不存在"}), 404
         return jsonify(summarize_job(job))
