@@ -353,9 +353,13 @@ paths:
       - $ref: '#/components/parameters/TaskId'
     get:
       tags: [Tasks]
-      summary: 增量读取任务日志
+      summary: 限量读取任务日志
       operationId: getTaskLog
       parameters:
+        - name: tail_lines
+          in: query
+          description: 从文件末尾读取最新若干行，忽略 offset；最多读取 limit 字节内容及 1 字节行边界，超长行可能截断
+          schema: { type: integer, minimum: 1, maximum: 100 }
         - name: offset
           in: query
           description: 从该字节偏移开始读取
@@ -949,6 +953,15 @@ components:
           minimum: 0
         eof:
           type: boolean
+        tail_lines:
+          type: integer
+          description: 仅末尾读取模式返回；请求的最大行数
+        line_count:
+          type: integer
+          description: 本次实际返回的行数
+        truncated:
+          type: boolean
+          description: 是否因字节上限截断了末尾请求范围内的长行
 
     ErrorResponse:
       type: object

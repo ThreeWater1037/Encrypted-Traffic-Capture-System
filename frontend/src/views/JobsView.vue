@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { Ban, ChevronRight, FileText, Play, RefreshCw, RotateCcw, ScrollText } from '@lucide/vue'
 import StatusPill from '../components/StatusPill.vue'
 
@@ -53,27 +53,6 @@ const filteredJobs = computed(() => statusFilter.value === 'ALL' ? props.jobs : 
 const canCancel = computed(() => props.selectedJob && !terminal.includes(props.selectedJob.status))
 const canResume = computed(() => props.selectedJob && ['PARTIAL', 'FAILED', 'CANCELED', 'INTERRUPTED'].includes(props.selectedJob.status))
 const canRestart = computed(() => props.selectedJob && terminal.includes(props.selectedJob.status))
-const logElements = new Map()
-
-function setLogElement(machineId, element) {
-  if (element) logElements.set(machineId, element)
-  else logElements.delete(machineId)
-}
-
-function loadedSize(entry) {
-  const bytes = Number(entry.next_offset || 0)
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`
-}
-
-watch(
-  () => props.logs.map((entry) => `${entry.machine_id}:${entry.next_offset}`).join('|'),
-  async () => {
-    await nextTick()
-    for (const element of logElements.values()) element.scrollTop = element.scrollHeight
-  },
-)
 
 function requestResume() {
   if (window.confirm('继续后将沿用原任务目录，已完成 URL 会跳过，未完成 URL 会重新抓取。是否继续？')) {
@@ -98,7 +77,7 @@ function displayTime(value) {
     <section class="panel jobs-list-panel">
       <div class="list-toolbar">
         <div><h2>任务记录</h2><p>主控创建的实验及其聚合状态；Worker 直提任务不会自动导入</p></div>
-        <button class="icon-button" title="立即刷新任务列表、进度和日志" aria-label="立即刷新任务列表、进度和日志" :disabled="refreshing" @click="emit('refresh')"><RefreshCw :size="15" /></button>
+        <button class="icon-button" title="立即刷新任务列表和进度" aria-label="立即刷新任务列表和进度" :disabled="refreshing" @click="emit('refresh')"><RefreshCw :size="15" /></button>
       </div>
       <div class="filter-row">
         <button v-for="value in ['ALL', 'RUNNING', 'SUCCEEDED', 'PARTIAL', 'FAILED']" :key="value" :class="{ active: statusFilter === value }" @click="statusFilter = value">{{ value }}</button>
@@ -138,10 +117,10 @@ function displayTime(value) {
       </div>
 
       <div v-if="logs.length" class="panel logs-panel">
-        <div class="panel-heading"><div><h3>Worker 日志</h3><p>每 5 分钟自动更新；点击“立即刷新”或“刷新日志”可随时读取最新日志</p></div></div>
+        <div class="panel-heading"><div><h3>Worker 日志 · 最新 10 行</h3><p>仅在点击“读取日志”或“刷新日志”时更新，每次替换为最新内容</p></div><button class="secondary-button" :disabled="logsLoading" @click="emit('logs', selectedJob.job_id)"><RefreshCw :size="15" />{{ logsLoading ? '读取中…' : '刷新日志' }}</button></div>
         <article v-for="entry in logs" :key="entry.machine_id">
-          <div class="log-meta"><strong>{{ entry.machine_name }}</strong><span>已读取 {{ loadedSize(entry) }} · {{ entry.eof ? '已追上最新日志' : '继续加载中' }}</span></div>
-          <pre :ref="(element) => setLogElement(entry.machine_id, element)">{{ entry.error || entry.text || '暂无日志' }}</pre>
+          <div class="log-meta"><strong>{{ entry.machine_name }}</strong><span v-if="!entry.error">本次显示 {{ entry.line_count || 0 }} 行{{ entry.truncated ? ' · 超长日志已截断' : '' }}</span></div>
+          <pre>{{ entry.error || entry.text || '暂无日志' }}</pre>
         </article>
       </div>
 

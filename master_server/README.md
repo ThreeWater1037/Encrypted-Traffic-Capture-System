@@ -69,7 +69,10 @@ paths.data_dir/uploads/{job_id}/
 整份 URL 矩阵。
 
 Master 默认每轮间隔 30 秒查询 Worker，前端每 5 分钟自动刷新。前端“立即刷新”
-会立即读取 Master 当前保存的进度和已打开的日志。已有部署如配置了
+会立即读取 Master 当前保存的进度。日志单独手动刷新，每台 Worker 只返回最新
+10 行；Worker 从文件末尾限量读取，单次最多读取 64 KiB 内容（另读 1 字节判断行边界），
+避免随任务运行时间增长而加载整份日志。此功能需要一起更新前端、Master 和 Worker。
+已有部署如配置了
 `limits.poll_interval: 2`，需改为 `30` 并重启 Master；若设置了环境变量
 `MASTER_POLL_INTERVAL`，应同步改为 `30`（环境变量优先于 YAML）。部署脚本保留
 已有配置，仅为新配置提供 30 秒默认值。

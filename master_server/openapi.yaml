@@ -308,6 +308,10 @@ paths:
       summary: 汇总各目标 Worker 日志
       security: [{ bearerAuth: [] }]
       parameters:
+        - name: tail_lines
+          in: query
+          description: 从各 Worker 文件末尾读取最新若干行，忽略 offsets；内容受 limit 字节上限约束，前端固定为 10
+          schema: { type: integer, minimum: 1, maximum: 100 }
         - name: offsets
           in: query
           description: JSON 对象，键为机器 ID，值为下一次读取的字节偏移

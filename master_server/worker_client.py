@@ -115,6 +115,15 @@ class WorkerClient:
             {"resume_token": resume_token},
         )
 
-    def get_log(self, task_id: str, *, offset: int = 0, limit: int = 65_536) -> dict[str, Any]:
-        query = urlencode({"offset": offset, "limit": limit})
-        return self._request("GET", f"/api/v1/tasks/{task_id}/log?{query}")
+    def get_log(
+        self, task_id: str, *, offset: int = 0, limit: int = 65_536,
+        tail_lines: int | None = None,
+    ) -> dict[str, Any]:
+        parameters = {"offset": offset, "limit": limit}
+        if tail_lines is not None:
+            parameters["tail_lines"] = tail_lines
+        query = urlencode(parameters)
+        result = self._request("GET", f"/api/v1/tasks/{task_id}/log?{query}")
+        if tail_lines is not None and result.get("tail_lines") != tail_lines:
+            raise WorkerRequestError("Worker 尚不支持读取最新日志，请更新 Worker 后重试")
+        return result

@@ -405,8 +405,11 @@ def create_app(
         try:
             offsets = json.loads(request.args.get("offsets", "{}"))
             limit = min(65_536, max(1, int(request.args.get("limit", "65536"))))
+            tail_lines = int(request.args["tail_lines"]) if "tail_lines" in request.args else None
+            if tail_lines is not None and not 1 <= tail_lines <= 100:
+                raise ValueError("tail_lines must be between 1 and 100")
         except (json.JSONDecodeError, ValueError) as exc:
-            raise ValidationError("offsets 或 limit 格式错误") from exc
+            raise ValidationError("offsets、limit 或 tail_lines 格式错误（tail_lines 必须为 1–100）") from exc
         if not isinstance(offsets, dict) or any(
             not isinstance(machine_id, str)
             or not isinstance(offset, int)
@@ -425,10 +428,12 @@ def create_app(
                 machine["base_url"], machine["token"], timeout=master_config.worker_request_timeout
             )
             try:
+                log_options = {"tail_lines": tail_lines} if tail_lines is not None else {}
                 entry = client.get_log(
                     worker_task_id,
                     offset=offsets.get(machine["machine_id"], 0),
                     limit=limit,
+                    **log_options,
                 )
                 logs.append({"machine_id": machine["machine_id"], "machine_name": machine["name"], **entry})
             except WorkerRequestError as exc:

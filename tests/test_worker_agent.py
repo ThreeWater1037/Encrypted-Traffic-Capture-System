@@ -265,6 +265,34 @@ class WorkerAgentApiTests(unittest.TestCase):
         self.assertGreater(data["next_offset"], 0)
         self.assertTrue(data["text"])
 
+    def test_log_tail_returns_latest_ten_lines_and_refreshes_after_append(self) -> None:
+        self.manager.submit(self.payload())
+        path = self.config.tasks_dir / "exec-test-001" / "worker.log"
+        url = "/api/v1/tasks/exec-test-001/log?tail_lines=10"
+        missing = self.client.get(url, headers=self.auth).get_json()
+        self.assertEqual(missing["line_count"], 0)
+        self.assertEqual(missing["tail_lines"], 10)
+        path.write_text("".join(f"日志 {i}\n" for i in range(100)), encoding="utf-8")
+        first = self.client.get(url, headers=self.auth).get_json()
+        self.assertEqual(first["text"].splitlines(), [f"日志 {i}" for i in range(90, 100)])
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write("日志 100\n")
+        second = self.client.get(url, headers=self.auth).get_json()
+        self.assertEqual(second["text"].splitlines(), [f"日志 {i}" for i in range(91, 101)])
+        self.assertEqual(second["line_count"], 10)
+        self.assertEqual(second["tail_lines"], 10)
+        self.assertFalse(second["truncated"])
+
+    def test_log_tail_rejects_invalid_line_counts(self) -> None:
+        self.manager.submit(self.payload())
+        for value in ("0", "-1", "101", "abc", "1.5", ""):
+            with self.subTest(value=value):
+                response = self.client.get(
+                    "/api/v1/tasks/exec-test-001/log", query_string={"tail_lines": value},
+                    headers=self.auth,
+                )
+                self.assertEqual(response.status_code, 400)
+
     def test_progress_endpoint_returns_new_atomic_checkpoints(self) -> None:
         payload = self.payload("live-progress-001")
         self.manager.submit(payload)

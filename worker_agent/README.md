@@ -108,7 +108,7 @@ OpenAPI/Swagger → 文件导入”，然后选择该文件。导入后在项目
 | `POST` | `/api/v1/tasks/from-file` | 通过 multipart 直接上传 `.txt/.tsv` 创建任务 |
 | `GET` | `/api/v1/tasks/{task_id}` | 查询任务状态 |
 | `GET` | `/api/v1/tasks/{task_id}/progress` | 分页读取已提交的逐 URL 原子采集检查点 |
-| `GET` | `/api/v1/tasks/{task_id}/log` | 按字节偏移增量读取日志 |
+| `GET` | `/api/v1/tasks/{task_id}/log` | 按字节偏移读取，或用 `tail_lines=10` 获取最新 10 行 |
 | `GET` | `/api/v1/tasks/{task_id}/result` | 查询本地结果清单 |
 | `POST` | `/api/v1/tasks/{task_id}/cancel` | 取消任务和整个子进程树 |
 

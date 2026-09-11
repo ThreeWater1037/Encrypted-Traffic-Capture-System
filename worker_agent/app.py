@@ -20,6 +20,7 @@ from flask import Flask, jsonify, request
 from browser_discovery import discover_browser
 
 from .config import WorkerConfig
+from .logs import read_log_tail
 from .schema import (
     TASK_ID_RE,
     ValidationError,
@@ -555,7 +556,7 @@ def create_app(
 
     @app.get("/api/v1/tasks/<task_id>/log")
     def get_task_log(task_id: str):
-        """按字节偏移增量读取日志，避免一次返回超大文本。"""
+        """按字节偏移或从文件末尾限量读取日志。"""
         if not TASK_ID_RE.fullmatch(task_id):
             return jsonify({"error": "invalid_task_id"}), 400
         task = task_store.get_task_status(task_id)
@@ -565,12 +566,21 @@ def create_app(
         try:
             offset = max(0, int(request.args.get("offset", "0")))
             limit = min(65_536, max(1, int(request.args.get("limit", "65536"))))
+            tail_lines = int(request.args["tail_lines"]) if "tail_lines" in request.args else None
+            if tail_lines is not None and not 1 <= tail_lines <= 100:
+                raise ValueError("tail_lines must be between 1 and 100")
         except ValueError:
             return jsonify({"error": "invalid_pagination"}), 400
 
         log_path = worker_config.tasks_dir / task_id / "worker.log"
         if not log_path.is_file():
-            return jsonify({"task_id": task_id, "text": "", "next_offset": 0, "eof": True})
+            empty = {"task_id": task_id, "text": "", "next_offset": 0, "eof": True}
+            if tail_lines is not None:
+                empty.update(tail_lines=tail_lines, line_count=0, truncated=False)
+            return jsonify(empty)
+
+        if tail_lines is not None:
+            return jsonify({"task_id": task_id, **read_log_tail(log_path, lines=tail_lines, max_bytes=limit)})
 
         file_size = log_path.stat().st_size
         offset = min(offset, file_size)

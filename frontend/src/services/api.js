@@ -23,8 +23,8 @@ export const getJob = (jobId, options = {}) => request(`/jobs/${encodeURICompone
 export const cancelJob = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' })
 export const resumeJob = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/resume`, { method: 'POST' })
 export const restartJob = (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/restart`, { method: 'POST', body: JSON.stringify({}) })
-export const getJobLogs = (jobId, offsets = {}) => {
-  const query = new URLSearchParams({ offsets: JSON.stringify(offsets), limit: '65536' })
+export const getJobLogs = (jobId) => {
+  const query = new URLSearchParams({ tail_lines: '10', limit: '65536' })
   return request(`/jobs/${encodeURIComponent(jobId)}/logs?${query}`)
 }
 export const createJsonJob = (payload) => request('/jobs', { method: 'POST', body: JSON.stringify(payload) })

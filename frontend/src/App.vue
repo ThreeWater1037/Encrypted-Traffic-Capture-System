@@ -125,10 +125,6 @@ async function refreshDashboard(manual = false) {
       loadJobs(),
     ]
     if (selectedJob.value) requests.push(refreshSelectedJob())
-    const jobId = selectedJob.value?.job_id
-    if (jobId && selectedLogJobId.value === jobId) {
-      requests.push(loadSelectedLogs(jobId, { drain: true, throwOnError: true }))
-    }
     const results = await Promise.allSettled(requests)
     const failed = results.find((result) => result.status === 'rejected')
     if (failed) throw failed.reason
@@ -215,38 +211,18 @@ async function handleRestart(jobId) {
   }
 }
 
-async function loadSelectedLogs(jobId, { reset = false, drain = false, throwOnError = false } = {}) {
+async function loadSelectedLogs(jobId) {
   if (logsLoading.value) return
   logsLoading.value = true
   try {
-    const merged = new Map(
-      (reset ? [] : selectedLogs.value).map((entry) => [entry.machine_id, { ...entry }]),
-    )
-    let page = 0
-    let hasMore = false
-    do {
-      const offsets = Object.fromEntries(
-        [...merged.values()].map((entry) => [entry.machine_id, entry.next_offset || 0]),
-      )
-      const response = await getJobLogs(jobId, offsets)
-      hasMore = false
-      for (const entry of response.logs) {
-        const previous = merged.get(entry.machine_id)
-        const requestedOffset = offsets[entry.machine_id] || 0
-        const streamReset = previous && Number(entry.next_offset || 0) < requestedOffset
-        merged.set(entry.machine_id, {
-          ...previous,
-          ...entry,
-          error: entry.error || '',
-          text: streamReset ? (entry.text || '') : `${previous?.text || ''}${entry.text || ''}`,
-        })
-        if (!entry.error && entry.eof === false) hasMore = true
-      }
-      page += 1
-    } while (drain && hasMore && page < 256)
-    if (selectedLogJobId.value === jobId) selectedLogs.value = [...merged.values()]
+    const response = await getJobLogs(jobId)
+    if (selectedLogJobId.value === jobId) {
+      selectedLogs.value = response.logs.map((entry) => {
+        if (entry.error || entry.tail_lines === 10) return entry
+        return { ...entry, text: '', error: '日志接口尚未更新，请更新 Master 和 Worker 后重试' }
+      })
+    }
   } catch (reason) {
-    if (throwOnError) throw reason
     showError(reason)
   } finally {
     logsLoading.value = false
@@ -254,9 +230,8 @@ async function loadSelectedLogs(jobId, { reset = false, drain = false, throwOnEr
 }
 
 async function handleLogs(jobId) {
-  const reset = selectedLogJobId.value !== jobId
   selectedLogJobId.value = jobId
-  await loadSelectedLogs(jobId, { reset, drain: true })
+  await loadSelectedLogs(jobId)
 }
 
 async function handleProbe(machineId) {

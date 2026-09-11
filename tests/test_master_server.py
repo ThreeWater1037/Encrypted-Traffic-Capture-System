@@ -391,6 +391,28 @@ class MasterServerTests(unittest.TestCase):
         self.assertEqual(data["logs"][0]["text"], "chunk@65536")
         self.assertEqual(self.fake_worker.log_requests[-1][1:], (65536, 4096))
 
+    def test_job_logs_forward_tail_line_count(self):
+        job_id = "tail-logs-001"
+        self.store.create_job(self.payload(job_id))
+        with (
+            patch("master_server.app.WorkerClient", return_value=self.fake_worker),
+            patch.object(self.fake_worker, "get_log", return_value={
+                "text": "latest\n", "tail_lines": 10, "line_count": 1,
+            }) as get_log,
+        ):
+            response = self.client.get(f"/api/v1/jobs/{job_id}/logs?tail_lines=10")
+        self.assertEqual(response.status_code, 200)
+        get_log.assert_called_once_with(
+            MasterStore.worker_task_id(job_id, "worker-local"),
+            offset=0, limit=65536, tail_lines=10,
+        )
+        self.assertEqual(response.get_json()["logs"][0]["tail_lines"], 10)
+        for value in ("0", "-1", "101", "abc", "1.5", ""):
+            with self.subTest(value=value):
+                self.assertEqual(self.client.get(
+                    f"/api/v1/jobs/{job_id}/logs", query_string={"tail_lines": value},
+                ).status_code, 400)
+
     def test_resume_job_reuses_worker_task_with_idempotency_token(self):
         job_id = "resume-master-001"
         self.store.create_job(self.payload(job_id))
