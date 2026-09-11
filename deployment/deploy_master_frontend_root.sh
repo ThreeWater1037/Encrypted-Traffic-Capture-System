@@ -194,7 +194,7 @@ data = data.resolve(); data.mkdir(parents=True, exist_ok=True)
 paths['data_dir'] = str(data)
 limits = section('limits')
 for key, value in dict(max_content_length=268435456, max_items=100000, max_queue_size=100,
-                       worker_request_timeout=15, poll_interval=2).items():
+                       worker_request_timeout=15, poll_interval=30).items():
     limits.setdefault(key, value)
 # New installation starts with no Workers; preserve an existing explicit bootstrap setting.
 section('bootstrap_worker').setdefault('enabled', False)

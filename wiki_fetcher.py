@@ -862,7 +862,8 @@ class WikiFetcher:
         path = self.output_dir / "capture_progress.json"
         temporary = path.with_suffix(path.suffix + ".tmp")
         payload = {
-            "version": 1,
+            "version": 2,
+            "run_id": self.progress_run_id,
             "status": "finished" if finished else "running",
             "updated_at": datetime.now().isoformat(),
             "last_processed_position": position,
@@ -1166,15 +1167,16 @@ class WikiFetcher:
             skipped_units += skipped
             incomplete_units += incomplete
             last_entry = entry
-            if captured or incomplete or pos % 1000 == 0 or pos == total:
-                self._write_progress(
-                    position=pos,
-                    total=total,
-                    entry=entry,
-                    completed_units=completed_units,
-                    skipped_units=skipped_units,
-                    incomplete_units=incomplete_units,
-                )
+            # Checkpoint skips are completed work too; publish their progress
+            # without waiting for the next thousand-URL boundary.
+            self._write_progress(
+                position=pos,
+                total=total,
+                entry=entry,
+                completed_units=completed_units,
+                skipped_units=skipped_units,
+                incomplete_units=incomplete_units,
+            )
 
             if pos < total and (captured or incomplete):
                 log.info("  Waiting %.1f s ...", INTERVAL_BETWEEN_URLS)

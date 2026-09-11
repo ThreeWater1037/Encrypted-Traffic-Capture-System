@@ -13,7 +13,7 @@ limits:
   max_items: 100000
   max_queue_size: 100
   worker_request_timeout: 15
-  poll_interval: 2
+  poll_interval: 30
 
 cors:
   allowed_origins:

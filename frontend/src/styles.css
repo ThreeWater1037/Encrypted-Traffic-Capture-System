@@ -3,6 +3,7 @@
 body { margin: 0; min-width: 1160px; min-height: 100vh; background: #f2f5f9; }
 button, input, textarea { font: inherit; }
 button { border: 0; cursor: pointer; }
+button:disabled { opacity: .55; cursor: not-allowed; }
 a { color: inherit; }
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: 230px 1fr; }
 .sidebar { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; padding: 25px 16px 18px; color: #dce7f6; background: linear-gradient(180deg, #111d33, #0b1527); }

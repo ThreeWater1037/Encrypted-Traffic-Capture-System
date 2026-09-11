@@ -9,6 +9,7 @@ const props = defineProps({
   logs: { type: Array, default: () => [] },
   logsLoading: { type: Boolean, default: false },
   pageLoading: { type: Boolean, default: false },
+  refreshing: { type: Boolean, default: false },
   pageOptions: { type: Object, default: () => ({}) },
 })
 const emit = defineEmits(['select', 'cancel', 'resume', 'restart', 'logs', 'refresh', 'page'])
@@ -97,7 +98,7 @@ function displayTime(value) {
     <section class="panel jobs-list-panel">
       <div class="list-toolbar">
         <div><h2>任务记录</h2><p>主控创建的实验及其聚合状态；Worker 直提任务不会自动导入</p></div>
-        <button class="icon-button" @click="emit('refresh')"><RefreshCw :size="15" /></button>
+        <button class="icon-button" title="立即刷新任务列表、进度和日志" aria-label="立即刷新任务列表、进度和日志" :disabled="refreshing" @click="emit('refresh')"><RefreshCw :size="15" /></button>
       </div>
       <div class="filter-row">
         <button v-for="value in ['ALL', 'RUNNING', 'SUCCEEDED', 'PARTIAL', 'FAILED']" :key="value" :class="{ active: statusFilter === value }" @click="statusFilter = value">{{ value }}</button>
@@ -137,7 +138,7 @@ function displayTime(value) {
       </div>
 
       <div v-if="logs.length" class="panel logs-panel">
-        <div class="panel-heading"><div><h3>Worker 日志</h3><p>位于 URL 矩阵之前；打开后每 2 秒增量同步，不再截断为首个 64 KiB</p></div></div>
+        <div class="panel-heading"><div><h3>Worker 日志</h3><p>每 5 分钟自动更新；点击“立即刷新”或“刷新日志”可随时读取最新日志</p></div></div>
         <article v-for="entry in logs" :key="entry.machine_id">
           <div class="log-meta"><strong>{{ entry.machine_name }}</strong><span>已读取 {{ loadedSize(entry) }} · {{ entry.eof ? '已追上最新日志' : '继续加载中' }}</span></div>
           <pre :ref="(element) => setLogElement(entry.machine_id, element)">{{ entry.error || entry.text || '暂无日志' }}</pre>

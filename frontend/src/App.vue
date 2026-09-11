@@ -59,6 +59,7 @@ const selectedLogs = ref([])
 const selectedLogJobId = ref('')
 const logsLoading = ref(false)
 const loading = ref(false)
+const refreshing = ref(false)
 const message = ref('')
 const error = ref('')
 
@@ -111,6 +112,31 @@ async function loadInitialData() {
     showError(reason)
   } finally {
     loading.value = false
+  }
+}
+
+async function refreshDashboard(manual = false) {
+  if (refreshing.value) return
+  refreshing.value = true
+  try {
+    const requests = [
+      getHealth().then((data) => { health.value = data }),
+      loadMachines(),
+      loadJobs(),
+    ]
+    if (selectedJob.value) requests.push(refreshSelectedJob())
+    const jobId = selectedJob.value?.job_id
+    if (jobId && selectedLogJobId.value === jobId) {
+      requests.push(loadSelectedLogs(jobId, { drain: true, throwOnError: true }))
+    }
+    const results = await Promise.allSettled(requests)
+    const failed = results.find((result) => result.status === 'rejected')
+    if (failed) throw failed.reason
+    if (manual) notify('已刷新任务进度')
+  } catch (reason) {
+    if (manual) showError(reason)
+  } finally {
+    refreshing.value = false
   }
 }
 
@@ -189,7 +215,7 @@ async function handleRestart(jobId) {
   }
 }
 
-async function loadSelectedLogs(jobId, { reset = false, drain = false } = {}) {
+async function loadSelectedLogs(jobId, { reset = false, drain = false, throwOnError = false } = {}) {
   if (logsLoading.value) return
   logsLoading.value = true
   try {
@@ -220,6 +246,7 @@ async function loadSelectedLogs(jobId, { reset = false, drain = false } = {}) {
     } while (drain && hasMore && page < 256)
     if (selectedLogJobId.value === jobId) selectedLogs.value = [...merged.values()]
   } catch (reason) {
+    if (throwOnError) throw reason
     showError(reason)
   } finally {
     logsLoading.value = false
@@ -268,16 +295,8 @@ onMounted(() => {
   loadInitialData()
   pollTimer = window.setInterval(async () => {
     if (!runningCount.value && !selectedJob.value) return
-    try {
-      await loadJobs()
-      if (selectedJob.value && !jobPageLoading.value) await refreshSelectedJob()
-      if (selectedJob.value && selectedLogJobId.value === selectedJob.value.job_id) {
-        await loadSelectedLogs(selectedJob.value.job_id)
-      }
-    } catch {
-      // 短暂网络波动交给下一轮轮询恢复，避免连续弹出提示。
-    }
-  }, 2000)
+    await refreshDashboard()
+  }, 5 * 60 * 1000)
 })
 onBeforeUnmount(() => window.clearInterval(pollTimer))
 </script>
@@ -321,7 +340,8 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
         <div class="topbar-meta">
           <span><Activity :size="15" /> {{ runningCount }} 个任务运行中</span>
           <span><Server :size="15" /> {{ machines.filter((m) => ['ONLINE', 'BUSY'].includes(m.status)).length }}/{{ machines.length }} 台在线</span>
-          <button class="icon-button" title="刷新" @click="loadInitialData"><RefreshCw :size="16" /></button>
+          <span>每 5 分钟自动刷新</span>
+          <button class="secondary-button" :disabled="loading || refreshing" :aria-busy="refreshing" @click="refreshDashboard(true)"><RefreshCw :size="16" />{{ refreshing ? '刷新中…' : '立即刷新' }}</button>
         </div>
       </header>
 
@@ -341,6 +361,7 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
           :logs="selectedLogs"
           :logs-loading="logsLoading"
           :page-loading="jobPageLoading"
+          :refreshing="loading || refreshing"
           :page-options="jobPageOptions"
           @page="handleJobPage"
           @select="handleSelectJob"
@@ -348,7 +369,7 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
           @resume="handleResume"
           @restart="handleRestart"
           @logs="handleLogs"
-          @refresh="loadJobs"
+          @refresh="refreshDashboard(true)"
         />
         <MachinesView
           v-if="activeView === 'machines'"

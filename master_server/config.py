@@ -178,7 +178,7 @@ class MasterConfig:
     max_items: int = 100_000
     max_queue_size: int = 100
     worker_request_timeout: float = 15.0
-    poll_interval: float = 2.0
+    poll_interval: float = 30.0
     allowed_origins: tuple[str, ...] = (
         "http://localhost:5173",
         "http://127.0.0.1:5173",
@@ -277,7 +277,7 @@ class MasterConfig:
                     "limits",
                     "poll_interval",
                     "MASTER_POLL_INTERVAL",
-                    2.0,
+                    30.0,
                 ),
                 "limits.poll_interval",
             ),

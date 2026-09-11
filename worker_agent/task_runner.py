@@ -517,7 +517,8 @@ class TaskManager:
         limit: int = 1000,
     ) -> dict[str, Any] | None:
         """从原子检查点生成逐 URL 采集进度，不等待整批 manifest。"""
-        if self.store.get_task_status(task_id) is None:
+        task_status = self.store.get_task_status(task_id)
+        if task_status is None:
             return None
         task_dir = self.config.tasks_dir / task_id
         output_dir = task_dir / "fetch_output"
@@ -546,7 +547,11 @@ class TaskManager:
         observed_position = min(max(0, observed_position), total_urls)
         current_run_id = progress.get("run_id")
         if not isinstance(current_run_id, str) or not current_run_id:
-            current_run_id = f"legacy-{progress.get('updated_at', 'unknown')}"
+            # Legacy writers have no run_id. Their update timestamp changes on
+            # every URL and must not reset pagination. The task start stays
+            # stable while capturing and changes on a resumed/restarted task.
+            started_at = task_status.get("started_at") or task_status.get("created_at")
+            current_run_id = f"legacy-{task_id}-{started_at or 'unknown'}"
         start = after_position if run_id == current_run_id else 0
         start = min(max(0, start), observed_position)
         end = min(observed_position, start + limit)
