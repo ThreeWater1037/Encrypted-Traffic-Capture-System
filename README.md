@@ -528,8 +528,51 @@ WORKER_DATA_DIR/tasks/<task_id>/
 报告，以及 `batch_process.py` 生成的 TSV、`capture_*_flows/`、
 `capture_*_inferred/` 等后处理产物，只有在创建任务时显式启用才会生成。
 
-Chrome/Edge 访问 `today.hit.edu.cn` 时采用专用资源等待策略，其他网站仍使用原有
-加载逻辑：保留 `today2.hit.edu.cn`、`myweb.hit.edu.cn` 的 HTTP/HTTPS 资源隔离；
+普通 Chrome/Edge 页面在导航前启用 Network/performance 事件，等待页面及子 frame 的
+HTTP(S) 请求全部完成或失败，再满足连续 **500 毫秒**静默。图片、XHR、fetch 和正在
+下载的响应都会计入 pending；WebSocket/EventSource 长连接不阻塞结束。资源等待有
+90 秒上限，超时或没有有效页面网络记录会按失败处理。请求失败详情、实际静默时间
+和分阶段耗时写入完成检查点的 `network_summary` / `phase_timings`；零 pending
+表示没有仍在下载的请求，不代表每项 HTTP 响应都是成功状态。
+每次尝试还会覆盖写入 `network_status_<browser>.json`，失败或超时也保留本次的
+未完成 URL 和错误明细，便于在没有完成检查点时排查。
+
+启动抓包时不再固定等待 1.2 秒。TShark 的本次输出文件初始化通知、完整的 PCAPNG
+文件头及所选接口描述都就绪后立即启动浏览器，等待上限为 5 秒。stderr 持续转发到
+Worker 日志；接口错误、提前退出或就绪超时会失败，不会生成成功检查点。tcpdump
+使用独立的监听通知及 PCAP 文件头校验。
+
+普通 Chromium 页面读取元数据后复查同一个网络请求账本：没有新活动就立即停止
+抓包，有新请求则继续等原来的 500 毫秒静默窗口，90 秒上限不重新计时。已去掉页面
+后和抓包停止前各 0.5 秒的重复等待。停止时等待进程正常刷新并退出，再流式检查
+PCAP/PCAPNG 结构、非空数据包与截断情况；强制终止、非零退出码或损坏文件均失败。
+文件结构校验不能替代解密后的 HTTP 响应完整性审计。
+
+Chrome/Edge 驱动服务使用进程退出等待，避免每秒访问已关闭的 HTTP 状态端口。
+浏览器退出、驱动服务停止、TLS 密钥复制及临时配置清理分别计时；失败保留诊断，
+不会默默继续提交成功。完成检查点和网络状态文件还包含 `capture_summary` /
+`cleanup_summary`。浏览器仍按 URL 独立启动。
+
+每个 URL 仍启动独立浏览器和全新配置目录；Chrome/Edge 启动及导航前通过 CDP 禁用
+HTTP 缓存并显式绕过 Service Worker。独立浏览器 CDP 连接在新的跨进程 iframe、
+Worker 等目标运行前递归应用相同策略，保留浏览器站点隔离；其网络完成事件也用于
+静默判断。策略初始化失败、观测到本地缓存命中或 304 时，本次抓取失败，细节写入
+`network_summary.cache_policy` / `cache_hit_requests`。旧页面的缓存、Cookie
+和 Service Worker 注册不会继承到下一 URL。不再全局注入 Cache-Control/Pragma，
+避免给跨域资源引入不被允许的预检请求。前一 URL 的抓包关闭、浏览器退出及临时
+配置清理全部完成后，默认等待 **1 秒**再访问下一项。命令行可覆盖：
+
+```powershell
+python wiki_fetcher.py --input urls.txt --browsers edge --pcap --network-idle-seconds 0.5 --interval-seconds 1
+```
+
+将 `--interval-seconds` 设为 `3` 可恢复原批次间隔；`--network-idle-seconds 2` 保留
+两秒真实网络静默窗口。Firefox/Safari 使用页面 complete 后的固定静默延时，
+没有 Chromium 的网络事件观测。500 毫秒静默不会截断已知未完成请求，但更晚才由
+定时器发起的请求不保证被观察到。
+
+Chrome/Edge 访问 `today.hit.edu.cn` 时仍采用专用资源等待策略：
+保留 `today2.hit.edu.cn`、`myweb.hit.edu.cn` 的 HTTP/HTTPS 资源隔离；
 正文 DOM 就绪后，只有剩余资源都连续 5 秒没有响应或数据传输进展，才停止剩余加载。
 正在持续下载的图片允许超过 5 秒；资源等待另有 90 秒兜底，触发时按失败处理。
 

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
@@ -37,7 +37,12 @@ class PacketCaptureTests(unittest.TestCase):
             with self.subTest(url=url):
                 driver = MagicMock(spec=webdriver.Chrome)
                 _prepare_navigation(driver, url)
-                driver.execute_cdp_cmd.assert_not_called()
+                self.assertEqual(driver.execute_cdp_cmd.call_args_list, [
+                    call("Network.enable", {}),
+                    call("Network.setCacheDisabled", {"cacheDisabled": True}),
+                    call("Network.setBypassServiceWorker", {"bypass": True}),
+                ])
+                driver.get_log.assert_called_once_with("performance")
 
     def test_navigation_timeout_stops_capture_before_quit_and_is_not_success(self) -> None:
         events = []
@@ -62,7 +67,7 @@ class PacketCaptureTests(unittest.TestCase):
             self.assertFalse(fetcher._mark_complete(entry, item_dir, "chrome", record))
         self.assertEqual(events, ["stop", "quit"])
 
-    def test_wiki_uses_original_wait_without_hit_policy_or_skip_report(self) -> None:
+    def test_wiki_uses_normal_wait_without_hit_policy_or_skip_report(self) -> None:
         driver = MagicMock(spec=webdriver.Chrome)
         driver.command_executor = MagicMock()
         driver.current_url = "https://en.wikipedia.org/wiki/Test"
@@ -73,7 +78,7 @@ class PacketCaptureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              patch.dict("wiki_fetcher.AVAILABLE_DRIVERS", {"chrome": builder}), \
              patch("wiki_fetcher.wait_for_resources") as resource_wait, \
-             patch.object(WikiFetcher, "_wait_for_normal_page") as normal_wait, \
+             patch.object(WikiFetcher, "_wait_for_normal_page", return_value={}) as normal_wait, \
              patch("wiki_fetcher.time.sleep"):
             fetcher = WikiFetcher(Path(tmp), ["chrome"], False)
             item_dir = fetcher._url_dir("wiki")
@@ -83,6 +88,68 @@ class PacketCaptureTests(unittest.TestCase):
             normal_wait.assert_called_once_with(driver)
             resource_wait.assert_not_called()
             self.assertFalse((item_dir / "resource_status_chrome.json").exists())
+            self.assertFalse(any(call.args[0] == "Network.setExtraHTTPHeaders"
+                                 for call in driver.execute_cdp_cmd.call_args_list))
+
+    def test_network_wait_uses_configurable_quiet_window(self) -> None:
+        driver = MagicMock(spec=webdriver.Edge)
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("wiki_fetcher.NetworkIdleTracker") as tracker_type:
+            tracker_type.return_value.wait.return_value = {"pending_count": 0}
+            fetcher = WikiFetcher(Path(tmp), ["edge"], False, network_idle_seconds=0.5)
+            self.assertEqual(fetcher._wait_for_normal_page(driver), {"pending_count": 0})
+            tracker_type.assert_called_once_with(driver, idle_seconds=0.5)
+            tracker_type.return_value.wait.assert_called_once_with()
+
+    def test_failed_network_wait_persists_pending_urls_without_checkpoint(self) -> None:
+        driver = MagicMock(spec=webdriver.Edge)
+        driver.command_executor = MagicMock()
+        builder = MagicMock()
+        builder.build.return_value = driver
+        failure = TimeoutException("network still pending")
+        failure.network_idle_summary = {
+            "pending_count": 1, "failed_requests": [],
+            "pending_requests": [{"url": "https://example.com/slow.js"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict("wiki_fetcher.AVAILABLE_DRIVERS", {"edge": builder}), \
+             patch("wiki_fetcher.NetworkIdleTracker") as tracker_type:
+            tracker_type.return_value.wait.side_effect = failure
+            fetcher = WikiFetcher(Path(tmp), ["edge"], False)
+            item_dir = fetcher._url_dir("failed")
+            result = fetcher._fetch_with("https://example.com/", "edge", item_dir)
+            self.assertIn("network still pending", result.error)
+            status = json.loads((item_dir / "network_status_edge.json").read_text("utf-8"))
+            self.assertEqual(status["network_summary"]["pending_requests"][0]["url"],
+                             "https://example.com/slow.js")
+            self.assertFalse(fetcher._mark_complete(
+                UrlEntry("1", "failed", "https://example.com/"), item_dir, "edge", result))
+
+    def test_nonfinite_or_invalid_wait_configuration_is_rejected(self) -> None:
+        for options in ({"network_idle_seconds": 0}, {"network_idle_seconds": float("nan")},
+                        {"interval_seconds": -1}, {"interval_seconds": float("inf")}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                WikiFetcher(Path("unused"), ["edge"], False, **options)
+
+    def test_cached_resource_cannot_be_marked_as_completed_capture(self):
+        driver = MagicMock(spec=webdriver.Edge)
+        driver.command_executor = MagicMock()
+        driver.current_url = "https://example.com/"
+        driver.title = "Example"
+        driver.page_source = "<html>Example</html>"
+        builder = MagicMock()
+        builder.build.return_value = driver
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict("wiki_fetcher.AVAILABLE_DRIVERS", {"edge":builder}), \
+             patch.object(WikiFetcher, "_wait_for_normal_page", return_value={
+                 "cache_hit_requests":[{"url":"https://example.com/a.js", "served_from_cache":True}]}):
+            fetcher = WikiFetcher(Path(tmp), ["edge"], False)
+            directory = fetcher._url_dir("cached")
+            record = fetcher._fetch_with(driver.current_url, "edge", directory)
+            self.assertIn("cache use detected", record.error)
+            self.assertFalse(fetcher._mark_complete(UrlEntry("1", "cached", driver.current_url),
+                                                   directory, "edge", record))
+            driver.quit.assert_called_once()
 
     def test_partial_capture_checkpoint_keeps_recapture_flag(self) -> None:
         from wiki_fetcher import SessionRecord
@@ -142,6 +209,10 @@ class PacketCaptureTests(unittest.TestCase):
             [
                 "/usr/bin/tshark",
                 "-q",
+                "--log-level",
+                "warning",
+                "--log-debug",
+                "Main",
                 "-i",
                 "any",
                 "-w",
@@ -208,7 +279,7 @@ class PacketCaptureTests(unittest.TestCase):
 
         self.assertEqual(interfaces, ["en0", "lo0"])
 
-    def test_tshark_errors_are_inherited_and_early_exit_is_logged(self) -> None:
+    def test_tshark_stderr_is_drained_and_early_exit_fails_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             capture = PacketCapture(Path(temp_dir) / "capture.pcap")
             process = _ExitedProcess()
@@ -224,20 +295,110 @@ class PacketCaptureTests(unittest.TestCase):
                     return_value=["/usr/bin/tshark", "-i", "any"],
                 ),
                 patch("wiki_fetcher.subprocess.Popen", return_value=process) as popen,
-                patch("wiki_fetcher.time.sleep"),
+                patch("wiki_fetcher.CaptureReadinessMonitor") as monitor,
                 self.assertLogs("wiki_fetcher", level="WARNING") as captured_logs,
             ):
-                capture.start()
+                monitor.return_value.wait_ready.side_effect = RuntimeError("exited before capture became ready")
+                with self.assertRaisesRegex(RuntimeError, "exited before capture became ready"):
+                    capture.start()
 
-        self.assertIs(popen.call_args.kwargs["stderr"], None)
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.PIPE)
         self.assertIn(
-            "exited before capture started",
+            "capture became ready",
             "\n".join(captured_logs.output),
         )
+
+    def test_readiness_failure_prevents_browser_start_and_checkpoint(self):
+        builder = MagicMock()
+        capture = MagicMock()
+        capture.start.side_effect = RuntimeError("capture readiness timeout")
+        capture.stop.return_value = None
+        capture.summary = {"error": "capture readiness timeout"}
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict("wiki_fetcher.AVAILABLE_DRIVERS", {"edge":builder}), \
+             patch("wiki_fetcher.PacketCapture", return_value=capture):
+            fetcher = WikiFetcher(Path(tmp),["edge"],True)
+            directory = fetcher._url_dir("failed")
+            record = fetcher._fetch_with("https://example.com/","edge",directory)
+            builder.build.assert_not_called()
+            self.assertIn("readiness timeout",record.error)
+            self.assertFalse(fetcher._mark_complete(UrlEntry("1","test",record.url),directory,"edge",record))
+
+    def test_metadata_recheck_waits_again_before_capture_stop(self):
+        events = []
+        driver = MagicMock(spec=webdriver.Edge)
+        driver.command_executor = MagicMock()
+        driver.current_url = "https://example.com/"
+        driver.title = "Example"
+        driver.page_source = "<html>Example</html>"
+        driver.quit.side_effect = lambda:events.append("quit")
+        builder = MagicMock()
+        builder.build.return_value = driver
+        capture = MagicMock()
+        capture.summary = {}
+        capture.stop.side_effect = lambda:(events.append("stop") or Path("capture.pcap"))
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict("wiki_fetcher.AVAILABLE_DRIVERS",{"edge":builder}), \
+             patch("wiki_fetcher.PacketCapture",return_value=capture), \
+             patch("wiki_fetcher.NetworkIdleTracker") as tracker_type:
+            tracker_type.return_value.wait.side_effect = lambda:(events.append("wait") or {"pending_count":0})
+            fetcher = WikiFetcher(Path(tmp),["edge"],True)
+            record = fetcher._fetch_with(driver.current_url,"edge",fetcher._url_dir("page"))
+            self.assertIsNone(record.error)
+            self.assertEqual(events,["wait","wait","stop","quit"])
+
+    def test_forced_or_structurally_invalid_capture_is_not_saved(self):
+        for forced in (False, True):
+            with self.subTest(forced=forced), tempfile.TemporaryDirectory() as tmp:
+                c = PacketCapture(Path(tmp)/"capture.pcap")
+                c._ready = True
+                c._proc = MagicMock()
+                c._proc.poll.side_effect = [None, 0]
+                if forced:
+                    c._proc.send_signal.side_effect = OSError("cannot signal")
+                with patch("wiki_fetcher.validate_capture_file",side_effect=ValueError("truncated block")):
+                    self.assertIsNone(c.stop())
+                    self.assertTrue(c.summary.get("error"))
 
     def test_linux_tcpdump_fallback_uses_any_interface(self) -> None:
         with patch("wiki_fetcher.platform.system", return_value="Linux"):
             self.assertEqual(PacketCapture._default_iface_tcpdump(), "any")
+
+    def test_structurally_valid_file_does_not_hide_capture_shutdown_failure(self):
+        cases = ((2, True, 0), (0, False, 0), (0, True, 1))
+        for exit_code, drained, truncated in cases:
+            with self.subTest(exit_code=exit_code, drained=drained, truncated=truncated), \
+                 tempfile.TemporaryDirectory() as tmp:
+                capture = PacketCapture(Path(tmp) / "capture.pcap")
+                capture._ready = True
+                capture._proc = MagicMock()
+                capture._proc.poll.side_effect = [None, exit_code]
+                capture._monitor = MagicMock()
+                capture._monitor.join.return_value = drained
+                file_summary = {"structure_valid": True, "packet_count": 10,
+                                "truncated_packet_count": truncated}
+                with patch("wiki_fetcher.validate_capture_file", return_value=file_summary):
+                    self.assertIsNone(capture.stop())
+                self.assertTrue(capture.summary["error"])
+
+    def test_successful_capture_stop_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture.pcap"
+            path.write_bytes(b"validated fixture")
+            capture = PacketCapture(path)
+            capture._ready = True
+            process = capture._proc = MagicMock()
+            process.poll.side_effect = [None, 0]
+            capture._monitor = MagicMock()
+            capture._monitor.join.return_value = True
+            with patch("wiki_fetcher.validate_capture_file", return_value={
+                    "structure_valid": True, "packet_count": 10,
+                    "truncated_packet_count": 0}) as validate:
+                self.assertEqual(capture.stop(), path)
+                self.assertEqual(capture.stop(), path)
+            validate.assert_called_once()
+            process.send_signal.assert_called_once()
+            capture._monitor.process.stderr.close.assert_called_once()
 
     def test_nonempty_partial_files_are_not_a_valid_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

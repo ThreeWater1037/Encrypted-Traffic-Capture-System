@@ -2,17 +2,289 @@
 
 import json
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 log = logging.getLogger("wiki_fetcher")
 RESOURCE_STALL_SECONDS = 5.0
 NETWORK_IDLE_SECONDS = 2.0
 RESOURCE_WAIT_LIMIT = 90.0
 HIT_LEGACY_HOSTS = {"today2.hit.edu.cn", "myweb.hit.edu.cn"}
+
+
+def configure_uncached_network(driver) -> None:
+    """Require network responses instead of Chromium HTTP or worker caches.
+
+    Apply to the capture target before navigation. Keep failures visible so a
+    browser that cannot enforce this policy does not silently run cached.
+    """
+    driver.execute_cdp_cmd("Network.enable", {})
+    driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+    driver.execute_cdp_cmd("Network.setBypassServiceWorker", {"bypass": True})
+
+
+def _performance_events(driver):
+    """Supplement ChromeDriver's log with out-of-process target events."""
+    events = driver.get_log("performance")
+    policy = vars(driver).get("_capture_cache_policy")
+    if policy is not None:
+        policy.check()
+        target_types = {item["session_id"]: item["type"]
+                        for item in policy.snapshot().get("targets", [])}
+        for message in policy.drain_events():
+            message["capture_target_type"] = target_types.get(message.get("sessionId"))
+            events.append({"message": json.dumps({"message": message})})
+    return events
+
+
+class NetworkIdleTracker:
+    """Keep one request ledger and deadline across pre-stop rechecks."""
+
+    def __init__(self, driver, *, idle_seconds: float = 0.5, timeout: float = 90.0):
+        self._session = _network_idle_session(driver, idle_seconds=idle_seconds, timeout=timeout)
+
+    def wait(self) -> dict:
+        # Resuming drains fresh events before examining the saved quiet window.
+        # No new events means an already satisfied window returns immediately.
+        return next(self._session)
+
+
+def wait_for_network_idle(driver, *, idle_seconds: float = 0.5,
+                          timeout: float = 90.0) -> dict:
+    """Observe one quiet window; use NetworkIdleTracker to recheck later."""
+    return NetworkIdleTracker(driver, idle_seconds=idle_seconds, timeout=timeout).wait()
+
+
+def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
+    """Wait for zero pending page HTTP requests and a continuous quiet interval.
+
+    Chromium performance logging and Network events must be enabled, and the
+    performance log drained *before* navigation, never between navigation and
+    this call. Buffered events retain their CDP monotonic timestamps, so time
+    already quiet during ``driver.get`` counts toward the interval. Downloads
+    remain pending until loadingFinished/loadingFailed, including cache hits.
+    WebSocket/EventSource streams are excluded; ordinary XHR/fetch are included.
+    The returned request ledger is suitable for writing to a JSON audit file.
+    """
+    if not all(math.isfinite(value) and value > 0 for value in (idle_seconds, timeout)):
+        raise ValueError("idle_seconds and timeout must be finite and positive")
+
+    started = time.monotonic()
+    tree = driver.execute_cdp_cmd("Page.getFrameTree", {})["frameTree"]
+    main_frame = tree["frame"]["id"]
+    # A known frame's loader distinguishes this navigation from old new-tab
+    # requests that can finish just after the pre-navigation log drain.
+    frames = {}
+    parents = {}
+
+    def add_frame_tree(node, parent=None):
+        frame = node["frame"]
+        frames[frame["id"]] = frame.get("loaderId")
+        parents[frame["id"]] = parent
+        for child in node.get("childFrames", []):
+            add_frame_tree(child, frame["id"])
+
+    add_frame_tree(tree)
+    clock_offset = None
+    try:
+        driver.execute_cdp_cmd("Performance.enable", {})
+        metrics = driver.execute_cdp_cmd("Performance.getMetrics", {})
+        metric_time = next((item["value"] for item in metrics.get("metrics", [])
+                            if item["name"] == "Timestamp"), None)
+        if metric_time is not None:
+            # Anchor at command receipt, not dispatch: the small command delay
+            # then makes the quiet interval conservative rather than too short.
+            clock_offset = time.monotonic() - metric_time
+    except WebDriverException:
+        # Older Chromium builds may not expose Performance metrics. Logging
+        # still provides real pending counts; receipt-time waiting is safe.
+        pass
+
+    pending = {}
+    requests = []
+    seen_request_events = set()
+    failures = []
+    detached = []
+    ignored_count = 0
+    finished_count = 0
+    redirect_count = 0
+    last_activity = None
+
+    def event_time(params, now):
+        stamp = params.get("timestamp")
+        if clock_offset is not None and isinstance(stamp, (int, float)):
+            return stamp + clock_offset
+        return now
+
+    def activity(params, now):
+        nonlocal last_activity
+        value = event_time(params, now)
+        last_activity = value if last_activity is None else max(last_activity, value)
+
+    def summary(now):
+        return {
+            "request_count": len(requests), "finished_count": finished_count,
+            "redirect_count": redirect_count, "failed_requests": failures,
+            "pending_count": len(pending), "pending_requests": list(pending.values()),
+            "detached_requests": detached, "ignored_request_count": ignored_count,
+            "requests": requests, "idle_seconds": idle_seconds,
+            "cache_hit_requests": [item.copy() for item in requests if any(
+                item.get(key) for key in ("served_from_cache", "from_disk_cache",
+                                         "from_service_worker", "from_prefetch_cache"))
+                or item.get("status") == 304],
+            "observed_idle_seconds": max(0.0, now - last_activity)
+                if last_activity is not None else 0.0,
+            "wait_seconds": now - started,
+            "decision_epoch": time.time(),
+            "clock_source": "cdp_monotonic" if clock_offset is not None else "log_receipt",
+        }
+
+    while True:
+        for entry in _performance_events(driver):
+            message = json.loads(entry["message"])["message"]
+            method = message["method"]
+            params = message.get("params", {})
+            request_id = params.get("requestId")
+            now = time.monotonic()
+
+            if method == "Page.frameAttached" and params.get("parentFrameId") in frames:
+                frame_id = params["frameId"]
+                frames.setdefault(frame_id, None)
+                parents[frame_id] = params["parentFrameId"]
+            elif method == "Page.frameNavigated":
+                frame = params["frame"]
+                if frame["id"] in frames or frame.get("parentId") in frames:
+                    frames[frame["id"]] = frame.get("loaderId")
+                    parents[frame["id"]] = frame.get("parentId")
+            elif method == "Page.frameDetached" and params.get("reason") != "swap":
+                # A removed iframe cannot finish its requests. A process swap
+                # is different: the frame and its downloads still exist.
+                removed = {params.get("frameId")}
+                if main_frame in removed:
+                    continue
+                while True:
+                    descendants = {frame_id for frame_id, parent in parents.items()
+                                   if parent in removed}
+                    if descendants <= removed:
+                        break
+                    removed.update(descendants)
+                for frame_id in removed:
+                    frames.pop(frame_id, None)
+                    parents.pop(frame_id, None)
+                for key, item in list(pending.items()):
+                    if item["frame_id"] in removed:
+                        item["state"] = "frame_detached"
+                        detached.append(item.copy())
+                        pending.pop(key)
+                        activity(params, now)
+            elif method == "Network.requestWillBeSent":
+                url = params["request"]["url"]
+                event_key = (request_id, params.get("timestamp"), url)
+                if event_key in seen_request_events:
+                    continue
+                frame_id = params.get("frameId")
+                loader_id = params.get("loaderId")
+                # A document request announces a new navigation before
+                # Page.frameNavigated commits its loader. This also applies
+                # when an existing iframe changes src during the quiet window.
+                # Subresources of an old loader must still be filtered out.
+                if (params.get("type") == "Document" and frame_id in frames
+                        and loader_id and url.startswith(("http://", "https://"))):
+                    frames[frame_id] = loader_id
+                frame_matches = frame_id in frames and (
+                    not frames[frame_id] or not loader_id or frames[frame_id] == loader_id)
+                loader_matches = (not frame_id and loader_id and loader_id in frames.values())
+                worker_matches = message.get("capture_target_type") in {
+                    "worker", "shared_worker", "service_worker"}
+                if not (frame_matches or loader_matches or worker_matches):
+                    continue
+                if not url.startswith(("http://", "https://")):
+                    continue
+                if params.get("type") in {"WebSocket", "EventSource"}:
+                    ignored_count += 1
+                    continue
+                seen_request_events.add(event_key)
+                previous = pending.pop(request_id, None)
+                if previous is not None and params.get("redirectResponse"):
+                    previous.update(state="redirected",
+                                    status=params["redirectResponse"].get("status"),
+                                    finished_timestamp=params.get("timestamp"))
+                    finished_count += 1
+                    redirect_count += 1
+                elif previous is not None:
+                    # Duplicate notifications are not additional requests.
+                    pending[request_id] = previous
+                    continue
+                item = {
+                    "request_id": request_id, "url": url,
+                    "type": params.get("type", "Other"), "frame_id": frame_id,
+                    "loader_id": loader_id, "state": "pending",
+                    "started_timestamp": params.get("timestamp"),
+                }
+                requests.append(item)
+                pending[request_id] = item
+                activity(params, now)
+            elif request_id in pending:
+                item = pending[request_id]
+                if method == "Network.responseReceived":
+                    response = params.get("response", {})
+                    item.update(status=response.get("status"),
+                                mime_type=response.get("mimeType"),
+                                from_disk_cache=response.get("fromDiskCache", False),
+                                from_service_worker=response.get("fromServiceWorker", False),
+                                from_prefetch_cache=response.get("fromPrefetchCache", False))
+                    if params.get("type") == "EventSource":
+                        item["state"] = "ignored_long_lived"
+                        pending.pop(request_id)
+                        ignored_count += 1
+                    activity(params, now)
+                elif method in {"Network.dataReceived", "Network.requestServedFromCache"}:
+                    # A cache notification does not imply the body has finished.
+                    if method == "Network.requestServedFromCache":
+                        item["served_from_cache"] = True
+                    activity(params, now)
+                elif method in {"Network.loadingFinished", "Network.loadingFailed"}:
+                    pending.pop(request_id)
+                    item["finished_timestamp"] = params.get("timestamp")
+                    if method == "Network.loadingFinished":
+                        item["state"] = "finished"
+                        item["encoded_data_length"] = params.get("encodedDataLength")
+                        finished_count += 1
+                    else:
+                        item.update(state="failed", error=params.get("errorText", "loadingFailed"),
+                                    canceled=params.get("canceled", False))
+                        for key in ("blockedReason", "corsErrorStatus"):
+                            if key in params:
+                                item[key] = params[key]
+                        failures.append(item.copy())
+                    activity(params, now)
+
+        now = time.monotonic()
+        if last_activity is None:
+            # With no page events yet, observe a full interval from receipt.
+            last_activity = now
+        if not pending and now - last_activity >= idle_seconds:
+            if not requests and tree["frame"].get("url", "").startswith(("http://", "https://")):
+                exc = TimeoutException(
+                    "No target HTTP(S) requests were observed; performance logging and "
+                    "Network events must be enabled and drained before navigation")
+                exc.network_idle_summary = summary(now)
+                raise exc
+            yield summary(now)
+            continue
+        if now - started >= timeout:
+            result = summary(now)
+            exc = TimeoutException(
+                f"Network did not become idle for {idle_seconds:g}s within {timeout:g}s; "
+                f"{len(pending)} request(s) still pending")
+            exc.network_idle_summary = result
+            raise exc
+        remaining_idle = idle_seconds - (now - last_activity) if not pending else 0.05
+        time.sleep(min(0.05, max(0.001, remaining_idle), max(0.001, timeout - (now - started))))
 
 
 def wait_for_resources(driver, skipped: list[dict] | None = None) -> list[dict]:

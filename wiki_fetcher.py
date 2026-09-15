@@ -18,6 +18,7 @@ import signal
 import hashlib
 import secrets
 import logging
+import math
 import argparse
 import re
 import tempfile
@@ -31,8 +32,7 @@ from typing import Iterable, Iterator, Optional
 from urllib.parse import urlsplit
 
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.edge.service import Service as EdgeService
+from browser_service import TimedChromeService as ChromeService, TimedEdgeService as EdgeService
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.safari.service import Service as SafariService
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -46,7 +46,10 @@ from webdriver_manager.core.driver_cache import DriverCacheManager
 
 from browser_discovery import discover_browser
 from browser_proxy import BrowserProxy, parse_browser_proxy
-from browser_loading import HIT_LEGACY_HOSTS, wait_for_resources
+from browser_loading import (
+    HIT_LEGACY_HOSTS, NetworkIdleTracker, configure_uncached_network, wait_for_resources,
+)
+from capture_readiness import CaptureReadinessMonitor, validate_capture_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,16 +63,39 @@ def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
     """设置导航兜底；今日哈工大资源等待在 DOM 就绪后单独处理。"""
     # Must be shorter than the WebDriver HTTP transport timeout (120s).
     driver.set_page_load_timeout(90)
-    if (
-        isinstance(driver, (webdriver.Chrome, webdriver.Edge))
-        and urlsplit(url).hostname == "today.hit.edu.cn"
-    ):
-        driver.execute_cdp_cmd("Network.enable", {})
-        driver.execute_cdp_cmd("Network.setBlockedURLs", {
-            "urls": [f"{scheme}://{host}/*"
-                     for host in sorted(HIT_LEGACY_HOSTS) for scheme in ("http", "https")],
-        })
+    if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
+        configure_uncached_network(driver)
+        if urlsplit(url).hostname == "today.hit.edu.cn":
+            driver.execute_cdp_cmd("Network.setBlockedURLs", {
+                "urls": [f"{scheme}://{host}/*"
+                         for host in sorted(HIT_LEGACY_HOSTS) for scheme in ("http", "https")],
+            })
         driver.get_log("performance")  # discard new-tab events before navigation
+        policy = vars(driver).get("_capture_cache_policy")
+        if policy is not None:
+            policy.check()
+            policy.reset_observation()
+
+
+def _initialize_chromium_network(driver):
+    """Configure root and future child targets before the first navigation."""
+    from browser_cache import ChromiumCachePolicy
+
+    policy = ChromiumCachePolicy(driver)
+    driver._capture_cache_policy = policy
+    try:
+        configure_uncached_network(driver)
+        policy.start()
+    except Exception:
+        try:
+            policy.close()
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                log.exception("Browser cleanup failed after cache policy initialization failure")
+        raise
+    return driver
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +110,9 @@ class PacketCapture:
     Capture timeline per browser:
         start() → browser launch → driver.get() → page loaded → stop()
 
-    The pcap is flushed and closed only after stop(), so all phases
-    (DNS query, TCP SYN, TLS ClientHello, HTTP response) are included.
+    Capture starts before navigation and stops after resource completion and
+    network idle. stop() validates file structure; response completeness is
+    separately checked using decrypted traffic.
     """
 
     def __init__(self, pcap_path: Path, capture_filter: str = ""):
@@ -93,6 +120,11 @@ class PacketCapture:
         self.capture_filter = capture_filter  # optional BPF filter
         self._proc: Optional[subprocess.Popen] = None
         self._tool: Optional[str] = None
+        self._monitor = None
+        self.summary = {}
+        self._ready = False
+        self._stop_result = None
+        self._expected_interfaces = 1
 
     # ------------------------------------------------------------------
     # Tool detection
@@ -136,7 +168,10 @@ class PacketCapture:
         if tool == "tshark":
             # Collect all up, non-loopback interfaces + loopback explicitly
             ifaces = self._list_interfaces_tshark(binary)
-            cmd = [binary, "-q"]
+            self._expected_interfaces = len(ifaces)
+            # Only enable Main's startup notification. Enabling every dumpcap
+            # INFO domain can interleave child diagnostic messages on Windows.
+            cmd = [binary, "-q", "--log-level", "warning", "--log-debug", "Main"]
             for iface in ifaces:
                 cmd += ["-i", iface]
             cmd += ["-w", str(self.pcap_path)]
@@ -282,46 +317,48 @@ class PacketCapture:
         result = self._find_tool()
         if result is None:
             log.warning("Neither tshark nor tcpdump found — pcap skipped.")
-            return
+            raise RuntimeError("Packet capture requested but neither tshark nor tcpdump was found")
 
         self._tool, binary = result
         try:
             cmd = self._build_cmd(self._tool, binary)
         except RuntimeError as exc:
-            # 接口探测失败时保留网页抓取结果，但明确跳过 PCAP，任务会标记为部分成功。
+            # 接口探测失败时终止本次抓取，避免浏览器先启动而漏抓握手。
             log.error("  pcap capture skipped: %s", exc)
             self._tool = None
-            return
+            raise
 
         log.info("  pcap capture starting (%s) → %s", self._tool, self.pcap_path)
         log.debug("  cmd: %s", " ".join(cmd))
 
         popen_kwargs = {
             "stdout": subprocess.DEVNULL,
-            # 继承父进程的 stderr。Worker 已把父进程输出写入 worker.log，
-            # 因此接口或权限错误会直接出现在任务日志中，且不会产生管道阻塞。
-            "stderr": None,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
         }
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         self._proc = subprocess.Popen(cmd, **popen_kwargs)
-        # Wait for sniffer to open BPF handles and start capturing
-        time.sleep(1.2)
-        return_code = self._proc.poll()
-        if return_code is not None:
-            log.warning(
-                "  %s exited before capture started (code=%s); see error output above.",
-                self._tool,
-                return_code,
-            )
+        self._monitor = CaptureReadinessMonitor(
+            self._proc, self._tool, self.pcap_path, self._expected_interfaces, logger=log)
+        try:
+            self.summary["readiness"] = self._monitor.wait_ready(timeout=5.0)
+            self._ready = True
+            log.info("  Capture ready in %.3fs", self.summary["readiness"]["wait_seconds"])
+        except Exception as exc:
+            self.summary["error"] = str(exc)
+            self.summary["readiness"] = getattr(exc, "details", {})
+            log.warning("  Capture readiness failed: %s", exc)
+            self.stop()
+            raise
 
     def stop(self) -> Optional[Path]:
         """刷新并可靠关闭抓包进程，返回非空 PCAP 路径。"""
         if self._proc is None:
-            return None
-
-        # Brief pause so the last packets (TCP FIN, TLS close_notify) are written
-        time.sleep(0.5)
+            return self._stop_result
+        forced = False
         # Ask the sniffer to flush write buffers, then guarantee termination.
         try:
             return_code = self._proc.poll()
@@ -332,15 +369,18 @@ class PacketCapture:
                     self._proc.send_signal(signal.SIGINT)
                 self._proc.wait(timeout=10)
             else:
+                self.summary.setdefault("error", f"Capture process exited before stop (code={return_code})")
                 log.warning(
                     "  %s capture process exited early (code=%s).",
                     self._tool,
                     return_code,
                 )
         except subprocess.TimeoutExpired:
+            forced = True
             self._proc.kill()
             self._proc.wait()
         except Exception:
+            forced = True
             try:
                 self._proc.terminate()
                 self._proc.wait(timeout=5)
@@ -352,14 +392,32 @@ class PacketCapture:
                     self._proc.kill()
                     self._proc.wait()
 
+        self.summary["exit_code"] = self._proc.poll()
+        self.summary["forced_stop"] = forced
+        if self.summary["exit_code"] != 0:
+            self.summary.setdefault("error", f"Capture exited with code {self.summary['exit_code']}")
         self._proc = None
-
-        if self.pcap_path.exists() and self.pcap_path.stat().st_size > 0:
+        if self._monitor:
+            self.summary["stderr_drained"] = self._monitor.join(timeout=1.0)
+            if not self.summary["stderr_drained"]:
+                self.summary.setdefault("error", "Capture stderr did not close after process exit")
+            else:
+                self._monitor.process.stderr.close()
+        if forced:
+            self.summary["error"] = "Capture required forced termination"
+        try:
+            self.summary["file"] = validate_capture_file(self.pcap_path, require_packet=True)
+            if self.summary["file"]["truncated_packet_count"]:
+                self.summary.setdefault("error", "Capture contains snaplen-truncated packets")
+        except (OSError, ValueError) as exc:
+            self.summary.setdefault("error", str(exc))
+        if self._ready and not self.summary.get("error"):
             log.info("  pcap saved → %s (%d bytes)",
                      self.pcap_path, self.pcap_path.stat().st_size)
-            return self.pcap_path
+            self._stop_result = self.pcap_path
+            return self._stop_result
         else:
-            log.warning("  pcap empty or missing.")
+            log.warning("  pcap incomplete: %s", self.summary.get("error", "capture not ready"))
             return None
 
 
@@ -384,6 +442,10 @@ class SessionRecord:
     request_id: str = field(default_factory=lambda: secrets.token_hex(8))
     error: Optional[str] = None
     skipped_resources: list[dict] = field(default_factory=list)
+    network_summary: dict = field(default_factory=dict)
+    phase_timings: dict[str, float] = field(default_factory=dict)
+    capture_summary: dict = field(default_factory=dict)
+    cleanup_summary: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         """生成便于写入 report.txt 的人类可读摘要。"""
@@ -506,9 +568,9 @@ class ChromeDriver(BrowserDriver):
     ) -> webdriver.Chrome:
         """配置 Chrome 启动参数、驱动服务和 CDP 无缓存设置。"""
         opts = ChromeOptions()
+        opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
         if skip_stalled_resources:
             opts.page_load_strategy = "eager"
-            opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
         binary = self._find_binary()
         if not binary:
             raise RuntimeError("Google Chrome/Chromium not found")
@@ -517,7 +579,7 @@ class ChromeDriver(BrowserDriver):
         # Fresh profile — no persistent cache or cookies
         opts.add_argument(f"--user-data-dir={profile_dir}")
 
-        # Disable all caching mechanisms
+        # Supplementary flags; CDP below enforces HTTP cache and worker bypass.
         opts.add_argument("--disable-application-cache")
         opts.add_argument("--disable-cache")
         opts.add_argument("--disk-cache-size=0")
@@ -541,9 +603,7 @@ class ChromeDriver(BrowserDriver):
         )
         driver = webdriver.Chrome(service=service, options=opts)
 
-        driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
-        driver.execute_cdp_cmd("Network.enable", {})
-        return driver
+        return _initialize_chromium_network(driver)
 
 
 class EdgeDriver(BrowserDriver):
@@ -568,9 +628,9 @@ class EdgeDriver(BrowserDriver):
             raise RuntimeError("Microsoft Edge not found")
 
         opts = EdgeOptions()
+        opts.set_capability("ms:loggingPrefs", {"performance": "ALL"})
         if skip_stalled_resources:
             opts.page_load_strategy = "eager"
-            opts.set_capability("ms:loggingPrefs", {"performance": "ALL"})
         opts.binary_location = binary
         opts.add_argument(f"--user-data-dir={profile_dir}")
         opts.add_argument("--disable-application-cache")
@@ -593,9 +653,7 @@ class EdgeDriver(BrowserDriver):
             ).install()
         )
         driver = webdriver.Edge(service=service, options=opts)
-        driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
-        driver.execute_cdp_cmd("Network.enable", {})
-        return driver
+        return _initialize_chromium_network(driver)
 
 
 class FirefoxDriver(BrowserDriver):
@@ -694,7 +752,8 @@ AVAILABLE_DRIVERS = {
 # Configurable interval between URL requests (seconds)
 # Change this value to control the pause between consecutive URL fetches.
 # ---------------------------------------------------------------------------
-INTERVAL_BETWEEN_URLS: float = 3.0   # seconds
+INTERVAL_BETWEEN_URLS: float = 1.0   # seconds; previous URL is fully cleaned up first
+NETWORK_IDLE_SECONDS: float = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -740,7 +799,13 @@ class WikiFetcher:
         *,
         save_html: bool = False,
         save_reports: bool = False,
+        network_idle_seconds: float = NETWORK_IDLE_SECONDS,
+        interval_seconds: float = INTERVAL_BETWEEN_URLS,
     ):
+        if not math.isfinite(network_idle_seconds) or network_idle_seconds <= 0:
+            raise ValueError("network_idle_seconds must be finite and greater than zero")
+        if not math.isfinite(interval_seconds) or interval_seconds < 0:
+            raise ValueError("interval_seconds must be finite and nonnegative")
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.browsers = browsers
@@ -751,6 +816,8 @@ class WikiFetcher:
         )
         self.save_html = save_html
         self.save_reports = save_reports
+        self.network_idle_seconds = network_idle_seconds
+        self.interval_seconds = interval_seconds
         self.progress_run_id = uuid.uuid4().hex
         self.all_records: list[SessionRecord] = []   # flat list across all URLs
 
@@ -840,6 +907,10 @@ class WikiFetcher:
             "skipped_resources": record.skipped_resources,
             "needs_recapture": bool(record.skipped_resources),
             "resource_status": "partial" if record.skipped_resources else "complete",
+            "network_summary": record.network_summary,
+            "phase_timings": record.phase_timings,
+            "capture_summary": record.capture_summary,
+            "cleanup_summary": record.cleanup_summary,
         }
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -884,6 +955,11 @@ class WikiFetcher:
 
     def _fetch_with(self, url: str, driver_key: str, url_dir: Path) -> SessionRecord:
         """完成单个 URL/浏览器的抓包、访问、落盘与资源清理。"""
+        fetch_started = time.perf_counter()
+        phase_timings = {}
+        network_summary = {}
+        capture_summary = {}
+        cleanup_summary = {}
         bd = AVAILABLE_DRIVERS[driver_key]
         timestamp = datetime.now().isoformat()
 
@@ -899,7 +975,6 @@ class WikiFetcher:
         actual_pcap_path: Optional[str] = None
         if self.capture_pcap:
             capture = PacketCapture(pcap_path=self._pcap_path(url_dir, driver_key))
-            capture.start()
 
         driver = None
         error_msg = None
@@ -916,30 +991,35 @@ class WikiFetcher:
         )
 
         try:
+            if capture:
+                capture.start()
+            phase_timings["capture_start"] = time.perf_counter() - fetch_started
             log.info("    Starting %s ...", bd.name)
             build_options = {"skip_stalled_resources": True} if skip_stalled else {}
+            phase_started = time.perf_counter()
             driver = bd.build(browser_key_log, profile_dir, self.proxy, **build_options)
+            phase_timings["browser_start"] = time.perf_counter() - phase_started
 
             t0 = time.perf_counter()
 
-            if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
-                driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
-                    "headers": {
-                        "Cache-Control": "no-cache, no-store, must-revalidate",
-                        "Pragma": "no-cache",
-                    }
-                })
-
+            # Cache is disabled through CDP and a fresh profile. Injecting
+            # Cache-Control/Pragma into every request creates CORS preflights
+            # and can make otherwise valid cross-origin resources fail.
             _prepare_navigation(driver, url)
+            phase_started = time.perf_counter()
             driver.get(url)
+            phase_timings["navigation"] = time.perf_counter() - phase_started
 
+            phase_started = time.perf_counter()
             if skip_stalled:
                 wait_for_resources(driver, skipped_resources)
             else:
-                self._wait_for_normal_page(driver)
+                network_summary = self._wait_for_normal_page(driver)
+            phase_timings["network_idle"] = time.perf_counter() - phase_started
 
             response_time_ms = (time.perf_counter() - t0) * 1000
 
+            phase_started = time.perf_counter()
             final_url = driver.current_url
             page_title = driver.title
             html = driver.page_source
@@ -954,28 +1034,119 @@ class WikiFetcher:
                 cookies = []
                 log.warning("    Error: %s", detected_error)
 
-            time.sleep(0.5)
+            phase_timings["metadata"] = time.perf_counter() - phase_started
+            # Reuse the ledger and deadline. No activity means no second sleep;
+            # requests started during metadata collection must still complete.
+            tracker = vars(driver).get("_capture_idle_tracker")
+            if tracker is not None:
+                phase_started = time.perf_counter()
+                network_summary = tracker.wait()
+                phase_timings["network_recheck"] = time.perf_counter() - phase_started
+            policy = vars(driver).get("_capture_cache_policy")
+            if policy is not None:
+                policy.check()
+                network_summary["cache_policy"] = policy.snapshot()
+                if network_summary["cache_policy"].get("cache_hits"):
+                    raise RuntimeError("Browser cache use detected; this capture is not an uncached sample")
+            if network_summary.get("cache_hit_requests"):
+                raise RuntimeError("Browser cache use detected; this capture is not an uncached sample")
 
         except Exception as exc:
             error_msg = str(exc)
+            network_summary = getattr(exc, "network_idle_summary", network_summary)
             log.warning("    Error: %s", exc)
         finally:
             # Stop recording before any potentially blocking browser cleanup.
+            phase_started = time.perf_counter()
             if capture:
-                saved = capture.stop()
-                actual_pcap_path = str(saved) if saved else None
+                try:
+                    saved = capture.stop()
+                    actual_pcap_path = str(saved) if saved else None
+                    details = getattr(capture, "summary", {})
+                    capture_summary = details if isinstance(details, dict) else {}
+                    if saved is None and not error_msg:
+                        error_msg = capture_summary.get("error", "Packet capture did not complete")
+                except Exception as exc:
+                    error_msg = error_msg or f"Capture shutdown failed: {exc}"
+            phase_timings["capture_stop"] = time.perf_counter() - phase_started
+            phase_started = time.perf_counter()
             if driver:
+                policy = vars(driver).get("_capture_cache_policy")
+                if policy is not None:
+                    cache_close_started = time.perf_counter()
+                    try:
+                        policy.check()
+                    except Exception as exc:
+                        error_msg = error_msg or str(exc)
+                    try:
+                        network_summary["cache_policy"] = policy.snapshot()
+                        policy.close()
+                    except Exception as exc:
+                        cleanup_summary["cache_policy_error"] = str(exc)
+                        error_msg = error_msg or f"Cache policy shutdown failed: {exc}"
+                    phase_timings["cache_policy_close"] = time.perf_counter() - cache_close_started
+                quit_started = time.perf_counter()
                 try:
                     client_config = getattr(driver.command_executor, "client_config", None)
                     if client_config is not None:
                         client_config.timeout = 5
                     driver.quit()
-                except Exception:
-                    pass
-            if browser_key_log.exists():
-                shutil.copy2(browser_key_log, key_log)
-            shutil.rmtree(profile_dir, ignore_errors=True)
+                except Exception as exc:
+                    cleanup_summary["error"] = str(exc)
+                    error_msg = error_msg or f"Browser shutdown failed: {exc}"
+                phase_timings["browser_quit"] = time.perf_counter() - quit_started
+                service = vars(driver).get("service")
+                details = getattr(service, "shutdown_details", None)
+                if isinstance(details, dict):
+                    cleanup_summary["service"] = details
+                    if details.get("error"):
+                        cleanup_summary["error"] = details["error"]
+                        error_msg = error_msg or details["error"]
+            copy_started = time.perf_counter()
+            try:
+                if browser_key_log.exists():
+                    shutil.copy2(browser_key_log, key_log)
+            except OSError as exc:
+                error_msg = error_msg or f"TLS keylog copy failed: {exc}"
+                cleanup_summary["keylog_error"] = str(exc)
+            phase_timings["keylog_copy"] = time.perf_counter() - copy_started
+            remove_started = time.perf_counter()
+            try:
+                # Only the absolute directory created by mkdtemp above is owned
+                # by this attempt. Preserve it on a failed browser shutdown.
+                if not cleanup_summary.get("error"):
+                    shutil.rmtree(profile_dir)
+                else:
+                    cleanup_summary["retained_profile"] = str(profile_dir)
+            except OSError as exc:
+                cleanup_summary["profile_error"] = str(exc)
+                cleanup_summary["retained_profile"] = str(profile_dir)
+                error_msg = error_msg or f"Browser profile cleanup failed: {exc}"
+            phase_timings["profile_cleanup"] = time.perf_counter() - remove_started
             os.environ.pop("SSLKEYLOGFILE", None)
+            phase_timings["browser_cleanup"] = time.perf_counter() - phase_started
+
+        phase_timings["total"] = time.perf_counter() - fetch_started
+        log.info("    Phase seconds: %s", " ".join(
+            f"{name}={seconds:.3f}" for name, seconds in phase_timings.items()
+        ))
+        if network_summary:
+            log.info("    Network idle: threshold=%.3fs pending=%s failed=%s",
+                     self.network_idle_seconds, network_summary.get("pending_count"),
+                     len(network_summary.get("failed_requests", [])))
+        if driver_key in {"chrome", "edge"} and not skip_stalled:
+            # A failed navigation has no completion checkpoint. Persist its
+            # pending URLs too, so this attempt is diagnosable without reports.
+            network_status_path = url_dir / f"network_status_{driver_key}.json"
+            temporary = network_status_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps({
+                "url": url, "run_id": self.progress_run_id,
+                "recorded_at": datetime.now().astimezone().isoformat(),
+                "error": error_msg, "network_summary": network_summary,
+                "phase_timings": phase_timings,
+                "capture_summary": capture_summary, "cleanup_summary": cleanup_summary,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(network_status_path)
 
         content_hash = hashlib.sha256(html.encode()).hexdigest() if html else ""
         html_length = len(html.encode())
@@ -1023,50 +1194,26 @@ class WikiFetcher:
             cookies=cookies, key_log_path=str(key_log) if key_log.exists() else None,
             pcap_path=actual_pcap_path, error=error_msg,
             skipped_resources=skipped_resources,
+            network_summary=network_summary,
+            phase_timings=phase_timings,
+            capture_summary=capture_summary, cleanup_summary=cleanup_summary,
         )
 
-    @staticmethod
-    def _wait_for_normal_page(driver) -> None:
-        # Stage 1: wait for document.readyState == "complete"
-        # (Selenium's default page load strategy already does this,
-        #  but we make it explicit and observable)
+    def _wait_for_normal_page(self, driver) -> dict:
+        if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
+            # Performance logging starts before navigation. Pending HTTP(S)
+            # requests must finish before the quiet window can complete.
+            tracker = NetworkIdleTracker(driver, idle_seconds=self.network_idle_seconds)
+            driver._capture_idle_tracker = tracker
+            return tracker.wait()
+
+        # Browsers without the Chromium event stream keep a bounded load check
+        # and a settle delay; do not label this fallback as measured network idle.
         WebDriverWait(driver, 30).until(
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
-
-        # Stage 2: wait for network to go idle — no new requests for
-        # NETWORK_IDLE_THRESHOLD consecutive seconds.
-        # This covers async JS, lazy-loaded images, XHR/fetch calls, etc.
-        NETWORK_IDLE_THRESHOLD = 2.0   # seconds of silence = "done"
-        NETWORK_IDLE_TIMEOUT   = 15.0  # give up after this long regardless
-
-        if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
-            # Track in-flight request count via CDP Network events (Chromium only)
-            driver.execute_cdp_cmd("Network.enable", {})
-            driver.execute_script("""
-                window.__inflight = 0;
-                window.__lastActivity = Date.now();
-                const orig_fetch = window.fetch;
-                window.fetch = function(...args) {
-                    window.__inflight++;
-                    window.__lastActivity = Date.now();
-                    return orig_fetch.apply(this, args).finally(() => {
-                        window.__inflight = Math.max(0, window.__inflight - 1);
-                        window.__lastActivity = Date.now();
-                    });
-                };
-            """)
-            idle_deadline = time.perf_counter() + NETWORK_IDLE_TIMEOUT
-            while time.perf_counter() < idle_deadline:
-                time.sleep(0.3)
-                idle_ms = driver.execute_script(
-                    "return Date.now() - (window.__lastActivity || 0);"
-                )
-                if idle_ms >= NETWORK_IDLE_THRESHOLD * 1000:
-                    break
-        else:
-            # Firefox: no CDP — fall back to a fixed settle delay
-            time.sleep(NETWORK_IDLE_THRESHOLD)
+        time.sleep(self.network_idle_seconds)
+        return {"mode": "settle_delay", "idle_seconds": self.network_idle_seconds}
 
 
     # ------------------------------------------------------------------
@@ -1151,7 +1298,8 @@ class WikiFetcher:
         )
         log.info("HTML   : %s", "enabled" if self.save_html else "disabled")
         log.info("reports: %s", "enabled" if self.save_reports else "disabled")
-        log.info("Interval between URLs: %.1f s", INTERVAL_BETWEEN_URLS)
+        log.info("Network idle threshold: %.3f s", self.network_idle_seconds)
+        log.info("Interval between URLs: %.1f s", self.interval_seconds)
         log.info("=" * 60)
 
         completed_units = 0
@@ -1179,8 +1327,8 @@ class WikiFetcher:
             )
 
             if pos < total and (captured or incomplete):
-                log.info("  Waiting %.1f s ...", INTERVAL_BETWEEN_URLS)
-                time.sleep(INTERVAL_BETWEEN_URLS)
+                log.info("  Waiting %.1f s ...", self.interval_seconds)
+                time.sleep(self.interval_seconds)
 
         if self.save_reports:
             self._write_summary()
@@ -1273,7 +1421,7 @@ def main():
             "Accepts a single URL or a structured text file (--input).\n"
             "TLS session keys are saved for Chrome and Firefox.\n"
             "Network traffic can optionally be saved as pcap (--pcap).\n\n"
-            f"Interval between URLs: INTERVAL_BETWEEN_URLS = {INTERVAL_BETWEEN_URLS} s (修改脚本顶部)"
+            f"Default interval between URLs: {INTERVAL_BETWEEN_URLS} s (--interval-seconds)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1322,6 +1470,10 @@ def main():
         "--save-reports", action="store_true",
         help="可选：保存逐 URL report.txt 和批次 summary.txt。",
     )
+    parser.add_argument("--network-idle-seconds", type=float, default=NETWORK_IDLE_SECONDS,
+                        help="Chromium 所有页面请求结束后的静默窗口（默认 0.5 秒）。")
+    parser.add_argument("--interval-seconds", type=float, default=INTERVAL_BETWEEN_URLS,
+                        help="前一 URL 完成资源清理后的间隔（默认 1 秒，可设为 0）。")
     args = parser.parse_args()
 
     # 构建 UrlEntry 列表
@@ -1353,6 +1505,8 @@ def main():
         capture_pcap=args.pcap,
         save_html=args.save_html,
         save_reports=args.save_reports,
+        network_idle_seconds=args.network_idle_seconds,
+        interval_seconds=args.interval_seconds,
     )
     if not fetcher.run(entries, total=total):
         log.error("仍有采集单元未完成；退出码 2 将触发 Worker 检查点重试")
