@@ -295,11 +295,15 @@ class MasterStore:
             ).fetchall()
             job_ids = [str(row["job_id"]) for row in rows]
             counts: dict[str, dict[str, int]] = {job_id: {} for job_id in job_ids}
+            checkpoint_counts = {job_id: 0 for job_id in job_ids}
             if job_ids:
                 placeholders = ",".join("?" for _ in job_ids)
                 count_rows = connection.execute(
                     f"""
-                    SELECT job_id, status, COUNT(*) AS count
+                    SELECT job_id, status, COUNT(*) AS count,
+                           SUM(CASE WHEN status NOT IN ('SUCCEEDED','PARTIAL','FAILED','CAPTURED')
+                                     AND json_extract(result_json, '$.status') = 'CAPTURED'
+                                    THEN 1 ELSE 0 END) AS checkpoint_count
                       FROM executions
                      WHERE job_id IN ({placeholders})
                      GROUP BY job_id, status
@@ -307,6 +311,7 @@ class MasterStore:
                     job_ids,
                 ).fetchall()
                 for item in count_rows:
+                    checkpoint_counts[str(item["job_id"])] += int(item["checkpoint_count"])
                     counts[str(item["job_id"])][str(item["status"])] = int(
                         item["count"]
                     )
@@ -315,6 +320,7 @@ class MasterStore:
             job = dict(row)
             job["cancel_requested"] = bool(job["cancel_requested"])
             job["execution_counts"] = counts[str(job["job_id"])]
+            job["checkpoint_completed_count"] = checkpoint_counts[str(job["job_id"])]
             jobs.append(job)
         return jobs
 
@@ -411,7 +417,10 @@ class MasterStore:
                 ).fetchall()
             count_rows = connection.execute(
                 """
-                SELECT status, COUNT(*) AS count
+                SELECT status, COUNT(*) AS count,
+                       SUM(CASE WHEN status NOT IN ('SUCCEEDED','PARTIAL','FAILED','CAPTURED')
+                                 AND json_extract(result_json, '$.status') = 'CAPTURED'
+                                THEN 1 ELSE 0 END) AS checkpoint_count
                   FROM executions WHERE job_id = ? GROUP BY status
                 """,
                 (job_id,),
@@ -424,6 +433,7 @@ class MasterStore:
         value["execution_counts"] = {
             str(item["status"]): int(item["count"]) for item in count_rows
         }
+        value["checkpoint_completed_count"] = sum(int(item["checkpoint_count"]) for item in count_rows)
         value["page"] = {
             "offset": offset,
             "limit": limit,
@@ -610,16 +620,20 @@ class MasterStore:
         error: str | None,
     ) -> None:
         """在单事务中写入一个 Worker 的全部 URL 结果。"""
+        # A canceled Worker may have no manifest. Keep committed checkpoint evidence
+        # so stopping the remaining units does not erase already completed captures.
         now = utc_now()
         with self._connection() as connection:
             connection.execute(
                 """
                 UPDATE executions
                    SET status = ?, stage = 'DONE', error = ?,
-                       result_json = NULL, updated_at = ?
+                       result_json = CASE WHEN ? IN ('CANCELED','INTERRUPTED')
+                                          THEN result_json ELSE NULL END,
+                       updated_at = ?
                  WHERE job_id = ? AND machine_id = ?
                 """,
-                (top_status, error, now, job_id, machine_id),
+                (top_status, error, top_status, now, job_id, machine_id),
             )
             rows = []
             for unit in units:

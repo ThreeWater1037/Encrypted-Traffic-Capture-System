@@ -9,8 +9,9 @@ from unittest.mock import patch
 
 from master_server.app import create_app
 from master_server.config import MasterConfig
-from master_server.dispatcher import JobDispatcher
+from master_server.dispatcher import JobDispatcher, summarize_job
 from master_server.store import MasterStore
+from master_server.worker_client import WorkerRequestError
 
 
 class FakeWorkerClient:
@@ -375,6 +376,102 @@ class MasterServerTests(unittest.TestCase):
         self.assertEqual(job["summary"]["progress"], 50)
         self.assertEqual(job["items"][0]["status"], "CAPTURED")
         self.assertEqual(job["items"][1]["status"], "CAPTURING")
+
+    def assert_job_progress(self, job_id, completed, progress):
+        # List, paginated detail and full detail must all use the global count.
+        views = [
+            next(job for job in self.client.get("/api/v1/jobs").get_json()["jobs"]
+                 if job["job_id"] == job_id),
+            self.client.get(f"/api/v1/jobs/{job_id}?unit=url&limit=1&offset=1").get_json(),
+            summarize_job(self.store.get_job(job_id)),
+        ]
+        for view in views:
+            self.assertEqual(view["summary"]["completed"], completed)
+            self.assertEqual(view["summary"]["progress"], progress)
+            self.assertNotIn("checkpoint_completed_count", view)
+
+    def test_cancel_before_dispatch_keeps_zero_progress(self):
+        job_id = "cancel-before-dispatch"
+        self.store.create_job(self.payload(job_id))
+        response = self.client.post(f"/api/v1/jobs/{job_id}/cancel")
+        self.assertEqual(response.status_code, 200)
+        self.dispatcher._run_job(job_id)
+        self.assertEqual(self.store.get_job_status(job_id)["status"], "CANCELED")
+        self.assert_job_progress(job_id, 0, 0)
+
+    def test_cancel_preserves_capture_progress_and_syncs_last_checkpoint(self):
+        job_id = "cancel-during-capture"
+        payload = self.payload(job_id)
+        payload["items"].append({"id": "3", "name": "Third", "url": "https://example.net/"})
+        self.store.create_job(payload)
+        unit = {"item_id": "1", "browser": "chrome", "status": "CAPTURED"}
+        snapshots = []
+
+        def capture_progress(task_id, **kwargs):
+            status = self.store.get_job_status(job_id)["status"]
+            snapshots.append(status)
+            units = [unit] if len(snapshots) == 1 else [dict(unit, item_id="2")]
+            return {"run_id": "capture-run", "next_position": len(snapshots),
+                    "has_more": False, "units": units}
+
+        def poll_task(task_id):
+            self.assert_job_progress(job_id, 1, 33)
+            self.client.post(f"/api/v1/jobs/{job_id}/cancel")
+            return {"status": "CANCELING", "stage": "CANCELING"}
+
+        def cancel_task(task_id):
+            # The CANCELING stage must not discard previously captured units.
+            self.assert_job_progress(job_id, 1, 33)
+            return {"status": "CANCELED", "stage": "CANCELED", "result": {}}
+
+        with (
+            patch.object(self.fake_worker, "get_capture_progress", side_effect=capture_progress),
+            patch.object(self.fake_worker, "get_task", side_effect=poll_task),
+            patch.object(self.fake_worker, "cancel_task", side_effect=cancel_task),
+        ):
+            self.dispatcher._run_job(job_id)
+
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(self.store.get_job_status(job_id)["status"], "CANCELED")
+        self.assert_job_progress(job_id, 2, 67)
+        executions = self.store.get_job(job_id)["executions"]
+        self.assertEqual(executions[0]["result"], unit)
+        self.assertIsNone(executions[2]["result"])
+
+    def test_stopped_units_without_checkpoints_do_not_count_as_completed(self):
+        for status in ("CANCELED", "INTERRUPTED"):
+            with self.subTest(status=status):
+                job_id = f"stopped-{status.lower()}"
+                self.store.create_job(self.payload(job_id))
+                self.store.update_worker_results(
+                    job_id, "worker-local", top_status=status, error=None,
+                    units=[{"item_id": "1", "browser": "chrome", "status": "SUCCEEDED"}],
+                )
+                self.assert_job_progress(job_id, 1, 50)
+
+    def test_cancel_result_keeps_checkpoints_when_final_progress_fetch_fails(self):
+        job_id = "cancel-checkpoint-fallback"
+        self.store.create_job(self.payload(job_id))
+        self.store.update_worker_capture_progress(
+            job_id, "worker-local",
+            [{"item_id": "1", "browser": "chrome", "status": "CAPTURED"}],
+        )
+        # An idempotent submit can return a task canceled while Master was offline.
+        with (
+            patch.object(self.fake_worker, "submit_task", return_value={
+                "status": "CANCELED", "result": {},
+            }),
+            patch.object(self.fake_worker, "get_capture_progress",
+                         side_effect=WorkerRequestError("Worker unavailable")),
+        ):
+            self.dispatcher._run_job(job_id)
+        self.assertEqual(self.store.get_job_status(job_id)["status"], "CANCELED")
+        self.assert_job_progress(job_id, 1, 50)
+        # Reapplying the same result is idempotent.
+        self.dispatcher._apply_worker_result(
+            job_id, "worker-local", {"status": "CANCELED", "result": None},
+        )
+        self.assert_job_progress(job_id, 1, 50)
 
     def test_job_logs_forward_per_machine_offsets(self):
         job_id = "paged-logs-001"

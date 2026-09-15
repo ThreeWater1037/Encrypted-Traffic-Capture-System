@@ -14,7 +14,7 @@ from .worker_client import WorkerClient, WorkerRequestError
 
 
 ClientFactory = Callable[[dict[str, Any]], WorkerClient]
-PROGRESS_COMPLETED_STATUSES = TERMINAL_STATUSES | {"CAPTURED"}
+PROGRESS_COMPLETED_STATUSES = {"SUCCEEDED", "PARTIAL", "FAILED", "CAPTURED"}
 
 
 class QueueFullError(RuntimeError):
@@ -35,11 +35,11 @@ def summarize_job(job: dict[str, Any]) -> dict[str, Any]:
         public = {
             key: value
             for key, value in job.items()
-            if key not in {"execution_counts", "source_path"}
+            if key not in {"execution_counts", "checkpoint_completed_count", "source_path"}
         }
         counts = job["execution_counts"]
         total = sum(counts.values())
-        terminal_count = sum(
+        terminal_count = job.get("checkpoint_completed_count", 0) + sum(
             count for status, count in counts.items() if status in PROGRESS_COMPLETED_STATUSES
         )
         public["summary"] = {
@@ -95,6 +95,10 @@ def summarize_job(job: dict[str, Any]) -> dict[str, Any]:
     for execution in executions:
         counts[execution["status"]] = counts.get(execution["status"], 0) + 1
     terminal_count = sum(
+        execution["status"] not in PROGRESS_COMPLETED_STATUSES
+        and (execution.get("result") or {}).get("status") == "CAPTURED"
+        for execution in executions
+    ) + sum(
         count for status, count in counts.items() if status in PROGRESS_COMPLETED_STATUSES
     )
     total = len(executions)
@@ -487,6 +491,15 @@ class JobDispatcher:
 
         if self._stop.is_set():
             return
+        if task.get("status") in {"CANCELED", "INTERRUPTED"}:
+            try:
+                # Cancellation can land between polls; include the last committed URL.
+                self._sync_worker_capture_progress(
+                    client, worker_task_id, job_id, machine_id,
+                    run_id=progress_run_id, position=progress_position,
+                )
+            except WorkerRequestError:
+                pass
         self._apply_worker_result(job_id, machine_id, task)
 
     def _sync_worker_capture_progress(
