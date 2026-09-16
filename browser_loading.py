@@ -183,7 +183,12 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
                         activity(params, now)
             elif method == "Network.requestWillBeSent":
                 url = params["request"]["url"]
-                event_key = (request_id, params.get("timestamp"), url)
+                # Driver logs and the cache-policy CDP session can timestamp
+                # the same blocked request differently. Its identity is stable
+                # even after loadingFailed has removed it from pending. Keep
+                # redirect timestamps to distinguish repeated hops to one URL.
+                event_key = (request_id, params.get("loaderId"), url,
+                             params.get("timestamp") if params.get("redirectResponse") else None)
                 if event_key in seen_request_events:
                     continue
                 frame_id = params.get("frameId")

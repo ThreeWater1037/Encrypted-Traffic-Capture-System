@@ -77,7 +77,6 @@ class PacketCaptureTests(unittest.TestCase):
         builder.build.return_value = driver
         with tempfile.TemporaryDirectory() as tmp, \
              patch.dict("wiki_fetcher.AVAILABLE_DRIVERS", {"chrome": builder}), \
-             patch("wiki_fetcher.wait_for_resources") as resource_wait, \
              patch.object(WikiFetcher, "_wait_for_normal_page", return_value={}) as normal_wait, \
              patch("wiki_fetcher.time.sleep"):
             fetcher = WikiFetcher(Path(tmp), ["chrome"], False)
@@ -86,10 +85,55 @@ class PacketCaptureTests(unittest.TestCase):
             self.assertIsNone(result.error)
             self.assertEqual(builder.build.call_args.kwargs, {})
             normal_wait.assert_called_once_with(driver)
-            resource_wait.assert_not_called()
             self.assertFalse((item_dir / "resource_status_chrome.json").exists())
             self.assertFalse(any(call.args[0] == "Network.setExtraHTTPHeaders"
                                  for call in driver.execute_cdp_cmd.call_args_list))
+
+    def test_hit_uses_shared_idle_and_recheck_with_legacy_blocks_and_404(self) -> None:
+        url = "https://today.hit.edu.cn/article/1266"
+        blocked = [{"url": f"https://{host}/old.png", "state": "failed",
+                    "blockedReason": "inspector", "error": "net::ERR_BLOCKED_BY_CLIENT"}
+                   for host in ("today2.hit.edu.cn", "myweb.hit.edu.cn")]
+        missing = {"url": "https://today.hit.edu.cn/missing.png", "status": 404,
+                   "state": "finished"}
+        for key, driver_class in (("chrome", webdriver.Chrome), ("edge", webdriver.Edge)):
+            with self.subTest(browser=key):
+                driver = MagicMock(spec=driver_class)
+                driver.command_executor = MagicMock()
+                driver.current_url = url
+                driver.title = "HIT"
+                driver.page_source = "<html>article</html>"
+                builder = MagicMock()
+                builder.build.return_value = driver
+                events = []
+                summary = {"pending_count": 0, "failed_requests": blocked,
+                           "requests": blocked + [missing], "idle_seconds": 0.5}
+                capture = MagicMock()
+                capture.summary = {}
+                capture.stop.side_effect = lambda: (events.append("stop") or Path("capture.pcap"))
+                driver.quit.side_effect = lambda: events.append("quit")
+                with tempfile.TemporaryDirectory() as tmp, \
+                     patch.dict("wiki_fetcher.AVAILABLE_DRIVERS", {key: builder}), \
+                     patch("wiki_fetcher.PacketCapture", return_value=capture), \
+                     patch("wiki_fetcher.NetworkIdleTracker") as tracker_type:
+                    tracker_type.return_value.wait.side_effect = lambda: (events.append("wait") or summary)
+                    fetcher = WikiFetcher(Path(tmp), [key], True)
+                    item_dir = fetcher._url_dir("hit")
+                    record = fetcher._fetch_with(url, key, item_dir)
+                    self.assertIsNone(record.error)
+                    self.assertEqual(builder.build.call_args.kwargs, {})
+                    tracker_type.assert_called_once_with(driver, idle_seconds=0.5)
+                    self.assertEqual(events, ["wait", "wait", "stop", "quit"])
+                    self.assertEqual(record.network_summary, summary)
+                    self.assertEqual(record.skipped_resources, [
+                        {"url": item["url"], "reason": "isolated_legacy_host"}
+                        for item in blocked])
+                    status = json.loads((item_dir / f"network_status_{key}.json").read_text("utf-8"))
+                    self.assertEqual(status["network_summary"]["requests"][-1], missing)
+                    self.assertTrue(any(c.args[0] == "Network.setBlockedURLs"
+                                        for c in driver.execute_cdp_cmd.call_args_list))
+                    self.assertFalse(any(c.args[0] == "Page.stopLoading"
+                                         for c in driver.execute_cdp_cmd.call_args_list))
 
     def test_network_wait_uses_configurable_quiet_window(self) -> None:
         driver = MagicMock(spec=webdriver.Edge)

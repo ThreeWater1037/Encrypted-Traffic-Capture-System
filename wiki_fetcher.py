@@ -47,7 +47,7 @@ from webdriver_manager.core.driver_cache import DriverCacheManager
 from browser_discovery import discover_browser
 from browser_proxy import BrowserProxy, parse_browser_proxy
 from browser_loading import (
-    HIT_LEGACY_HOSTS, NetworkIdleTracker, configure_uncached_network, wait_for_resources,
+    HIT_LEGACY_HOSTS, NetworkIdleTracker, configure_uncached_network,
 )
 from capture_readiness import CaptureReadinessMonitor, validate_capture_file
 
@@ -60,7 +60,7 @@ log = logging.getLogger(__name__)
 
 
 def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
-    """设置导航兜底；今日哈工大资源等待在 DOM 就绪后单独处理。"""
+    """设置导航兜底、无缓存策略和今日哈工大旧站资源屏蔽。"""
     # Must be shorter than the WebDriver HTTP transport timeout (120s).
     driver.set_page_load_timeout(90)
     if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
@@ -564,13 +564,11 @@ class ChromeDriver(BrowserDriver):
         key_log_path: Path,
         profile_dir: Path,
         proxy: BrowserProxy | None = None,
-        *, skip_stalled_resources: bool = False,
     ) -> webdriver.Chrome:
         """配置 Chrome 启动参数、驱动服务和 CDP 无缓存设置。"""
         opts = ChromeOptions()
         opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-        if skip_stalled_resources:
-            opts.page_load_strategy = "eager"
+        opts.page_load_strategy = "normal"
         binary = self._find_binary()
         if not binary:
             raise RuntimeError("Google Chrome/Chromium not found")
@@ -620,7 +618,6 @@ class EdgeDriver(BrowserDriver):
         key_log_path: Path,
         profile_dir: Path,
         proxy: BrowserProxy | None = None,
-        *, skip_stalled_resources: bool = False,
     ) -> webdriver.Edge:
         """配置 Edge 启动参数、驱动服务和 CDP 无缓存设置。"""
         binary = self._find_binary()
@@ -629,8 +626,7 @@ class EdgeDriver(BrowserDriver):
 
         opts = EdgeOptions()
         opts.set_capability("ms:loggingPrefs", {"performance": "ALL"})
-        if skip_stalled_resources:
-            opts.page_load_strategy = "eager"
+        opts.page_load_strategy = "normal"
         opts.binary_location = binary
         opts.add_argument(f"--user-data-dir={profile_dir}")
         opts.add_argument("--disable-application-cache")
@@ -985,7 +981,7 @@ class WikiFetcher:
         response_time_ms = 0.0
         error_html = ""
         skipped_resources = []
-        skip_stalled = (
+        block_legacy_resources = (
             driver_key in {"chrome", "edge"}
             and urlsplit(url).hostname == "today.hit.edu.cn"
         )
@@ -995,9 +991,8 @@ class WikiFetcher:
                 capture.start()
             phase_timings["capture_start"] = time.perf_counter() - fetch_started
             log.info("    Starting %s ...", bd.name)
-            build_options = {"skip_stalled_resources": True} if skip_stalled else {}
             phase_started = time.perf_counter()
-            driver = bd.build(browser_key_log, profile_dir, self.proxy, **build_options)
+            driver = bd.build(browser_key_log, profile_dir, self.proxy)
             phase_timings["browser_start"] = time.perf_counter() - phase_started
 
             t0 = time.perf_counter()
@@ -1011,10 +1006,7 @@ class WikiFetcher:
             phase_timings["navigation"] = time.perf_counter() - phase_started
 
             phase_started = time.perf_counter()
-            if skip_stalled:
-                wait_for_resources(driver, skipped_resources)
-            else:
-                network_summary = self._wait_for_normal_page(driver)
+            network_summary = self._wait_for_normal_page(driver)
             phase_timings["network_idle"] = time.perf_counter() - phase_started
 
             response_time_ms = (time.perf_counter() - t0) * 1000
@@ -1134,7 +1126,7 @@ class WikiFetcher:
             log.info("    Network idle: threshold=%.3fs pending=%s failed=%s",
                      self.network_idle_seconds, network_summary.get("pending_count"),
                      len(network_summary.get("failed_requests", [])))
-        if driver_key in {"chrome", "edge"} and not skip_stalled:
+        if driver_key in {"chrome", "edge"}:
             # A failed navigation has no completion checkpoint. Persist its
             # pending URLs too, so this attempt is diagnosable without reports.
             network_status_path = url_dir / f"network_status_{driver_key}.json"
@@ -1151,7 +1143,15 @@ class WikiFetcher:
         content_hash = hashlib.sha256(html.encode()).hexdigest() if html else ""
         html_length = len(html.encode())
 
-        if skip_stalled:
+        if block_legacy_resources:
+            # Preserve the existing exclusion report, using the shared request
+            # ledger instead of a separate wait or a five-second stall cutoff.
+            skipped_resources = [
+                {"url": item["url"], "reason": "isolated_legacy_host"}
+                for item in network_summary.get("failed_requests", [])
+                if urlsplit(item["url"]).hostname in HIT_LEGACY_HOSTS
+                and item.get("blockedReason") == "inspector"
+            ]
             # Always overwrite the per-page assessment, including a clean re-run.
             # Also keep append-only history for later filtering or recapture.
             assessment = {

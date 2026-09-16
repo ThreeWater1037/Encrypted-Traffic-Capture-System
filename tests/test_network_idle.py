@@ -73,6 +73,30 @@ class NetworkIdleTests(unittest.TestCase):
         self.assertEqual(len(result["cache_hit_requests"]), 1)
         self.assertTrue(result["cache_hit_requests"][0]["served_from_cache"])
 
+    def test_two_cdp_sessions_do_not_double_count_blocked_request_with_timestamp_jitter(self):
+        clock = [0.0]
+        url = "http://today2.hit.edu.cn/legacy.png"
+        first = [request("31108.6", 0, url=url),
+                 event("Network.loadingFailed", 0.000016, requestId="31108.6",
+                       errorText="", canceled=False, blockedReason="inspector")]
+        duplicate = [request("31108.6", 0.000018, url=url),
+                     event("Network.loadingFailed", 0.000024, requestId="31108.6",
+                           errorText="", canceled=False, blockedReason="inspector")]
+        driver = FakeDriver(clock, [(0, first)])
+        policy = driver._capture_cache_policy = MagicMock()
+        policy.drain_events.side_effect = [
+            [json.loads(e["message"])["message"] for e in duplicate],
+        ] + [[]] * 20
+        with patch("browser_loading.time.monotonic", side_effect=lambda: clock[0]), \
+             patch("browser_loading.time.sleep", side_effect=lambda t: clock.__setitem__(0, clock[0] + t)):
+            result = wait_for_network_idle(driver)
+        self.assertEqual(result["request_count"], 1)
+        self.assertEqual(result["pending_count"], 0)
+        self.assertEqual(len(result["failed_requests"]), 1)
+        self.assertEqual(result["failed_requests"][0]["request_id"], "31108.6")
+        self.assertEqual(result["failed_requests"][0]["blockedReason"], "inspector")
+        self.assertEqual(result["requests"][0]["started_timestamp"], 100.0)
+
     def test_related_worker_without_frame_id_is_included(self):
         clock = [0.0]
         driver = FakeDriver(clock, [])
@@ -244,6 +268,24 @@ class NetworkIdleTests(unittest.TestCase):
         self.assertEqual(result["finished_count"], 2)
         self.assertEqual(result["redirect_count"], 1)
         self.assertEqual(result["requests"][0]["status"], 302)
+
+    def test_same_url_redirects_keep_each_hop_despite_reusing_request_id(self):
+        url = "https://example.com/repeated-redirect"
+        result, _, duration = self.run_wait([
+            (0, [request("doc", 0, url=url, type="Document")]),
+            (0.1, [request("doc", 0.1, url=url, type="Document",
+                           redirectResponse={"status": 302, "url": url})]),
+            (0.2, [request("doc", 0.2, url=url, type="Document",
+                           redirectResponse={"status": 302, "url": url})]),
+            (0.3, [finished("doc", 0.3)]),
+        ])
+        self.assert_duration(duration, 0.8)
+        self.assertEqual(result["request_count"], 3)
+        self.assertEqual(result["redirect_count"], 2)
+        self.assertEqual(result["finished_count"], 3)
+        self.assertEqual(result["pending_count"], 0)
+        self.assertEqual([r["state"] for r in result["requests"]],
+                         ["redirected", "redirected", "finished"])
 
     def test_iframe_and_nested_frame_requests_are_included_and_removed_on_detach(self):
         result, _, duration = self.run_wait([
