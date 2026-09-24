@@ -342,14 +342,7 @@ class TaskManager:
             )
             self._append_log(log_path, f"task={task_id} canceled")
         except TaskTimedOutError as exc:
-            self.store.update_task(
-                task_id,
-                status="FAILED",
-                stage="TIMED_OUT",
-                error=str(exc),
-                pid=None,
-                finished_at=utc_now(),
-            )
+            self._finish_failed_task(task_dir, request_data, str(exc), "TIMED_OUT")
             self._append_log(log_path, f"task={task_id} timed out: {exc}")
         except TaskServiceStoppingError:
             self.store.update_task(
@@ -362,18 +355,35 @@ class TaskManager:
             )
             self._append_log(log_path, f"task={task_id} paused for service restart")
         except Exception as exc:
-            self.store.update_task(
-                task_id,
-                status="FAILED",
-                stage="FAILED",
-                error=f"{type(exc).__name__}: {exc}",
-                pid=None,
-                finished_at=utc_now(),
+            self._finish_failed_task(
+                task_dir, request_data, f"{type(exc).__name__}: {exc}", "FAILED"
             )
             self._append_log(
                 log_path,
                 f"task={task_id} failed: {type(exc).__name__}: {exc}",
             )
+
+    def _finish_failed_task(
+        self, task_dir: Path, request_data: dict[str, Any], error: str, stage: str
+    ) -> None:
+        """异常收尾也检查每个 URL 的产物，不把批次异常等同于全部失败。"""
+        manifest = None
+        try:
+            manifest = self._build_manifest(task_dir, request_data, [error])
+            with (task_dir / "manifest.json").open("w", encoding="utf-8") as stream:
+                json.dump(manifest, stream, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            # 清单文件写入失败时仍可把已生成的单元结果保存到数据库。
+            error = f"{error}; 结果清单保存异常: {type(exc).__name__}: {exc}"
+        self.store.update_task(
+            request_data["task_id"],
+            status=manifest["status"] if manifest else "FAILED",
+            stage=stage,
+            result_json=manifest,
+            error=error,
+            pid=None,
+            finished_at=utc_now(),
+        )
 
     @staticmethod
     def _write_task_inputs(task_dir: Path, request_data: dict[str, Any]) -> None:

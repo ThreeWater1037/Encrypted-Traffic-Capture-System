@@ -21,7 +21,7 @@ class MasterOpenApiTests(unittest.TestCase):
             "/api/v1/machines/{machine_id}/probe": {"post"},
             "/api/v1/jobs": {"get", "post"},
             "/api/v1/jobs/from-file": {"post"},
-            "/api/v1/jobs/{job_id}": {"get"},
+            "/api/v1/jobs/{job_id}": {"get", "delete"},
             "/api/v1/jobs/{job_id}/cancel": {"post"},
             "/api/v1/jobs/{job_id}/resume": {"post"},
             "/api/v1/jobs/{job_id}/restart": {"post"},

@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from .config import WorkerConfig
 
 
-TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+TASK_ID_RE = re.compile(r"^[^\W_][\w.-]{0,127}$")
 ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SNI_SUFFIX_RE = re.compile(
     r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
@@ -83,8 +83,8 @@ def validate_task_payload(payload: Any, config: WorkerConfig) -> dict[str, Any]:
         raise ValidationError(f"不支持的任务参数：{', '.join(unknown_keys)}")
 
     task_id = _clean_text(payload.get("task_id"), "task_id", max_length=128)
-    if not TASK_ID_RE.fullmatch(task_id):
-        raise ValidationError("task_id 只允许字母、数字、点、下划线和连字符")
+    if not TASK_ID_RE.fullmatch(task_id) or len(task_id.encode("utf-8")) > 240:
+        raise ValidationError("task_id 只允许中文等文字、数字、点、下划线和连字符，并以文字或数字开头，UTF-8 最长 240 字节")
 
     raw_items = payload.get("items")
     if not isinstance(raw_items, list):

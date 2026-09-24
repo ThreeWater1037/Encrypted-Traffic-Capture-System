@@ -3,8 +3,10 @@ import { reactive, ref } from 'vue'
 import { Pencil, Plus, RefreshCw, Server, ShieldCheck, Trash2, X } from '@lucide/vue'
 import StatusPill from '../components/StatusPill.vue'
 
-defineProps({ machines: { type: Array, default: () => [] } })
-const emit = defineEmits(['delete', 'probe', 'save'])
+const props = defineProps({ machines: { type: Array, default: () => [] }, saveMachine: { type: Function, required: true } })
+const emit = defineEmits(['delete', 'probe'])
+const saving = ref(false)
+const formError = ref('')
 const showForm = ref(false)
 const editingMachineId = ref(null)
 const form = reactive({ machine_id: '', name: '', base_url: 'http://127.0.0.1:5100', token: '', enabled: true })
@@ -15,11 +17,13 @@ function resetForm() {
 }
 
 function openAddForm() {
+  formError.value = ''
   resetForm()
   showForm.value = true
 }
 
 function openEditForm(machine) {
+  formError.value = ''
   editingMachineId.value = machine.machine_id
   Object.assign(form, {
     machine_id: machine.machine_id,
@@ -32,6 +36,7 @@ function openEditForm(machine) {
 }
 
 function closeForm() {
+  if (saving.value) return
   showForm.value = false
   resetForm()
 }
@@ -41,7 +46,10 @@ function confirmDelete(machine) {
   if (confirmed) emit('delete', machine.machine_id)
 }
 
-function submit() {
+async function submit() {
+  if (saving.value) return
+  saving.value = true
+  formError.value = ''
   const payload = {
     machine_id: form.machine_id,
     name: form.name || form.machine_id,
@@ -50,8 +58,13 @@ function submit() {
   }
   // 编辑时 Token 留空表示保留主控中已有的密钥，避免前端读取或回显敏感信息。
   if (form.token) payload.token = form.token
-  emit('save', payload)
-  closeForm()
+  try {
+    await props.saveMachine(payload)
+    saving.value = false
+    closeForm()
+  } catch (reason) {
+    formError.value = reason.message || String(reason)
+  } finally { saving.value = false }
 }
 </script>
 
@@ -91,17 +104,18 @@ function submit() {
             <h3>{{ editingMachineId ? '编辑 Worker' : '添加 Worker' }}</h3>
             <p>{{ editingMachineId ? '可修改名称、地址、启用状态；Token 留空时保持不变。' : '本机之外的机器只需替换 IP 与 Token。' }}</p>
           </div>
-          <button type="button" class="icon-button" @click="closeForm"><X :size="17" /></button>
+          <button type="button" class="icon-button" aria-label="关闭机器编辑" :disabled="saving" @click="closeForm"><X :size="17" /></button>
         </header>
-        <label class="field"><span>机器 ID</span><input v-model="form.machine_id" required :disabled="Boolean(editingMachineId)" placeholder="win-lab-01" /></label>
-        <label class="field"><span>显示名称</span><input v-model="form.name" placeholder="Windows 实验机" /></label>
-        <label class="field"><span>Worker 地址</span><input v-model="form.base_url" required placeholder="http://192.168.1.20:5100" /></label>
+        <label class="field"><span>机器 ID</span><input v-model="form.machine_id" required :disabled="saving || Boolean(editingMachineId)" placeholder="win-lab-01" /></label>
+        <label class="field"><span>显示名称</span><input v-model="form.name" :disabled="saving" placeholder="Windows 实验机" /></label>
+        <label class="field"><span>Worker 地址</span><input v-model="form.base_url" required :disabled="saving" placeholder="http://192.168.1.20:5100" /></label>
         <label class="field">
           <span>Worker Token</span>
-          <input v-model="form.token" :required="!editingMachineId" type="password" autocomplete="new-password" :placeholder="editingMachineId ? '留空表示保持原 Token' : '请输入 Worker Token'" />
+          <input v-model="form.token" :disabled="saving" :required="!editingMachineId" type="password" autocomplete="new-password" :placeholder="editingMachineId ? '留空表示保持原 Token' : '请输入 Worker Token'" />
         </label>
-        <label class="check-line machine-enabled"><input v-model="form.enabled" type="checkbox" />启用这台机器</label>
-        <button class="primary-button" type="submit">{{ editingMachineId ? '保存修改' : '保存机器' }}</button>
+        <label class="check-line machine-enabled"><input v-model="form.enabled" :disabled="saving" type="checkbox" />启用这台机器</label>
+        <p v-if="formError" class="inline-error" role="alert">{{ formError }}</p>
+        <button class="primary-button" type="submit" :disabled="saving">{{ saving ? '保存中…' : (editingMachineId ? '保存修改' : '保存机器') }}</button>
       </form>
     </div>
   </div>

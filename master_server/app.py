@@ -19,7 +19,7 @@ from .dispatcher import (
     summarize_job,
 )
 from .schema import ValidationError, parse_uploaded_input, validate_job, validate_machine
-from .store import MasterStore, TERMINAL_STATUSES, utc_now
+from .store import JOB_SORT_ORDERS, MasterStore, TERMINAL_STATUSES, utc_now
 from .worker_client import WorkerClient, WorkerRequestError
 
 
@@ -63,7 +63,7 @@ def _create_job(
     source_content: bytes | None = None,
 ):
     normalized = validate_job(payload, max_items=config.max_items)
-    if store.get_job_status(normalized["job_id"]) is not None:
+    if store.job_id_exists(normalized["job_id"]):
         raise sqlite3.IntegrityError(f"job_id {normalized['job_id']} 已存在")
     missing: list[str] = []
     disabled: list[str] = []
@@ -294,9 +294,22 @@ def create_app(
     def list_jobs():
         try:
             limit = min(500, max(1, int(request.args.get("limit", "100"))))
+            offset = max(0, int(request.args.get("offset", "0")))
         except ValueError:
-            raise ValidationError("limit 必须是整数")
-        return jsonify({"jobs": [summarize_job(item) for item in master_store.list_jobs(limit=limit)]})
+            raise ValidationError("offset 和 limit 必须是整数")
+        status = request.args.get("status", "ALL")
+        query = request.args.get("query", "")
+        sort = request.args.get("sort", "created_desc")
+        if sort not in JOB_SORT_ORDERS:
+            raise ValidationError("sort 必须为 " + "、".join(JOB_SORT_ORDERS))
+        counts = master_store.job_list_counts(status=status, query=query)
+        offset = min(offset, max(0, (counts["total"] - 1) // limit) * limit)
+        jobs = master_store.list_jobs(limit=limit, offset=offset, status=status, query=query, sort=sort)
+        return jsonify({
+            "jobs": [summarize_job(item) for item in jobs],
+            "page": {"offset": offset, "limit": limit, "total": counts["total"], "returned": len(jobs), "sort": sort},
+            "running_count": counts["running"],
+        })
 
     @app.get("/api/v1/jobs/<job_id>")
     def get_job(job_id: str):
@@ -315,6 +328,15 @@ def create_app(
         if job is None:
             return jsonify({"error": "not_found", "message": "任务不存在"}), 404
         return jsonify(summarize_job(job))
+
+    @app.delete("/api/v1/jobs/<job_id>")
+    def delete_job(job_id: str):
+        result = master_store.delete_job(job_id)
+        if result == "missing":
+            return jsonify({"error": "not_found", "message": "任务不存在"}), 404
+        if result == "active":
+            return jsonify({"error": "job_still_active", "message": "运行中的任务不能删除，请先取消或等待任务结束"}), 409
+        return jsonify({"job_id": job_id, "deleted": True, "resources_preserved": True})
 
     @app.post("/api/v1/jobs/<job_id>/cancel")
     def cancel_job(job_id: str):
@@ -423,7 +445,7 @@ def create_app(
             machine = master_store.get_machine(target["machine_id"])
             if machine is None:
                 continue
-            worker_task_id = MasterStore.worker_task_id(job_id, target["machine_id"])
+            worker_task_id = master_store.get_worker_task_id(job_id, target["machine_id"])
             client = WorkerClient(
                 machine["base_url"], machine["token"], timeout=master_config.worker_request_timeout
             )

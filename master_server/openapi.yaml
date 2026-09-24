@@ -117,6 +117,21 @@ paths:
       security: [{ bearerAuth: [] }]
       parameters:
         - in: query
+          name: sort
+          description: 在全量筛选结果上排序后分页，默认最新创建在前
+          schema: { type: string, enum: [created_desc, created_asc, updated_desc, name_asc, name_desc, status], default: created_desc }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+        - in: query
+          name: status
+          description: 按任务状态筛选；ALL 表示全部
+          schema: { type: string, default: ALL }
+        - in: query
+          name: query
+          description: 搜索任务名称或 ID，不区分大小写
+          schema: { type: string }
+        - in: query
           name: limit
           schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
       responses:
@@ -130,6 +145,16 @@ paths:
                   jobs:
                     type: array
                     items: { $ref: '#/components/schemas/Job' }
+                  running_count:
+                    type: integer
+                    description: 全库非终态任务数，不受筛选和分页影响
+                  page:
+                    type: object
+                    properties:
+                      offset: { type: integer }
+                      limit: { type: integer }
+                      total: { type: integer }
+                      returned: { type: integer }
     post:
       tags: [Jobs]
       operationId: createJob
@@ -187,6 +212,25 @@ paths:
   /api/v1/jobs/{job_id}:
     parameters:
       - $ref: '#/components/parameters/JobId'
+    delete:
+      tags: [Jobs]
+      operationId: deleteJob
+      summary: 从列表软删除已结束任务，保留服务器资源
+      description: 仅标记 Master 记录为已删除，保留执行映射、上传文件与 Worker 的文件及任务记录；任务 ID 不可复用。运行中的任务须先取消。重复删除返回成功。
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: 已删除，资源保留
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string }
+                  deleted: { type: boolean }
+                  resources_preserved: { type: boolean }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
     get:
       tags: [Jobs]
       operationId: getJob
@@ -203,7 +247,7 @@ paths:
           schema: { type: string }
         - in: query
           name: status
-          description: unit=url 时，匹配任一执行单元具有此状态的 URL；ALL 表示全部
+          description: unit=url 时，匹配任一执行单元具有此状态的 URL；CAPTURED 也匹配已保留的采集完成证据或通过的 checkpoint 检查；ALL 表示全部
           schema: { type: string, default: ALL }
         - in: query
           name: offset
@@ -425,7 +469,7 @@ components:
       type: object
       required: [name, items, targets]
       properties:
-        job_id: { type: string, description: 留空时由主控生成 }
+        job_id: { type: string, description: 留空时按安全处理后的任务名称加 16 位哈希生成，同名任务使用独立哈希；支持中文，最多 64 字符。显式指定的旧 ID 保持兼容。 }
         name: { type: string }
         items:
           type: array

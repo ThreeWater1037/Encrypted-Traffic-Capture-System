@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import datetime, timezone
+import hashlib
 from typing import Any
 from urllib.parse import urlsplit
 
 
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+JOB_ID_RE = re.compile(r"^[^\W_][\w.-]{0,63}$")
 ALLOWED_BROWSERS = ("chrome", "edge", "firefox")
 ALLOWED_STEPS = ("extract", "classify", "infer")
 
@@ -18,10 +19,19 @@ class ValidationError(ValueError):
     """可安全返回给调用方的参数错误。"""
 
 
-def new_job_id() -> str:
-    """生成可同时用于主控和 Worker 的短任务 ID。"""
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return f"job-{stamp}-{uuid.uuid4().hex[:8]}"
+def named_task_id(name: str, seed: str) -> str:
+    """保留可读名称，限制字符和 UTF-8 字节长度，并使用独立哈希防重。"""
+    slug = "".join(char if char.isalnum() or char in "._-" else "-" for char in name)
+    slug = re.sub(r"-+", "-", slug).strip("._-")
+    if re.match(r"^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)", slug, re.IGNORECASE):
+        slug = f"task-{slug}"
+    slug = slug[:47].encode("utf-8")[:96].decode("utf-8", errors="ignore").rstrip("._-") or "task"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    return f"{slug}-{digest}"
+
+
+def new_job_id(name: str = "task") -> str:
+    return named_task_id(name, uuid.uuid4().hex)
 
 
 def _text(value: Any, field: str, *, maximum: int) -> str:
@@ -91,11 +101,11 @@ def validate_job(payload: Any, *, max_items: int) -> dict[str, Any]:
     if unknown:
         raise ValidationError(f"不支持的任务参数：{', '.join(unknown)}")
 
-    job_id = payload.get("job_id") or new_job_id()
+    name = _text(payload.get("name", payload.get("job_id") or "任务"), "name", maximum=120)
+    job_id = payload.get("job_id") or new_job_id(name)
     job_id = _text(job_id, "job_id", maximum=64)
-    if not ID_RE.fullmatch(job_id):
-        raise ValidationError("job_id 只允许字母、数字、点、下划线和连字符")
-    name = _text(payload.get("name", job_id), "name", maximum=120)
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise ValidationError("job_id 只允许中文等文字、数字、点、下划线和连字符，并以文字或数字开头")
 
     raw_items = payload.get("items")
     if not isinstance(raw_items, list) or not 1 <= len(raw_items) <= max_items:

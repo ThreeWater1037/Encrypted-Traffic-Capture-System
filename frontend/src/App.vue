@@ -1,277 +1,30 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import {
-  Activity,
-  FlaskConical,
-  History,
-  LayoutDashboard,
-  RefreshCw,
-  Server,
-  ShieldCheck,
-  Wifi,
-  WifiOff,
-} from '@lucide/vue'
+import { onBeforeUnmount, onMounted } from 'vue'
+import { Activity, FlaskConical, History, LayoutDashboard, RefreshCw, Server, ShieldCheck, WifiOff } from '@lucide/vue'
 import WorkspaceView from './views/WorkspaceView.vue'
 import JobsView from './views/JobsView.vue'
 import MachinesView from './views/MachinesView.vue'
-import {
-  cancelJob,
-  createFileJob,
-  createJsonJob,
-  deleteMachine,
-  getHealth,
-  getJob,
-  getJobLogs,
-  getJobs,
-  getMachines,
-  probeMachine,
-  restartJob,
-  resumeJob,
-  saveMachine,
-} from './services/api'
+import * as api from './services/api'
+import { createConsoleState } from './services/consoleState'
 
-const activeView = ref('workspace')
-const health = ref(null)
-const machines = ref([])
-const jobs = ref([])
-const selectedJob = ref(null)
-const jobPageOptions = ref({})
-const jobPageLoading = ref(false)
-let jobRequestVersion = 0
-
-async function refreshSelectedJob(jobId = selectedJob.value?.job_id) {
-  if (!jobId) return
-  const version = ++jobRequestVersion
-  jobPageLoading.value = true
-  try {
-    const job = await getJob(jobId, jobPageOptions.value)
-    if (version === jobRequestVersion) selectedJob.value = job
-  } finally {
-    if (version === jobRequestVersion) jobPageLoading.value = false
-  }
-}
-
-async function handleJobPage(options) {
-  jobPageOptions.value = options
-  try { await refreshSelectedJob() } catch (reason) { showError(reason) }
-}
-const selectedLogs = ref([])
-const selectedLogJobId = ref('')
-const logsLoading = ref(false)
-const loading = ref(false)
-const refreshing = ref(false)
-const message = ref('')
-const error = ref('')
-
+const {
+  activeView, health, connectionError, lastUpdated, machines, machinesLoaded, jobs,
+  jobListOptions, jobListPage, jobListLoading, jobListError, runningCount,
+  selectedJobId, selectedJob, jobPageOptions, jobPageLoading, jobPageError,
+  selectedLogs, logsLoading, loading, refreshing, message, error, actionBusy,
+  loadInitialData, refreshDashboard, handleSubmit, handleSelectJob, handleJobPage,
+  handleJobListPage, handleCancel, handleResume, handleRestart, handleDeleteJob, handleLogs,
+  handleProbe, handleSaveMachine, handleDeleteMachine,
+} = createConsoleState(api)
 const navItems = [
   { id: 'workspace', label: '实验工作台', icon: LayoutDashboard },
   { id: 'jobs', label: '任务与结果', icon: History },
   { id: 'machines', label: '机器管理', icon: Server },
 ]
-
-const runningCount = computed(() =>
-  jobs.value.filter((job) => !['SUCCEEDED', 'PARTIAL', 'FAILED', 'CANCELED', 'INTERRUPTED'].includes(job.status)).length,
-)
-
-function notify(text) {
-  message.value = text
-  window.setTimeout(() => { message.value = '' }, 2800)
-}
-
-function showError(reason) {
-  error.value = reason?.message || String(reason)
-  window.setTimeout(() => { error.value = '' }, 5000)
-}
-
-async function loadMachines({ probeUnknown = false } = {}) {
-  const response = await getMachines()
-  machines.value = response.machines
-  if (probeUnknown) {
-    const unknown = machines.value.filter((machine) => machine.enabled && machine.status === 'UNKNOWN')
-    if (unknown.length) {
-      await Promise.allSettled(unknown.map((machine) => probeMachine(machine.machine_id)))
-      machines.value = (await getMachines()).machines
-    }
-  }
-}
-
-async function loadJobs() {
-  jobs.value = (await getJobs()).jobs
-}
-
-async function loadInitialData() {
-  loading.value = true
-  try {
-    const [healthData] = await Promise.all([
-      getHealth(),
-      loadMachines({ probeUnknown: true }),
-      loadJobs(),
-    ])
-    health.value = healthData
-  } catch (reason) {
-    showError(reason)
-  } finally {
-    loading.value = false
-  }
-}
-
-async function refreshDashboard(manual = false) {
-  if (refreshing.value) return
-  refreshing.value = true
-  try {
-    const requests = [
-      getHealth().then((data) => { health.value = data }),
-      loadMachines(),
-      loadJobs(),
-    ]
-    if (selectedJob.value) requests.push(refreshSelectedJob())
-    const results = await Promise.allSettled(requests)
-    const failed = results.find((result) => result.status === 'rejected')
-    if (failed) throw failed.reason
-    if (manual) notify('已刷新任务进度')
-  } catch (reason) {
-    if (manual) showError(reason)
-  } finally {
-    refreshing.value = false
-  }
-}
-
-async function handleSubmit(submission) {
-  loading.value = true
-  try {
-    const job = submission.kind === 'file'
-      ? await createFileJob(submission.form)
-      : await createJsonJob(submission.payload)
-    await loadJobs()
-    selectedJob.value = job
-    jobPageOptions.value = {}
-    await refreshSelectedJob(job.job_id)
-    selectedLogs.value = []
-    selectedLogJobId.value = ''
-    activeView.value = 'jobs'
-    notify(`任务 ${job.job_id} 已提交`)
-  } catch (reason) {
-    showError(reason)
-  } finally {
-    loading.value = false
-  }
-}
-
-async function handleSelectJob(jobId) {
-  try {
-    if (jobId !== selectedJob.value?.job_id) jobPageOptions.value = {}
-    await refreshSelectedJob(jobId)
-    selectedLogs.value = []
-    selectedLogJobId.value = ''
-  } catch (reason) {
-    showError(reason)
-  }
-}
-
-async function handleCancel(jobId) {
-  try {
-    await cancelJob(jobId)
-    await refreshSelectedJob(jobId)
-    await loadJobs()
-    notify('取消请求已发送')
-  } catch (reason) {
-    showError(reason)
-  }
-}
-
-async function handleResume(jobId) {
-  loading.value = true
-  try {
-    await resumeJob(jobId)
-    await refreshSelectedJob(jobId)
-    await loadJobs()
-    notify('已从原任务检查点继续')
-  } catch (reason) {
-    showError(reason)
-  } finally {
-    loading.value = false
-  }
-}
-
-async function handleRestart(jobId) {
-  loading.value = true
-  try {
-    const job = await restartJob(jobId)
-    await loadJobs()
-    selectedJob.value = job
-    jobPageOptions.value = {}
-    await refreshSelectedJob(job.job_id)
-    selectedLogs.value = []
-    selectedLogJobId.value = ''
-    notify(`新一轮任务 ${job.job_id} 已创建`)
-  } catch (reason) {
-    showError(reason)
-  } finally {
-    loading.value = false
-  }
-}
-
-async function loadSelectedLogs(jobId) {
-  if (logsLoading.value) return
-  logsLoading.value = true
-  try {
-    const response = await getJobLogs(jobId)
-    if (selectedLogJobId.value === jobId) {
-      selectedLogs.value = response.logs.map((entry) => {
-        if (entry.error || entry.tail_lines === 10) return entry
-        return { ...entry, text: '', error: '日志接口尚未更新，请更新 Master 和 Worker 后重试' }
-      })
-    }
-  } catch (reason) {
-    showError(reason)
-  } finally {
-    logsLoading.value = false
-  }
-}
-
-async function handleLogs(jobId) {
-  selectedLogJobId.value = jobId
-  await loadSelectedLogs(jobId)
-}
-
-async function handleProbe(machineId) {
-  try {
-    await probeMachine(machineId)
-    await loadMachines()
-    notify('机器能力已刷新')
-  } catch (reason) {
-    await loadMachines()
-    showError(reason)
-  }
-}
-
-async function handleSaveMachine(payload) {
-  try {
-    await saveMachine(payload)
-    await loadMachines()
-    notify('机器配置已保存')
-  } catch (reason) {
-    showError(reason)
-  }
-}
-
-async function handleDeleteMachine(machineId) {
-  try {
-    await deleteMachine(machineId)
-    await loadMachines()
-    notify('机器已删除')
-  } catch (reason) {
-    showError(reason)
-  }
-}
-
 let pollTimer
 onMounted(() => {
   loadInitialData()
-  pollTimer = window.setInterval(async () => {
-    if (!runningCount.value && !selectedJob.value) return
-    await refreshDashboard()
-  }, 5 * 60 * 1000)
+  pollTimer = window.setInterval(() => refreshDashboard(), 5 * 60 * 1000)
 })
 onBeforeUnmount(() => window.clearInterval(pollTimer))
 </script>
@@ -301,7 +54,7 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
         <div :class="['status-dot', health ? 'online' : 'offline']"></div>
         <div>
           <strong>{{ health ? '主控运行中' : '主控未连接' }}</strong>
-          <small>127.0.0.1:5200</small>
+          <small class="api-address" :title="api.API_BASE">{{ api.API_BASE }}</small>
         </div>
       </div>
     </aside>
@@ -321,17 +74,27 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
       </header>
 
       <section class="page-content">
+        <p v-if="connectionError" class="load-error" role="alert">主控未连接，当前数据可能已过期：{{ connectionError }}</p>
+        <p v-if="lastUpdated" class="update-time">主控最近连接成功：{{ lastUpdated }}</p>
         <WorkspaceView
           v-show="activeView === 'workspace'"
           :machines="machines"
+          :machines-loaded="machinesLoaded"
           :loading="loading"
           @submit="handleSubmit"
           @probe="handleProbe"
         />
         <JobsView
-          :key="selectedJob?.job_id || 'no-job'"
-          v-if="activeView === 'jobs'"
+          v-show="activeView === 'jobs'"
           :jobs="jobs"
+          :selected-job-id="selectedJobId"
+          :list-options="jobListOptions"
+          :list-page="jobListPage"
+          :list-loading="jobListLoading"
+          :list-error="jobListError"
+          :page-error="jobPageError"
+          :action-busy="actionBusy"
+          @list-page="handleJobListPage"
           :selected-job="selectedJob"
           :logs="selectedLogs"
           :logs-loading="logsLoading"
@@ -343,24 +106,25 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
           @cancel="handleCancel"
           @resume="handleResume"
           @restart="handleRestart"
+          @delete="handleDeleteJob"
           @logs="handleLogs"
           @refresh="refreshDashboard(true)"
         />
         <MachinesView
-          v-if="activeView === 'machines'"
+          v-show="activeView === 'machines'"
           :machines="machines"
           @delete="handleDeleteMachine"
           @probe="handleProbe"
-          @save="handleSaveMachine"
+          :save-machine="handleSaveMachine"
         />
       </section>
     </main>
 
     <transition name="toast">
-      <div v-if="message" class="toast success"><ShieldCheck :size="17" />{{ message }}</div>
+      <div v-if="message" class="toast success"><ShieldCheck :size="17" />{{ message }}<button aria-label="关闭提示" @click="message = ''">×</button></div>
     </transition>
     <transition name="toast">
-      <div v-if="error" class="toast error"><WifiOff :size="17" />{{ error }}</div>
+      <div v-if="error" class="toast error"><WifiOff :size="17" />{{ error }}<button aria-label="关闭错误提示" @click="error = ''">×</button></div>
     </transition>
   </div>
 </template>

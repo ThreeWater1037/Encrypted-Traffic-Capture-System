@@ -500,7 +500,7 @@ class MasterServerTests(unittest.TestCase):
             response = self.client.get(f"/api/v1/jobs/{job_id}/logs?tail_lines=10")
         self.assertEqual(response.status_code, 200)
         get_log.assert_called_once_with(
-            MasterStore.worker_task_id(job_id, "worker-local"),
+            self.store.get_worker_task_id(job_id, "worker-local"),
             offset=0, limit=65536, tail_lines=10,
         )
         self.assertEqual(response.get_json()["logs"][0]["tail_lines"], 10)

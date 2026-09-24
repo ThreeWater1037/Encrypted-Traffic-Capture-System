@@ -2,8 +2,9 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { FileUp, Globe2, Play, Plus, RefreshCw, Server, ShieldCheck, Trash2 } from '@lucide/vue'
 import StatusPill from '../components/StatusPill.vue'
+import { validTargets, parseTableItems } from '../services/workspace'
 
-const props = defineProps({ machines: { type: Array, default: () => [] }, loading: Boolean })
+const props = defineProps({ machines: { type: Array, default: () => [] }, machinesLoaded: Boolean, loading: Boolean })
 const emit = defineEmits(['submit', 'probe'])
 
 const DRAFT_KEY = 'flowlab.workspace.draft.v2'
@@ -23,7 +24,7 @@ function loadDraft() {
 
 const draft = loadDraft()
 const restoredRows = Array.isArray(draft.inputRows) && draft.inputRows.length
-  ? draft.inputRows.map((row) => ({
+  ? draft.inputRows.filter((row) => row && typeof row === 'object').map((row) => ({
       id: typeof row.id === 'string' ? row.id : '',
       name: typeof row.name === 'string' ? row.name : '',
       url: typeof row.url === 'string' ? row.url : '',
@@ -45,23 +46,23 @@ const selections = reactive(draft.selections && typeof draft.selections === 'obj
 const localError = ref('')
 
 const enabledMachines = computed(() => props.machines.filter((machine) => machine.enabled))
-const selectedCount = computed(() => Object.values(selections).filter((browsers) => browsers?.length).length)
+const selectedCount = computed(() => validTargets(props.machines, selections).length)
 
 function browserNames(machine) {
   return machine.capabilities?.browsers?.map((browser) => browser.name) || []
 }
 
-watch(() => props.machines, (machines) => {
-  for (const machine of machines) {
-    if (!(machine.machine_id in selections)) selections[machine.machine_id] = []
-    const available = browserNames(machine)
-    selections[machine.machine_id] = selections[machine.machine_id].filter((item) => available.includes(item))
-  }
-  const hasSelection = Object.values(selections).some((items) => items.length)
-  if (!hasSelection) {
+let selectionsInitialized = false
+watch([() => props.machines, () => props.machinesLoaded], ([machines, loaded]) => {
+  if (!loaded) return
+  const targets = validTargets(machines, selections)
+  for (const id of Object.keys(selections)) delete selections[id]
+  for (const target of targets) selections[target.machine_id] = target.browsers
+  if (!selectionsInitialized && !targets.length) {
     const first = machines.find((machine) => machine.enabled && ['ONLINE', 'BUSY'].includes(machine.status) && browserNames(machine).length)
     if (first) selections[first.machine_id] = [browserNames(first).includes('chrome') ? 'chrome' : browserNames(first)[0]]
   }
+  selectionsInitialized = true
 }, { immediate: true, deep: true })
 
 // 保存可序列化的工作台草稿；浏览器禁止恢复本地文件选择，因此不保存 selectedFile。
@@ -114,40 +115,21 @@ function removeRow(index) {
   inputRows.value.splice(index, 1)
 }
 
-function parseTableItems() {
-  const items = []
-  const usedIds = new Set()
-  for (const [index, source] of inputRows.value.entries()) {
-    const item = { id: source.id.trim(), name: source.name.trim(), url: source.url.trim() }
-    if (!item.id && !item.name && !item.url) continue
-    if (!item.id || !item.name || !item.url) throw new Error(`第 ${index + 1} 行的 ID、名称和 URL 必须全部填写`)
-    if (usedIds.has(item.id)) throw new Error(`第 ${index + 1} 行的 ID 与前面重复：${item.id}`)
-    try {
-      const parsed = new URL(item.url)
-      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error()
-    } catch {
-      throw new Error(`第 ${index + 1} 行不是有效的 HTTP/HTTPS URL`)
-    }
-    usedIds.add(item.id)
-    items.push(item)
-  }
-  return items
-}
-
 function targetPayload() {
-  return Object.entries(selections)
-    .filter(([, browsers]) => browsers.length)
-    .map(([machine_id, browsers]) => ({ machine_id, browsers }))
+  return validTargets(props.machines, selections)
 }
 
 function submit() {
   localError.value = ''
+  if (props.loading) return
   try {
+    if (!props.machinesLoaded) throw new Error('机器列表尚未加载成功，请刷新后重试')
+    if (!jobName.value.trim()) throw new Error('请填写任务名称')
     const targets = targetPayload()
     if (!targets.length) throw new Error('请至少选择一台机器和一个浏览器')
     const analysis = {
       steps: pcap.value ? Object.entries(steps).filter(([, enabled]) => enabled).map(([name]) => name) : [],
-      with_coframe: withCoframe.value,
+      with_coframe: pcap.value && steps.infer && withCoframe.value,
       sni_suffixes: sniSuffixes.value.split(',').map((value) => value.trim()).filter(Boolean),
     }
     const outputs = { html: saveHtml.value, reports: saveReports.value }
@@ -166,7 +148,7 @@ function submit() {
       emit('submit', { kind: 'file', form })
       return
     }
-    const items = parseTableItems()
+    const items = parseTableItems(inputRows.value)
     if (!items.length) throw new Error('请输入至少一个 URL')
     emit('submit', { kind: 'json', payload: { name: jobName.value, items, targets, pcap: pcap.value, outputs, analysis } })
   } catch (reason) {
@@ -195,9 +177,10 @@ function submit() {
         <small class="table-tip">空白行会自动忽略；提交前会检查必填项、重复 ID 和 URL 格式。</small>
       </div>
       <label v-else class="upload-zone">
-        <FileUp :size="28" /><strong>{{ selectedFile?.name || '选择 TXT / TSV 文件' }}</strong><small>UTF-8 编码，大小与条数上限由主控配置；文件先上传到主控</small>
+        <FileUp :size="28" /><strong>{{ selectedFile?.name || '选择 TXT / TSV 文件' }}</strong><small>UTF-8 编码，每行：ID〈Tab〉名称〈Tab〉完整 URL；以 # 开头的行为注释</small>
         <input type="file" accept=".txt,.tsv,text/plain,text/tab-separated-values" @change="selectedFile = $event.target.files[0]" />
       </label>
+      <p v-if="mode === 'file'" class="table-tip">示例：1〈Tab〉Example〈Tab〉https://example.com/。请使用真正的制表符，大小与条数上限由主控配置。</p>
     </section>
 
     <section class="panel target-panel">
@@ -237,7 +220,7 @@ function submit() {
       </div>
       <div class="options-two">
         <label class="field"><span>SNI 后缀过滤（逗号分隔）</span><input v-model="sniSuffixes" placeholder="留空表示不过滤" /></label>
-        <label class="check-line"><input v-model="withCoframe" type="checkbox" />启用 coframe 分析</label>
+        <label class="check-line"><input v-model="withCoframe" :disabled="!pcap || !steps.infer" type="checkbox" />启用 coframe 分析</label>
       </div>
       <div class="no-cache-note"><ShieldCheck :size="16" /><div><strong>无缓存模式已固定启用</strong><small>主控和 Worker 均返回 no-store；每次实验创建全新任务目录与浏览器配置。</small></div></div>
     </section>
@@ -245,7 +228,7 @@ function submit() {
     <footer class="submit-bar">
       <div><Globe2 :size="18" /><span>任务将通过主控分发，实验文件保存在各 Worker 本地</span></div>
       <span v-if="localError" class="inline-error">{{ localError }}</span>
-      <button class="primary-button" :disabled="loading" @click="submit"><Play :size="16" />{{ loading ? '提交中…' : '创建实验任务' }}</button>
+      <button class="primary-button" :disabled="loading || !machinesLoaded" @click="submit"><Play :size="16" />{{ loading ? '提交中…' : '创建实验任务' }}</button>
     </footer>
   </div>
 </template>

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
@@ -76,7 +76,7 @@ class WorkerClient:
     def get_task(self, task_id: str) -> dict[str, Any]:
         return self._request(
             "GET",
-            f"/api/v1/tasks/{task_id}?compact=true&include_result=false",
+            f"/api/v1/tasks/{quote(task_id, safe='')}?compact=true&include_result=false",
         )
 
     def get_capture_progress(
@@ -95,23 +95,23 @@ class WorkerClient:
             query_values["run_id"] = run_id
         return self._request(
             "GET",
-            f"/api/v1/tasks/{task_id}/progress?{urlencode(query_values)}",
+            f"/api/v1/tasks/{quote(task_id, safe='')}/progress?{urlencode(query_values)}",
         )
 
     def get_result(self, task_id: str) -> dict[str, Any]:
         return self._request(
             "GET",
-            f"/api/v1/tasks/{task_id}/result?compact=true",
+            f"/api/v1/tasks/{quote(task_id, safe='')}/result?compact=true",
             timeout=max(self.timeout, 600.0),
         )
 
     def cancel_task(self, task_id: str) -> dict[str, Any]:
-        return self._request("POST", f"/api/v1/tasks/{task_id}/cancel")
+        return self._request("POST", f"/api/v1/tasks/{quote(task_id, safe='')}/cancel")
 
     def resume_task(self, task_id: str, resume_token: str) -> dict[str, Any]:
         return self._request(
             "POST",
-            f"/api/v1/tasks/{task_id}/resume",
+            f"/api/v1/tasks/{quote(task_id, safe='')}/resume",
             {"resume_token": resume_token},
         )
 
@@ -123,7 +123,7 @@ class WorkerClient:
         if tail_lines is not None:
             parameters["tail_lines"] = tail_lines
         query = urlencode(parameters)
-        result = self._request("GET", f"/api/v1/tasks/{task_id}/log?{query}")
+        result = self._request("GET", f"/api/v1/tasks/{quote(task_id, safe='')}/log?{query}")
         if tail_lines is not None and result.get("tail_lines") != tail_lines:
             raise WorkerRequestError("Worker 尚不支持读取最新日志，请更新 Worker 后重试")
         return result

@@ -44,3 +44,42 @@ main { min-width: 0; }.topbar { height: 86px; display: flex; align-items: center
 .url-pagination > div { flex-wrap: wrap; }
 .url-pagination input { width: 66px; }
 .url-pagination button:disabled { opacity: .45; cursor: not-allowed; }
+
+/* Result text must remain readable and selectable in narrow windows. */
+body { min-width: 360px; }
+.api-address { display: block; overflow-wrap: anywhere; }
+.load-error { margin: 10px 0; padding: 12px; color: #a33440; background: #fff1f2; border-radius: 6px; overflow-wrap: anywhere; font-size: 13px; }
+.update-time { color: #607088; font-size: 12px; margin: 8px 0; }
+.status-pill, .job-list-item code, .job-meta, .execution-card small, .execution-card span,
+.execution-card p, .machine-card dl > div, .machine-card footer, .machine-card header code,
+.log-meta span, .log-meta strong, .metric-card span, .metric-card small, .table-tip { font-size: 12px; }
+.job-title-row strong, .result-url strong, .execution-card strong { font-size: 13px; }
+.result-url a, .logs-panel pre { font-size: 12px; }
+.artifact-path { grid-column: 1 / -1; min-width: 0; }
+.artifact-path:empty { display: none; }
+.artifact-path code { display: block; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; user-select: text; }
+.artifact-path button { margin-top: 5px; }
+.execution-card .capture-evidence { color: #176b53; }
+.toast button { background: transparent; color: inherit; font-size: 20px; }
+.toast { max-width: min(620px, calc(100vw - 32px)); font-size: 13px; }
+.toast.error { bottom: 92px; }
+@media (max-width: 1100px) {
+  .app-shell { grid-template-columns: 180px minmax(0, 1fr); }
+  .workspace-grid { grid-template-columns: minmax(0, 1fr); }
+  .workspace-grid > * { grid-column: 1; }
+  .jobs-layout { grid-template-columns: minmax(0, 1fr); }
+  .job-list { max-height: 260px; }
+  .machine-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .app-shell { display: block; }
+  .sidebar { position: static; height: auto; padding: 12px; }
+  .sidebar nav { display: flex; flex-wrap: wrap; }
+  .sidebar-status { margin-top: 12px; }
+  .topbar, .page-content { padding: 12px; }
+  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .detail-actions, .submit-bar { flex-wrap: wrap; }
+  .modal-card { width: calc(100vw - 24px); max-height: 90vh; overflow: auto; }
+  .input-table-wrap { overflow-x: auto; }
+  .input-table-head, .input-table-row { min-width: 580px; }
+}

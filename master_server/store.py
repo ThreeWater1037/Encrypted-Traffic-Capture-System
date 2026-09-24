@@ -12,9 +12,18 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from .schema import named_task_id
 
 
 TERMINAL_STATUSES = {"SUCCEEDED", "PARTIAL", "FAILED", "CANCELED", "INTERRUPTED"}
+JOB_SORT_ORDERS = {
+    "created_desc": "created_at DESC",
+    "created_asc": "created_at ASC",
+    "updated_desc": "updated_at DESC",
+    "name_asc": "name COLLATE NOCASE ASC",
+    "name_desc": "name COLLATE NOCASE DESC",
+    "status": "CASE status WHEN 'RUNNING' THEN 0 WHEN 'DISPATCHING' THEN 1 WHEN 'CREATED' THEN 2 WHEN 'CANCELING' THEN 3 WHEN 'FAILED' THEN 4 WHEN 'INTERRUPTED' THEN 5 WHEN 'PARTIAL' THEN 6 WHEN 'SUCCEEDED' THEN 7 WHEN 'CANCELED' THEN 8 ELSE 9 END",
+}
 ACTIVE_STATUSES = {
     "CREATED",
     "DISPATCHING",
@@ -128,6 +137,8 @@ class MasterStore:
             }
             if "resume_token" not in columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN resume_token TEXT")
+            if "deleted_at" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN deleted_at TEXT")
 
     def machine_count(self) -> int:
         with self._connection() as connection:
@@ -244,8 +255,8 @@ class MasterStore:
                 ),
             )
             worker_task_ids = {
-                target["machine_id"]: self.worker_task_id(
-                    request_data["job_id"], target["machine_id"]
+                target["machine_id"]: named_task_id(
+                    request_data["name"], f"{request_data['job_id']}\0{target['machine_id']}"
                 )
                 for target in request_data["targets"]
             }
@@ -278,20 +289,69 @@ class MasterStore:
 
     @staticmethod
     def worker_task_id(job_id: str, machine_id: str) -> str:
-        """生成稳定且符合 Worker 规则的幂等任务 ID。"""
+        """旧命名规则，仅用于兼容未保存映射的旧数据。"""
         suffix = machine_id.replace(".", "-")
         digest = hashlib.sha1(machine_id.encode("utf-8")).hexdigest()[:8]
         return f"{job_id[:80]}-{suffix[:30]}-{digest}"
 
-    def list_jobs(self, *, limit: int = 100) -> list[dict[str, Any]]:
+    def get_worker_task_id(self, job_id: str, machine_id: str) -> str:
+        """从执行记录读取固定目录 ID，命名规则更新不改变旧任务路径。"""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT worker_task_id FROM executions WHERE job_id = ? AND machine_id = ? LIMIT 1",
+                (job_id, machine_id),
+            ).fetchone()
+        return str(row[0]) if row else self.worker_task_id(job_id, machine_id)
+
+    def job_id_exists(self, job_id: str) -> bool:
+        with self._connection() as connection:
+            return connection.execute("SELECT 1 FROM jobs WHERE job_id = ?", (job_id,)).fetchone() is not None
+
+    def delete_job(self, job_id: str) -> str:
+        """软删除终态任务；保留记录、上传文件和全部 Worker 资源。"""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT status, deleted_at FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None:
+                return "missing"
+            if row["deleted_at"]:
+                return "deleted"
+            if row["status"] not in TERMINAL_STATUSES:
+                return "active"
+            connection.execute("UPDATE jobs SET deleted_at = ? WHERE job_id = ?", (utc_now(), job_id))
+        return "deleted"
+
+    @staticmethod
+    def _job_filter(status: str, query: str) -> tuple[str, list[str]]:
+        conditions = ["deleted_at IS NULL"]
+        params = []
+        if status != "ALL":
+            conditions.append("status = ?")
+            params.append(status)
+        if query.strip():
+            conditions.append("(instr(lower(job_id), lower(?)) > 0 OR instr(lower(name), lower(?)) > 0)")
+            params.extend([query.strip(), query.strip()])
+        return " AND ".join(conditions), params
+
+    def job_list_counts(self, *, status: str = "ALL", query: str = "") -> dict[str, Any]:
+        condition, params = self._job_filter(status, query)
+        with self._connection() as connection:
+            total = connection.execute(f"SELECT COUNT(*) FROM jobs WHERE {condition}", params).fetchone()[0]
+            counts = dict(connection.execute("SELECT status, COUNT(*) FROM jobs WHERE deleted_at IS NULL GROUP BY status").fetchall())
+        return {"total": total, "running": sum(count for state, count in counts.items() if state not in TERMINAL_STATUSES)}
+
+    def list_jobs(self, *, limit: int = 100, offset: int = 0, status: str = "ALL", query: str = "", sort: str = "created_desc") -> list[dict[str, Any]]:
+        condition, params = self._job_filter(status, query)
+        order = JOB_SORT_ORDERS[sort]
         with self._connection() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT job_id, name, status, stage, error, cancel_requested,
                        resume_token, created_at, started_at, finished_at, updated_at
-                  FROM jobs ORDER BY created_at DESC LIMIT ?
+                  FROM jobs WHERE {condition}
+                 ORDER BY {order}, job_id DESC LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                [*params, limit, offset],
             ).fetchall()
             job_ids = [str(row["job_id"]) for row in rows]
             counts: dict[str, dict[str, int]] = {job_id: {} for job_id in job_ids}
@@ -327,7 +387,7 @@ class MasterStore:
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                "SELECT * FROM jobs WHERE job_id = ? AND deleted_at IS NULL", (job_id,)
             ).fetchone()
         return self._job_with_executions(row) if row else None
 
@@ -335,7 +395,7 @@ class MasterStore:
         """读取任务请求与控制状态，但不加载数万条 execution。"""
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                "SELECT * FROM jobs WHERE job_id = ? AND deleted_at IS NULL", (job_id,)
             ).fetchone()
         return self._job(row) if row else None
 
@@ -346,7 +406,7 @@ class MasterStore:
                 """
                 SELECT job_id, name, status, stage, error, cancel_requested,
                        created_at, started_at, finished_at, updated_at
-                  FROM jobs WHERE job_id = ?
+                  FROM jobs WHERE job_id = ? AND deleted_at IS NULL
                 """,
                 (job_id,),
             ).fetchone()
@@ -363,7 +423,7 @@ class MasterStore:
         """分页读取任务明细，避免前端轮询一次加载数万条 execution。"""
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                "SELECT * FROM jobs WHERE job_id = ? AND deleted_at IS NULL", (job_id,)
             ).fetchone()
             if row is None:
                 return None
@@ -374,7 +434,9 @@ class MasterStore:
                 if query.strip():
                     conditions += " AND (instr(lower(item_id), lower(?)) > 0 OR instr(lower(item_name), lower(?)) > 0 OR instr(lower(url), lower(?)) > 0)"
                     params.extend([query.strip()] * 3)
-                if status != "ALL":
+                if status == "CAPTURED":
+                    conditions += " AND (status = 'CAPTURED' OR json_extract(result_json, '$.status') = 'CAPTURED' OR json_extract(result_json, '$.checks.checkpoint') = 1)"
+                elif status != "ALL":
                     conditions += " AND status = ?"
                     params.append(status)
                 total = connection.execute(
@@ -505,7 +567,7 @@ class MasterStore:
                        cancel_requested = 0, finished_at = NULL,
                        resume_token = ?, updated_at = ?
                  WHERE job_id = ?
-                   AND status IN ('PARTIAL','FAILED','CANCELED','INTERRUPTED')
+                   AND deleted_at IS NULL AND status IN ('PARTIAL','FAILED','CANCELED','INTERRUPTED')
                 """,
                 (resume_token, now, job_id),
             )
@@ -531,6 +593,11 @@ class MasterStore:
         stage: str | None = None,
         error: str | None = None,
     ) -> None:
+        if status == "FAILED":
+            # Dispatcher exceptions also lack per-unit results. Apply the same
+            # evidence-preserving fallback as an abnormal Worker response.
+            self.update_worker_results(job_id, machine_id, top_status=status, units=[], error=error)
+            return
         with self._connection() as connection:
             connection.execute(
                 """
@@ -627,13 +694,19 @@ class MasterStore:
             connection.execute(
                 """
                 UPDATE executions
-                   SET status = ?, stage = 'DONE', error = ?,
-                       result_json = CASE WHEN ? IN ('CANCELED','INTERRUPTED')
+                   SET status = CASE
+                           WHEN ? = 'FAILED' AND json_extract(result_json, '$.status') IN ('SUCCEEDED','PARTIAL')
+                               THEN json_extract(result_json, '$.status')
+                           WHEN ? = 'FAILED' AND json_extract(result_json, '$.status') = 'CAPTURED'
+                               THEN 'PARTIAL'
+                           ELSE ? END,
+                       stage = 'DONE', error = ?,
+                       result_json = CASE WHEN ? IN ('FAILED','CANCELED','INTERRUPTED')
                                           THEN result_json ELSE NULL END,
                        updated_at = ?
                  WHERE job_id = ? AND machine_id = ?
                 """,
-                (top_status, error, top_status, now, job_id, machine_id),
+                (top_status, top_status, top_status, error, top_status, now, job_id, machine_id),
             )
             rows = []
             for unit in units:
@@ -647,7 +720,8 @@ class MasterStore:
                 rows.append(
                     (
                         status,
-                        json.dumps(unit, ensure_ascii=False),
+                        unit.get("error"),
+                        json.dumps({**unit, "batch_error": error}, ensure_ascii=False),
                         now,
                         job_id,
                         machine_id,
@@ -658,7 +732,7 @@ class MasterStore:
             connection.executemany(
                 """
                 UPDATE executions
-                   SET status = ?, stage = 'DONE', error = NULL,
+                   SET status = ?, stage = 'DONE', error = ?,
                        result_json = ?, updated_at = ?
                  WHERE job_id = ? AND machine_id = ?
                    AND item_id = ? AND browser = ?
@@ -683,7 +757,7 @@ class MasterStore:
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
         with self._connection() as connection:
             rows = connection.execute(
-                f"SELECT job_id FROM jobs WHERE status IN ({placeholders})",
+                f"SELECT job_id FROM jobs WHERE deleted_at IS NULL AND status IN ({placeholders})",
                 tuple(sorted(ACTIVE_STATUSES)),
             ).fetchall()
         return [str(row[0]) for row in rows]

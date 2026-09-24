@@ -337,7 +337,7 @@ class JobDispatcher:
             )
             return
         client = self._client_factory(machine)
-        worker_task_id = MasterStore.worker_task_id(job_id, machine_id)
+        worker_task_id = self.store.get_worker_task_id(job_id, machine_id)
         task: dict[str, Any] | None = None
         last_progress: tuple[str, str, str | None] | None = None
         progress_run_id: str | None = None
@@ -491,7 +491,7 @@ class JobDispatcher:
 
         if self._stop.is_set():
             return
-        if task.get("status") in {"CANCELED", "INTERRUPTED"}:
+        if task.get("status") in {"FAILED", "CANCELED", "INTERRUPTED"}:
             try:
                 # Cancellation can land between polls; include the last committed URL.
                 self._sync_worker_capture_progress(
