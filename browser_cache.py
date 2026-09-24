@@ -111,28 +111,44 @@ class ChromiumCachePolicy:
                 "flatten": True, "filter": self.TARGET_FILTER}
 
     def _request(self, method, params, session_id=None, *, timeout=None):
-        with self._lock:
-            if not self._connected:
-                raise CachePolicyError("Browser debugger connection is closed")
-            self._next_id += 1
-            message_id = self._next_id
-            item = {"event": threading.Event(), "reply": None}
-            self._pending[message_id] = item
-        message = {"id": message_id, "method": method, "params": params}
-        if session_id:
-            message["sessionId"] = session_id
+        return self._request_many([(method, params)], session_id, timeout=timeout)[0]
+
+    def _request_many(self, commands, session_id=None, *, timeout=None):
+        """Send in order before waiting; some paused targets defer replies.
+
+        Register each reply slot before sending so fast replies cannot be lost.
+        All commands share one deadline, including release of a startup pause.
+        """
+        pending = []
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         try:
-            with self._send_lock:
-                self._socket.send(json.dumps(message))
-            if not item["event"].wait(self.timeout if timeout is None else timeout):
-                raise CachePolicyError(f"CDP {method} timed out")
-            reply = item["reply"]
-            if "error" in reply:
-                raise CachePolicyError(f"CDP {method}: {reply['error']}")
-            return reply.get("result", {})
+            for method, params in commands:
+                with self._lock:
+                    if not self._connected:
+                        raise CachePolicyError("Browser debugger connection is closed")
+                    self._next_id += 1
+                    message_id = self._next_id
+                    item = {"event": threading.Event(), "reply": None}
+                    self._pending[message_id] = item
+                    pending.append((message_id, method, item))
+                message = {"id": message_id, "method": method, "params": params}
+                if session_id:
+                    message["sessionId"] = session_id
+                with self._send_lock:
+                    self._socket.send(json.dumps(message))
+            results = []
+            for _, method, item in pending:
+                if not item["event"].wait(max(0.0, deadline - time.monotonic())):
+                    raise CachePolicyError(f"CDP {method} timed out")
+                reply = item["reply"]
+                if "error" in reply:
+                    raise CachePolicyError(f"CDP {method}: {reply['error']}")
+                results.append(reply.get("result", {}))
+            return results
         finally:
             with self._lock:
-                self._pending.pop(message_id, None)
+                for message_id, _, _ in pending:
+                    self._pending.pop(message_id, None)
 
     def _record_error(self, message):
         with self._condition:
@@ -233,17 +249,31 @@ class ChromiumCachePolicy:
             try:
                 if target["type"] in {"page", "iframe"}:
                     self._request("Page.enable", {}, session_id)
-                self._request("Network.enable", {}, session_id)
-                self._request("Network.setCacheDisabled", {"cacheDisabled": True}, session_id)
-                self._request("Network.setBypassServiceWorker", {"bypass": True}, session_id)
-                self._request("Target.setAutoAttach", self._auto_attach(True), session_id)
+                commands = [
+                    ("Network.enable", {}),
+                    ("Network.setCacheDisabled", {"cacheDisabled": True}),
+                    ("Network.setBypassServiceWorker", {"bypass": True}),
+                    ("Target.setAutoAttach", self._auto_attach(True)),
+                ]
+                if target["type"] == "service_worker" and target["paused"]:
+                    # A newly registered SW can defer Network.enable until
+                    # startup is released. Queue all policy commands first,
+                    # then release it without waiting for their replies. Still
+                    # require every reply; do not hide real policy failures.
+                    commands.append(("Runtime.runIfWaitingForDebugger", {}))
+                    self._request_many(commands, session_id)
+                    with self._lock:
+                        target["paused"] = False
+                else:
+                    for method, params in commands:
+                        self._request(method, params, session_id)
             except Exception as exc:
                 error = str(exc)
             finally:
                 # A policy failure must never leave a target indefinitely
                 # paused. The caller will reject this URL through check().
                 try:
-                    if not target["detached"] and self._connected:
+                    if target["paused"] and not target["detached"] and self._connected:
                         self._request("Runtime.runIfWaitingForDebugger", {}, session_id)
                 except Exception as exc:
                     error = error or str(exc)

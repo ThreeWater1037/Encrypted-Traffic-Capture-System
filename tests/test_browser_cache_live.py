@@ -1,6 +1,7 @@
-"""Opt-in real Edge checks for HTTP-cache and Service Worker bypass.
+"""Opt-in real Chromium checks for HTTP-cache and Service Worker bypass.
 
 Set RUN_BROWSER_CACHE_LIVE=1 and EDGE_TEST_DRIVER to an installed driver.
+For Chrome, set CACHE_TEST_BROWSER=chrome and CACHE_TEST_DRIVER instead.
 Fixtures serve deliberately cacheable resources and count actual HTTP requests.
 """
 
@@ -18,11 +19,12 @@ from urllib.parse import urlsplit
 
 from selenium import webdriver
 from selenium.webdriver.edge.options import Options
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 
 from browser_discovery import discover_browser
 from browser_cache import CachePolicyError, ChromiumCachePolicy
 from browser_loading import configure_uncached_network
-from browser_service import TimedEdgeService
+from browser_service import TimedChromeService, TimedEdgeService
 
 
 PNG = base64.b64decode(
@@ -110,6 +112,58 @@ class ChromiumCachePolicyTests(unittest.TestCase):
         policy.close()
         policy._socket.close.assert_called_once()
 
+    def deferred_service_worker(self, *, error=None, drop_enable=False):
+        policy = ChromiumCachePolicy(Mock(), timeout=0.02)
+        policy._connected = True
+        policy._socket = Mock()
+        sent = []
+
+        def send(raw):
+            message = json.loads(raw)
+            sent.append(message)
+            # Model Chromium: replies are deferred until startup is released.
+            if message['method'] != 'Runtime.runIfWaitingForDebugger':
+                return
+            for command in sent:
+                if drop_enable and command['method'] == 'Network.enable':
+                    continue
+                item = policy._pending.get(command['id'])
+                if item is None:
+                    continue
+                item['reply'] = ({'error': error} if error and command['method'] == 'Network.setCacheDisabled'
+                                 else {'result': {}})
+                item['event'].set()
+
+        policy._socket.send.side_effect = send
+        self.attach(policy, 'service_worker')
+        return policy, sent
+
+    def test_new_service_worker_sends_policy_then_resume_before_waiting(self):
+        policy, sent = self.deferred_service_worker()
+        self.assertEqual([item['method'] for item in sent], [
+            'Network.enable', 'Network.setCacheDisabled', 'Network.setBypassServiceWorker',
+            'Target.setAutoAttach', 'Runtime.runIfWaitingForDebugger'])
+        self.assertTrue(all(item['sessionId'] == 'session' for item in sent))
+        self.assertTrue(policy.snapshot()['targets'][0]['initialized'])
+        self.assertFalse(policy.snapshot()['targets'][0]['paused'])
+        self.assertEqual(policy.snapshot()['errors'], [])
+        self.assertEqual(policy._pending, {})
+
+    def test_new_service_worker_policy_failure_still_rejects_capture(self):
+        policy, _ = self.deferred_service_worker(error='cache policy denied')
+        with self.assertRaisesRegex(CachePolicyError, 'cache policy denied'):
+            policy._raise_errors()
+        self.assertFalse(policy.snapshot()['targets'][0]['initialized'])
+        self.assertFalse(policy.snapshot()['targets'][0]['paused'])
+        self.assertEqual(policy._pending, {})
+
+    def test_new_service_worker_missing_reply_still_times_out(self):
+        policy, _ = self.deferred_service_worker(drop_enable=True)
+        with self.assertRaisesRegex(CachePolicyError, 'Network.enable timed out'):
+            policy._raise_errors()
+        self.assertFalse(policy.snapshot()['targets'][0]['initialized'])
+        self.assertEqual(policy._pending, {})
+
 
 class CacheHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -136,7 +190,7 @@ class CacheHandler(BaseHTTPRequestHandler):
             body, content_type = PNG, "image/png"
         elif path == "/sw-page":
             body = HEAD.encode()
-        elif path == "/sw.js":
+        elif path in {"/sw.js", "/startup-sw.js"}:
             body = b"""
                 self.addEventListener('install', event => event.waitUntil((async () => {
                     const cache = await caches.open('fixture-cache');
@@ -151,6 +205,14 @@ class CacheHandler(BaseHTTPRequestHandler):
                     }
                 });
             """
+            if path == "/startup-sw.js":
+                body += b"""
+                    const startup = (async () => {
+                        await (await fetch('/worker-resource')).text();
+                        await (await fetch('/worker-resource')).text();
+                    })();
+                    self.addEventListener('install', event => event.waitUntil(startup));
+                """
             content_type = "application/javascript"
         elif path == "/sw-resource":
             body, content_type = b"from-real-server", "text/plain"
@@ -194,11 +256,14 @@ class CacheHandler(BaseHTTPRequestHandler):
 @unittest.skipUnless(os.environ.get("RUN_BROWSER_CACHE_LIVE") == "1", "opt-in browser cache test")
 class LiveBrowserCacheTests(unittest.TestCase):
     def setUp(self):
-        driver_path = os.environ.get("EDGE_TEST_DRIVER")
+        browser = os.environ.get("CACHE_TEST_BROWSER", "edge")
+        self.assertIn(browser, ('edge', 'chrome'))
+        self.browser_name = browser
+        driver_path = os.environ.get("CACHE_TEST_DRIVER") or os.environ.get("EDGE_TEST_DRIVER")
         self.assertTrue(driver_path and Path(driver_path).is_file(),
-                        "EDGE_TEST_DRIVER must name an existing driver")
-        binary = discover_browser("edge")
-        self.assertTrue(binary, "An installed Edge browser is required")
+                        "CACHE_TEST_DRIVER or EDGE_TEST_DRIVER must name an existing driver")
+        binary = discover_browser(browser)
+        self.assertTrue(binary, "An installed Chromium browser is required")
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), CacheHandler)
         self.server.requests = []
         self.server.request_lock = threading.Lock()
@@ -208,17 +273,17 @@ class LiveBrowserCacheTests(unittest.TestCase):
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
         self.profile = tempfile.TemporaryDirectory(prefix="codex-cache-edge-")
         self.addCleanup(self.profile.cleanup)
-        options = Options()
+        options = ChromeOptions() if browser == 'chrome' else Options()
         options.binary_location = binary
-        options.set_capability("ms:loggingPrefs", {"performance": "ALL"})
+        options.set_capability("goog:loggingPrefs" if browser == 'chrome' else "ms:loggingPrefs", {"performance": "ALL"})
         for argument in ("--headless=new", "--no-proxy-server", "--no-first-run",
                          "--no-default-browser-check", "--disable-background-networking",
                          "--disable-component-update", "--site-per-process",
                          f"--user-data-dir={self.profile.name}"):
             options.add_argument(argument)
-        self.service = TimedEdgeService(driver_path)
+        self.service = (TimedChromeService if browser == 'chrome' else TimedEdgeService)(driver_path)
         self.addCleanup(self.service.stop)
-        self.driver = webdriver.Edge(service=self.service, options=options)
+        self.driver = (webdriver.Chrome if browser == 'chrome' else webdriver.Edge)(service=self.service, options=options)
         self.addCleanup(self.driver.quit)
         self.driver.set_page_load_timeout(10)
         self.driver.set_script_timeout(10)
@@ -271,7 +336,7 @@ class LiveBrowserCacheTests(unittest.TestCase):
         main_target_only = self.counts()
         cross_script = (f"localhost:{port}", "/frame.js")
         self.assertEqual(main_target_only[cross_script], before[cross_script])
-        print("Real Edge negative control: main-target-only CDP reused warmed cross-site iframe JS")
+        print(f"Real {self.browser_name} negative control: main-target-only CDP reused warmed cross-site iframe JS")
         before = main_target_only
         policy = ChromiumCachePolicy(self.driver).start()
         self.addCleanup(policy.close)
@@ -300,7 +365,7 @@ class LiveBrowserCacheTests(unittest.TestCase):
                             and not item["if_modified_since"] for item in uncached_requests))
         self.assertTrue(any(item["type"] == "iframe" and item["initialized"]
                             for item in policy.snapshot()["targets"]))
-        print("Real Edge cache: warm-cache control detected; 2 uncached visits each fetched "
+        print(f"Real {self.browser_name} cache: warm-cache control detected; 2 uncached visits each fetched "
               "all 9 main/same-site/cross-site resources, 18 HTTP 200, 0 conditional requests; "
               f"CDP response counts={response_counts}")
 
@@ -354,8 +419,43 @@ class LiveBrowserCacheTests(unittest.TestCase):
         requests = [item for item in self.server.requests if item["path"] == "/sw-resource"]
         self.assertTrue(all(item["status"] == 200 and not item["if_none_match"]
                             and not item["if_modified_since"] for item in requests))
-        print("Real Edge SW: active CacheStorage worker served control locally with HTTP cache disabled; "
+        print(f"Real {self.browser_name} SW: active CacheStorage worker served control locally with HTTP cache disabled; "
               "production helper fetched same URL from server twice, 2 HTTP 200, 0 cache/SW flags")
+
+    def test_new_service_worker_initializes_without_protocol_timeout(self):
+        # Production installs the policy before navigation/registration. An
+        # already-running SW (the test above) does not cover paused startup.
+        self.driver.get(self.base_url + "/sw-page")
+        configure_uncached_network(self.driver)
+        policy = ChromiumCachePolicy(self.driver).start()
+        self.addCleanup(policy.close)
+        result = self.driver.execute_async_script("""
+            const done = arguments[arguments.length - 1];
+            (async () => {
+                await navigator.serviceWorker.register('/startup-sw.js');
+                await navigator.serviceWorker.ready;
+                return await (await fetch('/sw-resource')).text();
+            })().then(done, error => done({error: String(error)}));
+        """)
+        policy.check()
+        self.assertEqual(result, "from-real-server")
+        snapshot = policy.snapshot()
+        workers = [item for item in snapshot['targets'] if item['type'] == 'service_worker']
+        self.assertTrue(workers, snapshot)
+        self.assertTrue(all(item['initialized'] for item in workers), snapshot)
+        self.assertEqual(snapshot['errors'], [])
+        self.assertEqual(snapshot['cache_hits'], [])
+        # Cache rules and event coverage must apply to the worker's very first
+        # script execution, not just page requests after registration resolves.
+        requests = [item for item in self.server.requests if item['path'] == '/worker-resource']
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all(item['status'] == 200 and not item['if_none_match']
+                            and not item['if_modified_since'] for item in requests))
+        responses = [event for event in policy.drain_events()
+                     if event['method'] == 'Network.responseReceived'
+                     and event['params']['response']['url'].endswith('/worker-resource')]
+        # Browser and page auto-attach can observe the same SW via two sessions.
+        self.assertEqual(len({event['params']['requestId'] for event in responses}), 2)
 
     def test_nested_workers_repeat_cacheable_fetches_on_network(self):
         self.driver.get(self.base_url + "/sw-page")
@@ -384,7 +484,7 @@ class LiveBrowserCacheTests(unittest.TestCase):
         self.assertTrue(all(item["initialized"] for item in workers))
         self.assertEqual(snapshot["cache_hits"], [])
         self.assertEqual(snapshot["errors"], [])
-        print("Real Edge nested workers: both worker targets initialized before execution; "
+        print(f"Real {self.browser_name} nested workers: both worker targets initialized before execution; "
               "same max-age resource fetched twice, 2 HTTP 200, 0 cache flags")
 
 
