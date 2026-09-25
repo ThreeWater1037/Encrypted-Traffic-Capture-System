@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
-from wiki_fetcher import WikiFetcher, UrlEntry, _prepare_navigation
+from wiki_fetcher import AVAILABLE_DRIVERS, WikiFetcher, UrlEntry, _prepare_navigation
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -67,6 +67,20 @@ class TargetCompletionLiveTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(3)
+
+    def test_production_forbes_rules_register_with_default_https_port(self):
+        # Do not replace production rules with localhost:port here: that hid
+        # invalid empty-port BiDi patterns in the original live fixture.
+        driver = AVAILABLE_DRIVERS[self.browser].build(self.root / "keys.log", self.root)
+        self.addCleanup(driver.quit)
+        self.addCleanup(driver._capture_cache_policy.close)
+        _prepare_navigation(driver, "https://www.forbeschina.com/leadership/70344")
+        driver._capture_cache_policy.check()
+        driver.get(self.base + "/normal")
+        self.assertEqual(driver.title, "fixture")
+        self.assertEqual(driver._capture_cache_policy.snapshot()["errors"], [])
+        _prepare_navigation(driver, self.base + "/normal")
+        self.assertEqual(driver._capture_blocked_urls, [])
 
     def test_stalled_iframe_does_not_fail_target_and_analytics_query_is_blocked(self):
         rule = f"http://localhost:{self.server.server_port}/g/collect"

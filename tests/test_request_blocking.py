@@ -10,7 +10,7 @@ from selenium import webdriver
 
 from browser_cache import CachePolicyError, ChromiumCachePolicy
 from browser_firefox import FirefoxNetworkPolicy
-from browser_request_policy import FORBES_RECAPTCHA_URL, FORBES_ANALYTICS_URL, blocked_urls_for_page
+from browser_request_policy import FORBES_RECAPTCHA_URL, FORBES_ANALYTICS_URL, blocked_urls_for_page, bidi_block_patterns
 from wiki_fetcher import WikiFetcher, _prepare_navigation
 
 
@@ -39,6 +39,17 @@ class RequestBlockingTests(unittest.TestCase):
                 _prepare_navigation(driver, "https://example.com/")
                 policy.set_blocked_urls.assert_called_with([])
                 self.assertEqual(driver._capture_blocked_urls, [])
+
+    def test_bidi_analytics_port_is_nonempty_and_keeps_default_port_scope(self):
+        for url, expected in (("https://www.google-analytics.com/g/collect", "443"),
+                              ("http://localhost/g/collect", "80"),
+                              ("https://localhost:8443/g/collect", "8443"),
+                              ("http://localhost:8123/g/collect", "8123")):
+            with self.subTest(url=url), patch("browser_request_policy.FORBES_ANALYTICS_URL", url):
+                pattern = bidi_block_patterns([url])[0]
+                self.assertEqual(pattern["port"], expected)
+                self.assertNotIn("search", pattern)
+                self.assertEqual(pattern["pathname"], "/g/collect")
 
     def test_bidi_uses_exact_url_and_removes_intercept(self):
         policy = FirefoxNetworkPolicy(MagicMock())

@@ -39,8 +39,11 @@ def bidi_block_patterns(rules):
     for rule in rules:
         if rule == FORBES_ANALYTICS_URL:
             parts = urlsplit(rule)
+            # BiDi rejects an empty input port. Spell out the scheme default;
+            # omitting port would also match unrelated non-default ports.
+            port = parts.port if parts.port is not None else {"https": 443, "http": 80}[parts.scheme]
             patterns.append({"type": "pattern", "protocol": parts.scheme,
-                             "hostname": parts.hostname, "port": str(parts.port or ""),
+                             "hostname": parts.hostname, "port": str(port),
                              "pathname": parts.path})
         else:
             patterns.append({"type": "string", "pattern": rule})
