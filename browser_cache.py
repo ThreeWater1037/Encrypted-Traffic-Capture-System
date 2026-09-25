@@ -1,6 +1,8 @@
 """Apply Chromium network-cache policy before each attached target can run."""
 
 from collections import deque
+from browser_request_policy import blocked_request_reason, cdp_block_patterns
+
 import json
 import queue
 import threading
@@ -264,8 +266,7 @@ class ChromiumCachePolicy:
         # Configure page/iframe sessions only: their Fetch interception covers
         # owned dedicated workers, whose own sessions have no Fetch domain.
         if self._blocked_urls:
-            return "Fetch.enable", {"patterns": [
-                {"urlPattern": url, "requestStage": "Request"} for url in self._blocked_urls]}
+            return "Fetch.enable", {"patterns": cdp_block_patterns(self._blocked_urls)}
         return "Fetch.disable", {}
 
     def _initialize_loop(self):
@@ -277,7 +278,7 @@ class ChromiumCachePolicy:
                 session_id, params = session_id
                 try:
                     with self._lock:
-                        blocked = params["request"]["url"] in self._blocked_urls
+                        blocked = blocked_request_reason(params["request"]["url"], self._blocked_urls)
                     self._request("Fetch.failRequest" if blocked else "Fetch.continueRequest",
                                   {"requestId": params["requestId"], **(
                                       {"errorReason": "BlockedByClient"} if blocked else {})}, session_id)
@@ -354,7 +355,7 @@ class ChromiumCachePolicy:
                 if remaining <= 0:
                     raise CachePolicyError("Timed out initializing new browser targets")
                 self._condition.wait(min(remaining, 0.1))
-            if self._cache_hits:
+            if self._cache_hits and getattr(self, "reject_cache_hits", True):
                 raise CachePolicyError(f"Browser cache policy observed {len(self._cache_hits)} cache response event(s)")
 
     def reset_observation(self):

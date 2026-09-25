@@ -10,7 +10,7 @@ from selenium import webdriver
 
 from browser_cache import CachePolicyError, ChromiumCachePolicy
 from browser_firefox import FirefoxNetworkPolicy
-from browser_request_policy import FORBES_RECAPTCHA_URL, blocked_urls_for_page
+from browser_request_policy import FORBES_RECAPTCHA_URL, FORBES_ANALYTICS_URL, blocked_urls_for_page
 from wiki_fetcher import WikiFetcher, _prepare_navigation
 
 
@@ -18,7 +18,7 @@ class RequestBlockingTests(unittest.TestCase):
     def test_scope_uses_hostname_not_substring(self):
         for url in ("https://forbeschina.com/a", "https://www.forbeschina.com/a",
                     "https://news.forbeschina.com/a", "https://WWW.FORBESCHINA.COM/a"):
-            self.assertEqual(blocked_urls_for_page(url), [FORBES_RECAPTCHA_URL])
+            self.assertEqual(blocked_urls_for_page(url), [FORBES_RECAPTCHA_URL, FORBES_ANALYTICS_URL])
         for url in ("https://forbeschina.com.evil.test/", "https://evilforbeschina.com/",
                     "https://example.com/?next=https://forbeschina.com/",
                     "https://forbeschina.com@evil.test/"):
@@ -33,8 +33,8 @@ class RequestBlockingTests(unittest.TestCase):
                 if browser is webdriver.Firefox:
                     driver._capture_firefox_network = policy
                 _prepare_navigation(driver, "https://www.forbeschina.com/article")
-                policy.set_blocked_urls.assert_called_once_with([FORBES_RECAPTCHA_URL])
-                self.assertEqual(driver._capture_blocked_urls, [FORBES_RECAPTCHA_URL])
+                policy.set_blocked_urls.assert_called_once_with([FORBES_RECAPTCHA_URL, FORBES_ANALYTICS_URL])
+                self.assertEqual(driver._capture_blocked_urls, [FORBES_RECAPTCHA_URL, FORBES_ANALYTICS_URL])
                 driver.get.assert_not_called()
                 _prepare_navigation(driver, "https://example.com/")
                 policy.set_blocked_urls.assert_called_with([])
@@ -101,7 +101,7 @@ class RequestBlockingTests(unittest.TestCase):
                 self.assertIn("rule rejected", record.error)
                 driver.get.assert_not_called()
                 status = json.loads((Path(tmp) / f"network_status_{browser}.json").read_text(encoding="utf-8"))
-                self.assertEqual(status["request_blocking"]["urls"], [FORBES_RECAPTCHA_URL])
+                self.assertEqual(status["request_blocking"]["urls"], [FORBES_RECAPTCHA_URL, FORBES_ANALYTICS_URL])
 
 
 if __name__ == "__main__":

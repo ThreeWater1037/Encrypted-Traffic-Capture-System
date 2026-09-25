@@ -49,6 +49,7 @@ from webdriver_manager.core.http import WDMHttpClient
 from browser_discovery import discover_browser
 from browser_proxy import BrowserProxy, parse_browser_proxy
 from browser_request_policy import blocked_urls_for_page
+from browser_session import CaptureChrome, CaptureEdge, CaptureFirefox, NAVIGATION_TIMEOUT
 from browser_loading import (
     HIT_LEGACY_HOSTS, NetworkIdleTracker, configure_uncached_network,
 )
@@ -64,8 +65,9 @@ log = logging.getLogger(__name__)
 
 def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
     """设置导航兜底、无缓存策略和站点范围内的资源屏蔽。"""
-    # Must be shorter than the WebDriver HTTP transport timeout (120s).
-    driver.set_page_load_timeout(90)
+    # Navigation must expire before the local driver HTTP transport budget.
+    driver.set_page_load_timeout(NAVIGATION_TIMEOUT)
+    driver.set_script_timeout(10)
     blocked_urls = blocked_urls_for_page(url)
     previous_urls = vars(driver).get("_capture_blocked_urls", [])
     driver._capture_blocked_urls = blocked_urls
@@ -102,6 +104,7 @@ def _initialize_firefox_network(driver):
     from browser_firefox import FirefoxNetworkPolicy
 
     policy = FirefoxNetworkPolicy(driver)
+    policy.reject_cache_hits = False  # The shared ledger validates the target document.
     driver._capture_firefox_network = driver._capture_cache_policy = policy
     try:
         policy.start()
@@ -122,6 +125,7 @@ def _initialize_chromium_network(driver):
     from browser_cache import ChromiumCachePolicy
 
     policy = ChromiumCachePolicy(driver)
+    policy.reject_cache_hits = False  # Background cache events remain diagnostic.
     driver._capture_cache_policy = policy
     try:
         configure_uncached_network(driver)
@@ -643,7 +647,7 @@ class ChromeDriver(BrowserDriver):
         """配置 Chrome 启动参数、驱动服务和 CDP 无缓存设置。"""
         opts = ChromeOptions()
         opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-        opts.page_load_strategy = "normal"
+        opts.page_load_strategy = "eager"
         binary = self._find_binary()
         if not binary:
             raise RuntimeError("Google Chrome/Chromium not found")
@@ -672,7 +676,7 @@ class ChromeDriver(BrowserDriver):
         _apply_chromium_proxy(opts, proxy)
 
         service = ChromeService(_resolve_driver_path("chrome"))
-        driver = webdriver.Chrome(service=service, options=opts)
+        driver = CaptureChrome(service=service, options=opts)
 
         return _initialize_chromium_network(driver)
 
@@ -699,7 +703,7 @@ class EdgeDriver(BrowserDriver):
 
         opts = EdgeOptions()
         opts.set_capability("ms:loggingPrefs", {"performance": "ALL"})
-        opts.page_load_strategy = "normal"
+        opts.page_load_strategy = "eager"
         opts.binary_location = binary
         opts.add_argument(f"--user-data-dir={profile_dir}")
         opts.add_argument("--disable-application-cache")
@@ -717,7 +721,7 @@ class EdgeDriver(BrowserDriver):
         _apply_chromium_proxy(opts, proxy)
 
         service = EdgeService(_resolve_driver_path("edge"))
-        driver = webdriver.Edge(service=service, options=opts)
+        driver = CaptureEdge(service=service, options=opts)
         return _initialize_chromium_network(driver)
 
 
@@ -746,7 +750,7 @@ class FirefoxDriver(BrowserDriver):
         opts = FirefoxOptions()
         opts.binary_location = binary
         opts.set_capability("webSocketUrl", True)
-        opts.page_load_strategy = "normal"
+        opts.page_load_strategy = "eager"
         os.environ["SSLKEYLOGFILE"] = str(key_log_path)
 
         # 不传 -profile：GeckoDriver 会为每次会话创建全新临时 Profile，并把
@@ -770,7 +774,7 @@ class FirefoxDriver(BrowserDriver):
         opts.add_argument("--headless")
 
         service = FirefoxService(_resolve_driver_path("firefox"))
-        return _initialize_firefox_network(webdriver.Firefox(service=service, options=opts))
+        return _initialize_firefox_network(CaptureFirefox(service=service, options=opts))
 
 
 class SafariDriver(BrowserDriver):
@@ -974,7 +978,9 @@ class WikiFetcher:
             "artifacts": {path.name: path.stat().st_size for path in expected},
             "skipped_resources": record.skipped_resources,
             "needs_recapture": bool(record.skipped_resources),
-            "resource_status": "partial" if record.skipped_resources else "complete",
+            "resource_status": ("partial" if record.skipped_resources else
+                                record.network_summary.get("resource_status", "complete")),
+            "completion_policy": record.network_summary.get("completion_policy", "all_requests"),
             "network_summary": record.network_summary,
             "phase_timings": record.phase_timings,
             "capture_summary": record.capture_summary,
@@ -1074,6 +1080,7 @@ class WikiFetcher:
             # and can make otherwise valid cross-origin resources fail.
             _prepare_navigation(driver, url)
             phase_started = time.perf_counter()
+            driver._capture_navigation_deadline = time.monotonic() + NAVIGATION_TIMEOUT
             driver.get(url)
             phase_timings["navigation"] = time.perf_counter() - phase_started
 
@@ -1110,9 +1117,19 @@ class WikiFetcher:
             if policy is not None:
                 policy.check()
                 network_summary["cache_policy"] = policy.snapshot()
-                if network_summary["cache_policy"].get("cache_hits"):
+                if (network_summary.get("completion_policy") != "target_document"
+                        and network_summary["cache_policy"].get("cache_hits")):
                     raise RuntimeError("Browser cache use detected; this capture is not an uncached sample")
-            if network_summary.get("cache_hit_requests"):
+            cache_hits = network_summary.get("cache_hit_requests", [])
+            if network_summary.get("completion_policy") == "target_document":
+                target = network_summary.get("target_document") or {}
+                target_hits = [item for item in cache_hits
+                               if item.get("request_id") == target.get("request_id")]
+                if cache_hits and not target_hits:
+                    network_summary.setdefault("warnings", []).append(
+                        "Supplementary resource cache hits observed; see cache_hit_requests")
+                cache_hits = target_hits
+            if cache_hits:
                 raise RuntimeError("Browser cache use detected; this capture is not an uncached sample")
 
         except Exception as exc:
@@ -1195,9 +1212,15 @@ class WikiFetcher:
             f"{name}={seconds:.3f}" for name, seconds in phase_timings.items()
         ))
         if network_summary:
-            log.info("    Network idle: threshold=%.3fs pending=%s failed=%s",
+            log.info("    Network observation: threshold=%.3fs pending=%s failed=%s",
                      self.network_idle_seconds, network_summary.get("pending_count"),
                      len(network_summary.get("failed_requests", [])))
+            if network_summary.get("completion_reason"):
+                log.info("    Completion: policy=%s reason=%s resources=%s",
+                         network_summary.get("completion_policy"), network_summary["completion_reason"],
+                         network_summary.get("resource_status"))
+            for warning in network_summary.get("warnings", []):
+                log.warning("    Capture warning: %s", warning)
         if driver_key in {"chrome", "edge", "firefox"}:
             # A failed navigation has no completion checkpoint. Persist its
             # pending URLs too, so this attempt is diagnosable without reports.
@@ -1275,9 +1298,13 @@ class WikiFetcher:
 
     def _wait_for_normal_page(self, driver) -> dict:
         if isinstance(driver, (webdriver.Chrome, webdriver.Edge, webdriver.Firefox)):
-            # Protocol observation starts before navigation. Pending HTTP(S)
-            # requests must finish before the quiet window can complete.
-            tracker = NetworkIdleTracker(driver, idle_seconds=self.network_idle_seconds)
+            # Main-document completion is required. Supplementary requests are
+            # observed with a short budget and retained as partial diagnostics.
+            tracker = NetworkIdleTracker(
+                driver, idle_seconds=self.network_idle_seconds, timeout=NAVIGATION_TIMEOUT,
+                completion_policy="target_document", resource_timeout=10.0,
+                resource_stall_seconds=3.0,
+                deadline=vars(driver).get("_capture_navigation_deadline"))
             driver._capture_idle_tracker = tracker
             return tracker.wait()
 

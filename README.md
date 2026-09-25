@@ -530,27 +530,36 @@ WORKER_DATA_DIR/tasks/<task_id>/
 报告，以及 `batch_process.py` 生成的 TSV、`capture_*_flows/`、
 `capture_*_inferred/` 等后处理产物，只有在创建任务时显式启用才会生成。
 
-Chrome/Edge 页面在导航前启用 CDP Network/performance 事件，Firefox 启用 BiDi 网络事件，等待页面及子 frame 的
-HTTP(S) 请求全部完成或失败，再满足连续 **500 毫秒**静默。图片、XHR、fetch 和正在
-下载的响应都会计入 pending；WebSocket/EventSource 长连接不阻塞结束。资源等待有
-90 秒上限，超时或没有有效页面网络记录会按失败处理。请求失败详情、实际静默时间
-和分阶段耗时写入完成检查点的 `network_summary` / `phase_timings`；零 pending
-表示没有仍在下载的请求，不代表每项 HTTP 响应都是成功状态。
-每次尝试还会覆盖写入 `network_status_<browser>.json`，失败或超时也保留本次的
-未完成 URL 和错误明细，便于在没有完成检查点时排查。
+Chrome、Edge、Firefox 默认按 **目标页面响应完成** 判定采集成功。三种浏览器使用
+`eager` 导航（DOM 就绪即可返回），再通过 CDP / BiDi 的共同请求账本确认主页面最终
+HTTP 2xx 响应已完整接收，且不是本地缓存响应。主页面失败、HTTP 4xx/5xx、未完成或
+缺少有效网络观测仍失败，不以文件存在或固定等待替代验证。
+
+导航与主页面响应共用 **30 秒**预算。主页面完成后继续观察附带资源：全部请求结束并
+连续 **500 毫秒**静默即可结束；否则连续 **3 秒无网络进展**，或自主页面响应完成起
+达到 **10 秒**资源预算，就停止等待。广告、统计、图片、iframe、XHR/fetch 的未完成
+请求保留在诊断中，不再单独阻止目标 URL 成功。资源可能未采完整，结果不等于整页
+所有资源完成；WebSocket/EventSource 长连接继续不阻塞结束。
+
+`network_status_<browser>.json` 与完成检查点的 `network_summary` 保存
+`completion_policy=target_document`、`completion_reason`、`target_document`、
+`network_complete`、`resource_status`、未完成请求及警告。附带资源不完整时仍可提交
+成功检查点，`resource_status=partial`，不会因为该警告自动重复采集。
 
 启动抓包时不再固定等待 1.2 秒。TShark 的本次输出文件初始化通知、完整的 PCAPNG
 文件头及所选接口描述都就绪后立即启动浏览器，等待上限为 5 秒。stderr 持续转发到
 Worker 日志；接口错误、提前退出或就绪超时会失败，不会生成成功检查点。tcpdump
 使用独立的监听通知及 PCAP 文件头校验。
 
-普通 Chromium 页面读取元数据后复查同一个网络请求账本：没有新活动就立即停止
-抓包，有新请求则继续等原来的 500 毫秒静默窗口，90 秒上限不重新计时。已去掉页面
-后和抓包停止前各 0.5 秒的重复等待。停止时等待进程正常刷新并退出，再流式检查
+三种浏览器读取元数据后复查同一个请求账本，复用原有资源预算，不重新计时。
+已去掉页面后和抓包停止前各 0.5 秒的重复等待。停止时等待进程正常刷新并退出，再流式检查
 PCAP/PCAPNG 结构、非空数据包与截断情况；强制终止、非零退出码或损坏文件均失败。
 文件结构校验不能替代解密后的 HTTP 响应完整性审计。
 
 Chrome/Edge/Firefox 驱动服务使用有界进程退出等待，避免轮询已关闭的 HTTP 状态端口。
+新建 WebDriver 会话的 HTTP 等待为 30 秒，导航命令为 35 秒（给页面 30 秒预算留出返回余量），
+普通命令为 10 秒，退出命令为 5 秒，并关闭本机驱动 HTTP 自动重试；这些是各阶段预算，
+不代表整个采集单元总耗时只有 30 秒，驱动解析、初始化和收尾另计。
 浏览器退出、驱动服务停止、TLS 密钥复制及临时配置清理分别计时；失败保留诊断，
 不会默默继续提交成功。完成检查点和网络状态文件还包含 `capture_summary` /
 `cleanup_summary`。浏览器仍按 URL 独立启动。
@@ -558,7 +567,8 @@ Chrome/Edge/Firefox 驱动服务使用有界进程退出等待，避免轮询已
 每个 URL 仍启动独立浏览器和全新配置目录；Chrome/Edge 启动及导航前通过 CDP 禁用
 HTTP 缓存并显式绕过 Service Worker。独立浏览器 CDP 连接在新的跨进程 iframe、
 Worker 等目标运行前递归应用相同策略，保留浏览器站点隔离；其网络完成事件也用于
-静默判断。策略初始化失败、观测到未获允许的本地缓存命中或 304 时，本次抓取失败，细节写入
+等待判断。策略初始化失败或目标主页面命中缓存 / 304 时，本次抓取失败；附带资源的
+缓存命中保留为诊断警告，不再使整个目标失败，细节写入
 `network_summary.cache_policy` / `cache_hit_requests`。Firefox 使用 WebDriver BiDi
 在整个会话禁用 HTTP 缓存，并核验缓存响应和 304；在全新 Profile 中禁用 Service Worker
 注册，避免其缓存或合成响应。这与 Chromium 的绕过方式不同，依赖 Service Worker 的
@@ -566,7 +576,8 @@ Worker 等目标运行前递归应用相同策略，保留浏览器站点隔离�
 Firefox 允许同一页面文档内复用本次已完整下载的图片：必须先观测到该图片的 GET 请求
 以非缓存 HTTP 200 完整结束，再允许同一文档、同一 URL 的图片缓存响应。原始缓存标记
 保留，并在 `same_document_image_reuses` 中记录首次下载的请求 ID。首次加载就命中缓存、
-首次下载未完成或失败、304、非图片缓存仍然失败。导航、重新加载、观测重置或下一 URL
+首次下载未完成或失败、304、非图片缓存仍记录为缓存异常；目标主页面的缓存异常仍失败。
+导航、重新加载、观测重置或下一 URL
 采集不会继承放行依据；每个 URL 仍使用独立浏览器与全新 Profile。Chrome/Edge 维持
 原来的缓存及 Service Worker 绕过策略。
 三种浏览器均保存 `network_status_<browser>.json`。旧页面的缓存、Cookie
@@ -579,23 +590,25 @@ python wiki_fetcher.py --input urls.txt --browsers edge --pcap --network-idle-se
 ```
 
 将 `--interval-seconds` 设为 `3` 可恢复原批次间隔；`--network-idle-seconds 2` 保留
-两秒真实网络静默窗口。Chrome/Edge/Firefox 共用请求完成与静默判断，并在读取页面
-信息后复查新增请求；Safari 仍使用 complete 后的固定延时。500 毫秒静默不会截断已知未完成请求，但更晚才由
-定时器发起的请求不保证被观察到。
+两秒静默窗口，但仍受附带资源 3 秒停滞 / 10 秒总预算约束。Chrome/Edge/Firefox
+共用完成策略；Safari 仍使用 complete 后的固定延时。超过附带资源预算的未完成请求、
+更晚才由定时器发起的请求不保证采集完整。
 
 Chrome/Edge/Firefox 采集 `forbeschina.com` 及其子域名时，在导航前精确屏蔽
 `https://www.google.com/recaptcha/api2/aframe`（仅此完整 URL，不匹配其他路径或带查询参数的 URL）。
+同时屏蔽 `https://www.google-analytics.com/g/collect`，该规则允许任意查询参数，
+但不匹配其他主机、`/g/collect-other` 或 `/g/collect/extra`。
 Chrome/Edge 使用 CDP，并覆盖后续创建的子页面和 Worker；Firefox 使用 BiDi 拦截。
 规则按输入页面域名启用，不对其他站点全局屏蔽。结果属于主动排除该组件后的流量。
 `network_status_<browser>.json` 的 `request_blocking` 记录规则；请求账本保留原始失败事件，
-并通过 `policy_reason=forbes_recaptcha_exclusion` 和 `intentionally_blocked_requests`
-标识命中的主动屏蔽。其余请求仍须正常结束，超时仍报失败。
+并通过 `policy_reason=forbes_recaptcha_exclusion` / `forbes_analytics_exclusion`
+和 `intentionally_blocked_requests` 标识主动屏蔽。其他附带请求使用上述有界等待策略。
 Firefox 临时 Profile 禁用 Service Worker、Chrome/Edge 绕过 Service Worker 的策略不变。
 
 Chrome/Edge/Firefox 访问 `today.hit.edu.cn` 时采用相同的旧站屏蔽策略：
 保留 `today2.hit.edu.cn`、`myweb.hit.edu.cn` 的 HTTP/HTTPS 资源隔离；
-其余资源使用统一请求账本等待完成，不因五秒无进展主动截断；网络等待有 90 秒兜底，
-触发时按失败处理并保留未完成请求。
+其余资源使用统一目标页面完成策略；附带资源达到 3 秒停滞 / 10 秒预算后保留
+未完成请求诊断，主页面完整响应仍可成功。
 
 受影响页面会保留可供补抓的标记，即使没有启用 HTML/报告输出：
 

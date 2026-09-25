@@ -31,8 +31,10 @@ class FirefoxNetworkTests(unittest.TestCase):
         policy.frame_tree = lambda: {"frame": {"id": "main", "url": "https://example.com/"}}
         return driver, policy
 
-    def run_timeline(self, timeline, *, timeout=5.0, recheck_at=None):
+    def run_timeline(self, timeline, *, timeout=5.0, recheck_at=None, **tracker_options):
         driver, policy = self.make_policy()
+        if tracker_options.get("completion_policy") == "target_document":
+            policy.reject_cache_hits = False
         clock = [0.0]
         schedule = list(timeline)
         original = policy.network_events
@@ -47,7 +49,7 @@ class FirefoxNetworkTests(unittest.TestCase):
         policy.network_events = events
         with patch("browser_loading.time.monotonic", side_effect=lambda: clock[0]), \
              patch("browser_loading.time.sleep", side_effect=lambda t: clock.__setitem__(0, clock[0] + t)):
-            tracker = NetworkIdleTracker(driver, timeout=timeout)
+            tracker = NetworkIdleTracker(driver, timeout=timeout, **tracker_options)
             result = tracker.wait()
             if recheck_at is not None:
                 clock[0] = recheck_at
@@ -58,6 +60,39 @@ class FirefoxNetworkTests(unittest.TestCase):
     @staticmethod
     def response(method="responseCompleted", request_id="r", **kwargs):
         return bidi(method, request_id, response={"status": 200, "fromCache": False, "mimeType": "text/plain"}, **kwargs)
+
+    def test_target_completion_with_hung_fetch_uses_shared_three_second_budget(self):
+        doc_request = {"request": "doc", "url": "https://example.com/", "destination": "document"}
+        result, elapsed = self.run_timeline([(0, [
+            bidi("beforeRequestSent", request=doc_request),
+            bidi("responseStarted", request=doc_request, response={"status": 200, "fromCache": False}),
+            bidi("responseCompleted", request=doc_request, response={"status": 200, "fromCache": False}),
+            bidi("beforeRequestSent", "hung")])], completion_policy="target_document")
+        self.assertLess(elapsed, 3.06)
+        self.assertEqual(result["target_document"]["type"], "Document")
+        self.assertEqual(result["pending_count"], 1)
+        self.assertEqual(result["completion_reason"], "resource_stall")
+
+    def test_target_http_error_is_not_hidden_by_relaxed_policy(self):
+        doc_request = {"request": "doc", "url": "https://example.com/", "destination": "document"}
+        from selenium.common.exceptions import WebDriverException
+        with self.assertRaisesRegex(WebDriverException, "Target document failed"):
+            self.run_timeline([(0, [bidi("beforeRequestSent", request=doc_request),
+                bidi("responseStarted", request=doc_request, response={"status": 503}),
+                bidi("responseCompleted", request=doc_request, response={"status": 503})])],
+                completion_policy="target_document")
+
+    def test_target_policy_keeps_optional_cache_as_evidence(self):
+        doc = {"request": "doc", "url": "https://example.com/", "destination": "document"}
+        timeline = [(0, [bidi("beforeRequestSent", request=doc),
+            bidi("responseStarted", request=doc, response={"status": 200, "fromCache": False}),
+            bidi("responseCompleted", request=doc, response={"status": 200, "fromCache": False}),
+            bidi("beforeRequestSent", "image"),
+            bidi("responseStarted", "image", response={"status": 200, "fromCache": True}),
+            bidi("responseCompleted", "image", response={"status": 200, "fromCache": True})])]
+        result, _ = self.run_timeline(timeline, completion_policy="target_document")
+        self.assertEqual(len(result["cache_hit_requests"]), 1)
+        self.assertEqual(result["target_document"]["status"], 200)
 
     def test_pending_body_waits_for_completion_and_quiet(self):
         result, elapsed = self.run_timeline([(0, [bidi("beforeRequestSent"), self.response("responseStarted")]),
@@ -201,7 +236,7 @@ class FirefoxNetworkTests(unittest.TestCase):
     def test_builder_enables_bidi_and_disables_service_workers(self):
         with patch.object(FirefoxDriver, "_find_binary", return_value="/firefox"), \
              patch("wiki_fetcher._resolve_driver_path", return_value="/gecko"), \
-             patch("wiki_fetcher.FirefoxService"), patch("wiki_fetcher.webdriver.Firefox") as constructor, \
+             patch("wiki_fetcher.FirefoxService"), patch("wiki_fetcher.CaptureFirefox") as constructor, \
              patch("wiki_fetcher._initialize_firefox_network") as initialize:
             FirefoxDriver().build(Path("/keys"), Path("/profile"))
         options = constructor.call_args.kwargs["options"]

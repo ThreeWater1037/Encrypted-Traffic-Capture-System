@@ -12,6 +12,7 @@ from urllib.parse import urlsplit, urlunsplit
 import websocket
 
 from browser_cache import CachePolicyError, ChromiumCachePolicy
+from browser_request_policy import bidi_block_patterns
 
 
 class FirefoxNetworkPolicy(ChromiumCachePolicy):
@@ -140,7 +141,7 @@ class FirefoxNetworkPolicy(ChromiumCachePolicy):
         if urls:
             result = self._request("network.addIntercept", {
                 "phases": ["beforeRequestSent"],
-                "urlPatterns": [{"type": "string", "pattern": url} for url in urls]})
+                "urlPatterns": bidi_block_patterns(urls)})
             self._url_intercept = result["intercept"]
             self._intercepts.append(self._url_intercept)
 
@@ -194,7 +195,7 @@ class FirefoxNetworkPolicy(ChromiumCachePolicy):
                     raise CachePolicyError("Timed out rejecting intercepted Firefox requests")
                 self._condition.wait(min(remaining, 0.1))
             self._raise_errors()
-            if self._cache_hits:
+            if self._cache_hits and getattr(self, "reject_cache_hits", True):
                 # BiDi reports both responseStarted and responseCompleted. The
                 # event count is not a count of distinct cached resources.
                 urls = list(dict.fromkeys(hit.get("url") or "<unknown>" for hit in self._cache_hits))

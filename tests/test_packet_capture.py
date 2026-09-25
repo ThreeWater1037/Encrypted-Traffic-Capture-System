@@ -26,7 +26,7 @@ class PacketCaptureTests(unittest.TestCase):
             "urls": ["http://myweb.hit.edu.cn/*", "https://myweb.hit.edu.cn/*",
                      "http://today2.hit.edu.cn/*", "https://today2.hit.edu.cn/*"],
         })
-        driver.set_page_load_timeout.assert_called_once_with(90)
+        driver.set_page_load_timeout.assert_called_once_with(30.0)
 
     def test_other_sites_keep_all_image_sources_enabled(self) -> None:
         for url in (
@@ -122,7 +122,10 @@ class PacketCaptureTests(unittest.TestCase):
                     record = fetcher._fetch_with(url, key, item_dir)
                     self.assertIsNone(record.error)
                     self.assertEqual(builder.build.call_args.kwargs, {})
-                    tracker_type.assert_called_once_with(driver, idle_seconds=0.5)
+                    tracker_type.assert_called_once_with(
+                        driver, idle_seconds=0.5, timeout=30.0, completion_policy="target_document",
+                        resource_timeout=10.0, resource_stall_seconds=3.0,
+                        deadline=vars(driver).get("_capture_navigation_deadline"))
                     self.assertEqual(events, ["wait", "wait", "stop", "quit"])
                     self.assertEqual(record.network_summary, summary)
                     self.assertEqual(record.skipped_resources, [
@@ -142,7 +145,10 @@ class PacketCaptureTests(unittest.TestCase):
             tracker_type.return_value.wait.return_value = {"pending_count": 0}
             fetcher = WikiFetcher(Path(tmp), ["edge"], False, network_idle_seconds=0.5)
             self.assertEqual(fetcher._wait_for_normal_page(driver), {"pending_count": 0})
-            tracker_type.assert_called_once_with(driver, idle_seconds=0.5)
+            tracker_type.assert_called_once_with(
+                        driver, idle_seconds=0.5, timeout=30.0, completion_policy="target_document",
+                        resource_timeout=10.0, resource_stall_seconds=3.0,
+                        deadline=vars(driver).get("_capture_navigation_deadline"))
             tracker_type.return_value.wait.assert_called_once_with()
 
     def test_failed_network_wait_persists_pending_urls_without_checkpoint(self) -> None:

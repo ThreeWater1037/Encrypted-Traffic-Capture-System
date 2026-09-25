@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from selenium.common.exceptions import TimeoutException, WebDriverException
-from browser_request_policy import FORBES_RECAPTCHA_REASON
+from browser_request_policy import blocked_request_reason
 
 log = logging.getLogger("wiki_fetcher")
 RESOURCE_STALL_SECONDS = 5.0
@@ -49,8 +49,13 @@ def _performance_events(driver):
 class NetworkIdleTracker:
     """Keep one request ledger and deadline across pre-stop rechecks."""
 
-    def __init__(self, driver, *, idle_seconds: float = 0.5, timeout: float = 90.0):
-        self._session = _network_idle_session(driver, idle_seconds=idle_seconds, timeout=timeout)
+    def __init__(self, driver, *, idle_seconds: float = 0.5, timeout: float = 90.0,
+                 completion_policy: str = "all_requests", resource_timeout: float = 10.0,
+                 resource_stall_seconds: float = 3.0, deadline: float | None = None):
+        self._session = _network_idle_session(
+            driver, idle_seconds=idle_seconds, timeout=timeout,
+            completion_policy=completion_policy, resource_timeout=resource_timeout,
+            resource_stall_seconds=resource_stall_seconds, deadline=deadline)
 
     def wait(self) -> dict:
         # Resuming drains fresh events before examining the saved quiet window.
@@ -64,7 +69,9 @@ def wait_for_network_idle(driver, *, idle_seconds: float = 0.5,
     return NetworkIdleTracker(driver, idle_seconds=idle_seconds, timeout=timeout).wait()
 
 
-def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
+def _network_idle_session(driver, *, idle_seconds: float, timeout: float,
+                          completion_policy: str, resource_timeout: float,
+                          resource_stall_seconds: float, deadline: float | None):
     """Wait for zero pending page HTTP requests and a continuous quiet interval.
 
     CDP performance logging or Firefox BiDi must be enabled, and startup
@@ -73,12 +80,22 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
     already quiet during ``driver.get`` counts toward the interval. Downloads
     remain pending until loadingFinished/loadingFailed, including cache hits.
     WebSocket/EventSource streams are excluded; ordinary XHR/fetch are included.
+    The default low-level mode requires full network idle. target_document mode
+    requires a completed non-cache 2xx main document, then bounds supplementary
+    resource waiting without pretending those requests completed.
     The returned request ledger is suitable for writing to a JSON audit file.
     """
-    if not all(math.isfinite(value) and value > 0 for value in (idle_seconds, timeout)):
+    if completion_policy not in {"all_requests", "target_document"}:
+        raise ValueError("Unknown completion policy")
+    if not all(math.isfinite(value) and value > 0 for value in (
+            idle_seconds, timeout, resource_timeout, resource_stall_seconds)):
         raise ValueError("idle_seconds and timeout must be finite and positive")
 
     started = time.monotonic()
+    target_deadline = deadline if deadline is not None else started + timeout
+    target_completed_at = None
+    target_document = None
+    completion_reason = None
     firefox = vars(driver).get("_capture_firefox_network")
     tree = firefox.frame_tree() if firefox is not None else driver.execute_cdp_cmd("Page.getFrameTree", {})["frameTree"]
     main_frame = tree["frame"]["id"]
@@ -154,6 +171,15 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
                 if last_activity is not None else 0.0,
             "wait_seconds": now - started,
             "decision_epoch": time.time(),
+            "completion_policy": completion_policy,
+            "completion_reason": completion_reason,
+            "target_document": target_document.copy() if target_document else None,
+            "network_complete": not pending,
+            "resource_status": "partial" if (pending or failures or detached or any(
+                isinstance(item.get("status"), (int, float)) and item["status"] >= 400
+                for item in requests)) else "complete",
+            "warnings": (["Supplementary requests did not finish; target document completed"]
+                         if pending and completion_reason in {"resource_stall", "resource_timeout"} else []),
             "clock_source": "bidi_monotonic_receipt" if firefox is not None else (
                 "cdp_monotonic" if clock_offset is not None else "log_receipt"),
         }
@@ -288,8 +314,9 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
                                 item[key] = params[key]
                         if ((item.get("blockedReason") == "inspector"
                              or item.get("error") == "net::ERR_BLOCKED_BY_CLIENT")
-                                and item["url"] in vars(driver).get("_capture_blocked_urls", [])):
-                            item["policy_reason"] = FORBES_RECAPTCHA_REASON
+                                and blocked_request_reason(item["url"], vars(driver).get("_capture_blocked_urls", []))):
+                            item["policy_reason"] = blocked_request_reason(
+                                item["url"], vars(driver).get("_capture_blocked_urls", []))
                         failures.append(item.copy())
                     activity(params, now)
 
@@ -297,6 +324,47 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
         if last_activity is None:
             # With no page events yet, observe a full interval from receipt.
             last_activity = now
+        if completion_policy == "target_document":
+            documents = [item for item in requests
+                         if item["type"] == "Document" and item["frame_id"] == main_frame]
+            latest = documents[-1] if documents else None
+            if latest is not target_document:
+                target_document = latest
+                target_completed_at = None
+            if target_document:
+                status = target_document.get("status")
+                if (target_document["state"] == "failed"
+                        or any(target_document.get(key) for key in (
+                            "served_from_cache", "from_disk_cache", "from_service_worker", "from_prefetch_cache"))
+                        or status == 304
+                        or (isinstance(status, (int, float)) and status >= 400)):
+                    exc = WebDriverException(
+                        f"Target document failed: {target_document['url']} "
+                        f"({target_document.get('error') or status})")
+                    exc.network_idle_summary = summary(now)
+                    raise exc
+                if (target_document["state"] == "finished"
+                        and isinstance(status, (int, float)) and 200 <= status < 300):
+                    if target_completed_at is None:
+                        target_completed_at = event_time(
+                            {"timestamp": target_document.get("finished_timestamp")}, now)
+                    if not pending and now - last_activity >= idle_seconds:
+                        completion_reason = "network_idle"
+                    elif now - last_activity >= resource_stall_seconds:
+                        completion_reason = "resource_stall"
+                    elif now - target_completed_at >= resource_timeout:
+                        completion_reason = "resource_timeout"
+                    else:
+                        completion_reason = None
+                    if completion_reason:
+                        yield summary(now)
+                        continue
+            if target_completed_at is None and now >= target_deadline:
+                exc = TimeoutException("Target document did not complete within the navigation budget")
+                exc.network_idle_summary = summary(now)
+                raise exc
+            time.sleep(0.05)
+            continue
         if not pending and now - last_activity >= idle_seconds:
             if not requests and tree["frame"].get("url", "").startswith(("http://", "https://")):
                 exc = TimeoutException(
@@ -304,6 +372,7 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
                     "must be enabled and startup events drained before navigation")
                 exc.network_idle_summary = summary(now)
                 raise exc
+            completion_reason = "network_idle"
             yield summary(now)
             continue
         if now - started >= timeout:
