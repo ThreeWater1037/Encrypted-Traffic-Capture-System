@@ -116,6 +116,8 @@ network:
 
 ## 3. Windows 子机器
 
+新服务器可直接使用 [Windows 一键部署脚本](deployment/deploy_worker_windows_README.md)，自动安装 Git、Miniconda、浏览器及抓包环境，并配置开机运行；首次 Npcap 普通版安装需完成向导。下面保留手工部署步骤。
+
 ### 3.1 安装系统依赖
 
 安装 Chrome、Edge 或 Firefox。通过 Wireshark 官方安装程序安装 Wireshark，并一并
@@ -556,11 +558,17 @@ Chrome/Edge/Firefox 驱动服务使用有界进程退出等待，避免轮询已
 每个 URL 仍启动独立浏览器和全新配置目录；Chrome/Edge 启动及导航前通过 CDP 禁用
 HTTP 缓存并显式绕过 Service Worker。独立浏览器 CDP 连接在新的跨进程 iframe、
 Worker 等目标运行前递归应用相同策略，保留浏览器站点隔离；其网络完成事件也用于
-静默判断。策略初始化失败、观测到本地缓存命中或 304 时，本次抓取失败，细节写入
+静默判断。策略初始化失败、观测到未获允许的本地缓存命中或 304 时，本次抓取失败，细节写入
 `network_summary.cache_policy` / `cache_hit_requests`。Firefox 使用 WebDriver BiDi
 在整个会话禁用 HTTP 缓存，并核验缓存响应和 304；在全新 Profile 中禁用 Service Worker
 注册，避免其缓存或合成响应。这与 Chromium 的绕过方式不同，依赖 Service Worker 的
 页面行为可能变化，策略会明确记录在诊断文件中。BiDi 初始化失败直接报错，不退回固定等待。
+Firefox 允许同一页面文档内复用本次已完整下载的图片：必须先观测到该图片的 GET 请求
+以非缓存 HTTP 200 完整结束，再允许同一文档、同一 URL 的图片缓存响应。原始缓存标记
+保留，并在 `same_document_image_reuses` 中记录首次下载的请求 ID。首次加载就命中缓存、
+首次下载未完成或失败、304、非图片缓存仍然失败。导航、重新加载、观测重置或下一 URL
+采集不会继承放行依据；每个 URL 仍使用独立浏览器与全新 Profile。Chrome/Edge 维持
+原来的缓存及 Service Worker 绕过策略。
 三种浏览器均保存 `network_status_<browser>.json`。旧页面的缓存、Cookie
 和 Service Worker 注册不会继承到下一 URL。不再全局注入 Cache-Control/Pragma，
 避免给跨域资源引入不被允许的预检请求。前一 URL 的抓包关闭、浏览器退出及临时

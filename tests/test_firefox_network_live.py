@@ -4,6 +4,7 @@ Set RUN_FIREFOX_NETWORK_LIVE=1 and GECKODRIVER_PATH to an installed driver.
 """
 
 from collections import Counter
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -45,13 +46,24 @@ class Handler(BaseHTTPRequestHandler):
             mime = "application/javascript"
         elif path in {"/cache", "/worker-cache"}:
             body, mime = b"from server", "text/plain"
+        elif path in {"/image.png", "/cache-image.png"}:
+            body = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
+            mime = "image/png"
+        elif path.startswith("/image-page-"):
+            body = b'''<!doctype html><title>Image reuse</title><link rel="icon" href="data:,"><body>
+                <script>(async()=>{for(let i=0;i<2;i++){
+                    const image=new Image(); image.src='/image.png';
+                    document.body.append(image); await image.decode();
+                }})()</script>'''
+            mime = "text/html"
         else:
             body = b'<!doctype html><title>Firefox policy</title><link rel="icon" href="data:,"><body>fixture'
             mime = "text/html"
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "public, max-age=3600" if path in {"/cache", "/worker-cache"} else "no-store")
+        self.send_header("Cache-Control", "public, max-age=3600" if path in {"/cache", "/worker-cache", "/cache-image.png"} else "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -147,6 +159,26 @@ class FirefoxPolicyLiveTests(unittest.TestCase):
             policy.check()
         self.assertTrue(policy.snapshot()["cache_hits"])
 
+    def test_same_document_image_reuse_passes_with_download_evidence(self):
+        # Firefox 156 reuses images within a document even with HTTP bypass and
+        # disabled disk/memory caches. Permit this only with original download
+        # evidence; raw cache flags remain visible in the shared request ledger.
+        driver = self.build()
+        driver.execute_async_script("""
+            const done=arguments[0];
+            (async()=>{for(let i=0;i<2;i++){
+                const image=new Image(); image.src='/image.png';
+                document.body.append(image); await image.decode();
+            } done(true)})().catch(e=>done(String(e)));
+        """)
+        self.assertEqual(self.server.hits["/image.png"], 1)
+        result = NetworkIdleTracker(driver).wait()
+        self.assertEqual(result["cache_hit_requests"], [])
+        self.assertEqual(len(result["same_document_image_reuses"]), 1)
+        policy = driver._capture_firefox_network.snapshot()
+        self.assertEqual(len(policy["same_document_image_reuses"]), 1)
+        self.assertEqual(policy["cache_hits"], [])
+
     def test_fetcher_writes_firefox_status_and_successful_cleanup(self):
         output = Path(self.temp.name)
         fetcher = WikiFetcher(output, ["firefox"], False)
@@ -157,6 +189,43 @@ class FirefoxPolicyLiveTests(unittest.TestCase):
         self.assertEqual(status["network_summary"]["cache_policy"]["protocol"], "webdriver_bidi")
         self.assertIsNone(status["cleanup_summary"]["service"]["error"])
         self.assertIn("network_recheck", status["phase_timings"])
+
+    def test_two_capture_urls_each_download_shared_image(self):
+        root = Path(self.temp.name)
+        fetcher = WikiFetcher(root, ["firefox"], False)
+        for index in (1, 2):
+            output = root / str(index)
+            output.mkdir()
+            result = fetcher._fetch_with(self.base + f"/image-page-{index}", "firefox", output)
+            self.assertIsNone(result.error)
+            self.assertEqual(self.server.hits["/image.png"], index)
+            status = json.loads((output / "network_status_firefox.json").read_text(encoding="utf-8"))
+            summary = status["network_summary"]
+            self.assertEqual(summary["cache_hit_requests"], [])
+            self.assertEqual(len(summary["same_document_image_reuses"]), 1)
+
+    def test_first_image_from_previous_page_cache_is_rejected(self):
+        options = Options()
+        options.add_argument("--headless")
+        options.set_capability("webSocketUrl", True)
+        driver = webdriver.Firefox(service=TimedFirefoxService(os.environ["GECKODRIVER_PATH"]), options=options)
+        self.addCleanup(driver.quit)
+        driver.get(self.base + "/page")
+        # Prime an image before this capture observation. Serve cacheable image
+        # bytes via a separate endpoint, then deliberately enable caches below.
+        script = """const done=arguments[0], image=new Image();
+            image.src='/cache-image.png'; document.body.append(image);
+            image.decode().then(()=>done(true)).catch(e=>done(String(e)));"""
+        self.assertIs(driver.execute_async_script(script), True)
+        policy = FirefoxNetworkPolicy(driver).start()
+        self.addCleanup(policy.close)
+        policy._request("network.setCacheBehavior", {"cacheBehavior": "default"})
+        driver.get(self.base + "/page?second")
+        self.assertIs(driver.execute_async_script(script), True)
+        self.assertEqual(self.server.hits["/cache-image.png"], 1)
+        with self.assertRaisesRegex(CachePolicyError, "/cache-image.png"):
+            policy.check()
+        self.assertEqual(policy.snapshot()["same_document_image_reuses"], [])
 
     @unittest.skipUnless(os.environ.get("RUN_FIREFOX_CAPTURE_LIVE") == "1", "opt-in TLS/PCAP test")
     def test_tls_keylog_decrypts_complete_local_response(self):

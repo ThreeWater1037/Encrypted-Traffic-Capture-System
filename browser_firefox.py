@@ -18,7 +18,8 @@ class FirefoxNetworkPolicy(ChromiumCachePolicy):
     protocol_name = "BiDi"
     EVENTS = ["network.beforeRequestSent", "network.responseStarted",
               "network.responseCompleted", "network.fetchError",
-              "browsingContext.contextCreated", "browsingContext.contextDestroyed"]
+              "browsingContext.contextCreated", "browsingContext.contextDestroyed",
+              "browsingContext.navigationStarted"]
 
     def __init__(self, driver, *, timeout=5.0):
         super().__init__(driver, timeout=timeout)
@@ -26,6 +27,67 @@ class FirefoxNetworkPolicy(ChromiumCachePolicy):
         self._blocked = set()
         self._blocking = set()
         self._subscription = None
+        self._documents = {}
+        self._observed_requests = {}
+        self._downloaded_images = {}
+        self._image_reuses = {}
+
+    def _observe_image_reuse(self, method, params):
+        """Allow only images fully downloaded in this observed document.
+
+        Keep raw fromCache evidence. A new navigation (including a reload of
+        the same URL), observation reset, or browser has no reusable evidence.
+        """
+        context = params.get("context")
+        if method in {"browsingContext.navigationStarted", "browsingContext.contextDestroyed"}:
+            self._documents[context] = self._documents.get(context, 0) + 1
+            self._downloaded_images = {key: value for key, value in self._downloaded_images.items()
+                                       if key[0] != context}
+            return None
+        request, response = params.get("request", {}), params.get("response", {})
+        request_id = (request.get("request"), params.get("redirectCount", 0))
+        scope = (context, self._documents.get(context, 0))
+        url = request.get("url", "")
+        if method == "network.beforeRequestSent":
+            self._observed_requests[request_id] = {
+                "scope": scope, "url": url, "method": request.get("method"),
+                "destination": request.get("destination"), "cached": False,
+            }
+            return None
+        observed = self._observed_requests.get(request_id)
+        if not observed or observed["scope"] != scope or observed["url"] != url:
+            return None
+        if method == "network.fetchError":
+            observed["failed"] = True
+            return None
+        image_request = (context is not None and observed["method"] == "GET"
+                         and observed["destination"] == "image"
+                         and not observed.get("failed")
+                         and url.startswith(("http://", "https://")))
+        cache_key = (*scope, url)
+        if response.get("fromCache") or response.get("status") == 304:
+            observed["cached"] = True
+            source = self._downloaded_images.get(cache_key)
+            if (image_request and response.get("fromCache") is True
+                    and response.get("status") == 200
+                    and response.get("mimeType", "").startswith("image/")
+                    and source and source["request_id"] != f"{request_id[0]}:{request_id[1]}"):
+                reuse = {"request_id": f"{request_id[0]}:{request_id[1]}", "url": url,
+                         "context": context, "document_generation": scope[1],
+                         "source_request_id": source["request_id"],
+                         "source_bytes_received": source["bytes_received"]}
+                self._image_reuses[request_id] = reuse
+                return reuse
+        elif (method == "network.responseCompleted" and image_request
+              and not observed["cached"] and response.get("fromCache") is False
+              and response.get("status") == 200
+              and response.get("mimeType", "").startswith("image/")
+              and response.get("bytesReceived", 0) > 0):
+            self._downloaded_images[cache_key] = {
+                "request_id": f"{request_id[0]}:{request_id[1]}",
+                "bytes_received": response["bytesReceived"],
+            }
+        return None
 
     def _debugger_url(self):
         endpoint = urlsplit(self.driver.capabilities.get("webSocketUrl", ""))
@@ -90,11 +152,14 @@ class FirefoxNetworkPolicy(ChromiumCachePolicy):
         message["capture_timestamp"] = time.monotonic()
         with self._condition:
             self._events.append(message)
+            reuse = self._observe_image_reuse(method, params)
+            if reuse:
+                message["capture_same_document_image_reuse"] = reuse
             if method.startswith("network."):
                 self._event_count += 1
                 request = params.get("request", {})
                 response = params.get("response", {})
-                if response.get("fromCache") or response.get("status") == 304:
+                if (response.get("fromCache") or response.get("status") == 304) and not reuse:
                     self._cache_hits.append({"request_id": request.get("request"),
                                              "url": request.get("url"),
                                              "reasons": ["fromCache" if response.get("fromCache") else "HTTP304"]})
@@ -116,13 +181,23 @@ class FirefoxNetworkPolicy(ChromiumCachePolicy):
                 self._condition.wait(min(remaining, 0.1))
             self._raise_errors()
             if self._cache_hits:
-                raise CachePolicyError(f"Firefox observed {len(self._cache_hits)} cached response event(s)")
+                # BiDi reports both responseStarted and responseCompleted. The
+                # event count is not a count of distinct cached resources.
+                urls = list(dict.fromkeys(hit.get("url") or "<unknown>" for hit in self._cache_hits))
+                samples = ", ".join(url[:240] for url in urls[:3])
+                raise CachePolicyError(
+                    f"Firefox observed {len(self._cache_hits)} cached response event(s) "
+                    f"for {len(urls)} URL(s); sample URLs: {samples}")
 
     def reset_observation(self):
         self.check()
-        super().reset_observation()
         with self._lock:
+            super().reset_observation()
             self._blocked.clear()
+            self._documents.clear()
+            self._observed_requests.clear()
+            self._downloaded_images.clear()
+            self._image_reuses.clear()
 
     def frame_tree(self):
         result = self._request("browsingContext.getTree", {"root": self.driver.current_window_handle})
@@ -164,7 +239,8 @@ class FirefoxNetworkPolicy(ChromiumCachePolicy):
             elif method == "network.responseStarted":
                 response = params["response"]
                 base.update(response={"status": response["status"], "mimeType": response.get("mimeType"),
-                                      "fromDiskCache": response.get("fromCache", False)},
+                                      "fromDiskCache": response.get("fromCache", False),
+                                      "sameDocumentImageReuse": message.get("capture_same_document_image_reuse")},
                             type="EventSource" if response.get("mimeType", "").split(";")[0] == "text/event-stream" else "Other")
                 normalized = "Network.responseReceived"
             elif method == "network.responseCompleted":
@@ -189,6 +265,7 @@ class FirefoxNetworkPolicy(ChromiumCachePolicy):
                     "protocol": "webdriver_bidi", "http_cache": "bypass",
                     "service_worker_policy": "disabled_in_profile",
                     "errors": list(self._errors), "cache_hits": list(self._cache_hits),
+                    "same_document_image_reuses": list(self._image_reuses.values()),
                     "network_event_count": self._event_count,
                     "pending_intercept_count": len(self._blocking)}
 

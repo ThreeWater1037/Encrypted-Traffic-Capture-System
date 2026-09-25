@@ -110,9 +110,64 @@ class FirefoxNetworkTests(unittest.TestCase):
         for response in ({"status": 200, "fromCache": True}, {"status": 304}):
             _, policy = self.make_policy()
             policy._handle_event(bidi("responseStarted", response=response))
-            with self.assertRaises(CachePolicyError):
+            with self.assertRaisesRegex(CachePolicyError, "https://example.com/a"):
                 policy.check()
             self.assertTrue(policy.snapshot()["cache_hits"])
+
+    @staticmethod
+    def image_events(request_id, *, cached=False, context="main", url="https://example.com/image.png",
+                     status=200, size=100, mime="image/png", destination="image"):
+        response = {"status": status, "fromCache": cached, "mimeType": mime, "bytesReceived": size}
+        return [bidi(method, request_id, context=context, url=url,
+                     request={"request": request_id, "url": url, "method": "GET", "destination": destination},
+                     **({"response": response} if method != "beforeRequestSent" else {}))
+                for method in ("beforeRequestSent", "responseStarted", "responseCompleted")]
+
+    def test_same_document_image_reuse_keeps_evidence_and_passes_shared_ledger(self):
+        result, _ = self.run_timeline([(0, self.image_events("download")),
+                                      (.1, self.image_events("reuse", cached=True))])
+        self.assertEqual(result["cache_hit_requests"], [])
+        self.assertEqual(result["finished_count"], 2)
+        reuse, = result["same_document_image_reuses"]
+        self.assertTrue(reuse["from_disk_cache"])
+        self.assertEqual(reuse["same_document_image_reuse"]["source_request_id"], "download:0")
+
+    def test_image_reuse_requires_completed_uncached_image_in_same_document(self):
+        for case in ("missing", "unfinished", "failed", "zero_bytes", "not_image", "different_url",
+                     "different_context", "no_context", "reset", "navigation", "destroyed", "http304",
+                     "fetch_not_image", "old_response_after_navigation", "previous_capture", "fetch_error"):
+            with self.subTest(case=case):
+                _, policy = self.make_policy()
+                source = self.image_events("download", status=500 if case == "failed" else 200,
+                                           size=0 if case == "zero_bytes" else 100,
+                                           mime="text/plain" if case == "not_image" else "image/png")
+                if case == "unfinished":
+                    source = source[:2]
+                if case == "missing":
+                    source = []
+                if case == "fetch_error":
+                    source.insert(2, bidi("fetchError", "download", url="https://example.com/image.png"))
+                for event in source:
+                    policy._handle_event(event)
+                if case == "reset":
+                    policy.reset_observation()
+                if case == "previous_capture":
+                    _, policy = self.make_policy()
+                if case in {"navigation", "destroyed", "old_response_after_navigation"}:
+                    policy._handle_event({"method": "browsingContext." + (
+                        "contextDestroyed" if case == "destroyed" else "navigationStarted"),
+                        "params": {"context": "main", "url": "https://example.com/"}})
+                    if case == "old_response_after_navigation":
+                        policy._handle_event(source[-1])
+                for event in self.image_events("reuse", cached=True,
+                        url="https://example.com/other.png" if case == "different_url" else "https://example.com/image.png",
+                        context={"different_context": "other", "no_context": None}.get(case, "main"),
+                        status=304 if case == "http304" else 200,
+                        destination="" if case == "fetch_not_image" else "image"):
+                    policy._handle_event(event)
+                with self.assertRaises(CachePolicyError):
+                    policy.check()
+                self.assertEqual(policy.snapshot()["same_document_image_reuses"], [])
 
     def test_intercept_is_queued_off_receiver_and_preserves_reason(self):
         _, policy = self.make_policy()

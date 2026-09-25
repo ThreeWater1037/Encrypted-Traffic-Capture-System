@@ -1,4 +1,4 @@
-# Ubuntu root 部署脚本
+# 部署脚本
 
 本目录集中存放 Worker、Master 和前端的部署脚本与说明，并纳入 Git 管理。
 
@@ -6,10 +6,13 @@
 
 | 部署目标 | Git 版（用于新部署和后续更新） | 使用说明 |
 |---|---|---|
+| Windows Worker | [deploy_worker_windows.ps1](deploy_worker_windows.ps1) | [Windows 一键部署说明](deploy_worker_windows_README.md) |
 | Worker | [deploy_worker_git_root.sh](deploy_worker_git_root.sh) | [Worker Git 部署说明](deploy_worker_git_root_README.md) |
 | Master + 前端 | [deploy_master_frontend_git_root.sh](deploy_master_frontend_git_root.sh) | [Master 与前端 Git 部署说明](deploy_master_frontend_git_root_README.md) |
 
-Git 版从项目仓库的 `main` 分支获取代码，支持空服务器安装、原有部署迁移和后续更新。默认使用 root、`/data/project/Encrypted-Traffic-Capture-System` 和 `/data/miniconda`；具体配置保留规则、停机范围和验收步骤见对应说明。
+Windows 版在管理员 PowerShell 中运行，自动安装 Git、Miniconda、三种浏览器和 Wireshark，默认使用 `C:\TrafficWorker`，通过计划任务开机运行。首次 Npcap 普通版安装需完成向导；详情见 Windows 说明。
+
+下面的 Ubuntu Git 版从项目仓库的 `main` 分支获取代码，支持空服务器安装、原有部署迁移和后续更新。默认使用 root、`/data/project/Encrypted-Traffic-Capture-System` 和 `/data/miniconda`；具体配置保留规则、停机范围和验收步骤见对应说明。
 
 本机上传示例（Windows PowerShell，替换服务器 IP）：
 

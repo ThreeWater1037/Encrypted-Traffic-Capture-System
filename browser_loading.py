@@ -140,10 +140,13 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
             "pending_count": len(pending), "pending_requests": list(pending.values()),
             "detached_requests": detached, "ignored_request_count": ignored_count,
             "requests": requests, "idle_seconds": idle_seconds,
-            "cache_hit_requests": [item.copy() for item in requests if any(
+            "same_document_image_reuses": [item.copy() for item in requests
+                                            if item.get("same_document_image_reuse")],
+            "cache_hit_requests": [item.copy() for item in requests if (any(
                 item.get(key) for key in ("served_from_cache", "from_disk_cache",
                                          "from_service_worker", "from_prefetch_cache"))
-                or item.get("status") == 304],
+                or item.get("status") == 304)
+                and not item.get("same_document_image_reuse")],
             "observed_idle_seconds": max(0.0, now - last_activity)
                 if last_activity is not None else 0.0,
             "wait_seconds": now - started,
@@ -251,6 +254,10 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
                                 from_disk_cache=response.get("fromDiskCache", False),
                                 from_service_worker=response.get("fromServiceWorker", False),
                                 from_prefetch_cache=response.get("fromPrefetchCache", False))
+                    # Only Firefox's adapter can authorize this exception with
+                    # evidence of a completed image download in this document.
+                    if firefox is not None and response.get("sameDocumentImageReuse"):
+                        item["same_document_image_reuse"] = response["sameDocumentImageReuse"]
                     if params.get("type") == "EventSource":
                         item["state"] = "ignored_long_lived"
                         pending.pop(request_id)

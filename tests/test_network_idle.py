@@ -73,6 +73,15 @@ class NetworkIdleTests(unittest.TestCase):
         self.assertEqual(len(result["cache_hit_requests"]), 1)
         self.assertTrue(result["cache_hit_requests"][0]["served_from_cache"])
 
+    def test_chromium_cannot_claim_firefox_image_reuse_exception(self):
+        result, _, _ = self.run_wait([(0, [request("cached", 0),
+            event("Network.responseReceived", 0, requestId="cached", response={
+                "status": 200, "fromDiskCache": True, "mimeType": "image/png",
+                "sameDocumentImageReuse": {"source_request_id": "other"}}),
+            finished("cached", 0)])])
+        self.assertEqual(len(result["cache_hit_requests"]), 1)
+        self.assertEqual(result["same_document_image_reuses"], [])
+
     def test_two_cdp_sessions_do_not_double_count_blocked_request_with_timestamp_jitter(self):
         clock = [0.0]
         url = "http://today2.hit.edu.cn/legacy.png"
