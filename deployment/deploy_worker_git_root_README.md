@@ -105,6 +105,28 @@ bash /root/deploy_worker_git_root.sh --help
 
 脚本不会自动启用 UFW、修改 SSH 或操作云安全组。云安全组需另行放行 TCP 5100，来源填写 Master 实际出口 IP `/32`；内网访问填写对应私网来源。
 
+## 驱动下载慢时使用本地驱动
+
+采集程序按“显式环境变量 → PATH 中的驱动 → webdriver-manager 在线获取”的顺序选择驱动。本地驱动被选中后，不再联网查询其版本或下载地址。驱动必须与服务器浏览器版本及操作系统架构兼容；浏览器升级后也应更新对应驱动。
+
+| 浏览器 | PATH 中的程序名 | 可选服务环境变量 |
+|---|---|---|
+| Chrome | `chromedriver` | `CHROMEDRIVER_PATH` |
+| Edge | `msedgedriver` | `EDGEDRIVER_PATH` |
+| Firefox | `geckodriver` | `GECKODRIVER_PATH` |
+
+例如：在网络正常的电脑上，从 [Chrome for Testing 官方列表](https://googlechromelabs.github.io/chrome-for-testing/) 下载匹配版本的 `chromedriver-linux64.zip`，解压后上传其中的 `chromedriver` 到服务器 `/root/chromedriver`，然后执行：
+
+```bash
+install -m 755 /root/chromedriver /usr/local/bin/chromedriver
+/usr/local/bin/chromedriver --version
+bash /root/deploy_worker_git_root.sh --worker-id 你的Worker编号
+```
+
+部署脚本创建的 Worker 服务 PATH 已包含 `/usr/local/bin`。指定其他路径时，应把对应环境变量配置到 systemd 服务环境中，仅在 SSH 终端 `export` 不会改变已运行的服务。显式指定的驱动不存在或不可执行时会直接报错，不会悄悄退回在线下载。
+
+无本地驱动时，在线请求设有 10 秒连接超时、30 秒读空闲超时；这是每次请求的等待限制，不是整个部署或下载的总时限。网页代理设置不会自动变成驱动下载代理。
+
 ## 验收与排障
 
 引导检查使用 `/usr/bin/python3 -I`，确保读取 Ubuntu `python3-yaml` 包，不受当前终端激活的 Conda 环境影响；Worker 仍使用上表指定的 Conda Python。旧版脚本在 `(base)` 下可能报 `No module named 'yaml'`，可先执行下面的命令确认系统依赖，再用系统 PATH 运行旧脚本：

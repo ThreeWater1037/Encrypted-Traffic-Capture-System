@@ -43,6 +43,8 @@ from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.microsoft import EdgeChromiumDriverManager
 from webdriver_manager.firefox import GeckoDriverManager
 from webdriver_manager.core.driver_cache import DriverCacheManager
+from webdriver_manager.core.download_manager import WDMDownloadManager
+from webdriver_manager.core.http import WDMHttpClient
 
 from browser_discovery import discover_browser
 from browser_proxy import BrowserProxy, parse_browser_proxy
@@ -496,6 +498,41 @@ def _driver_cache_manager() -> DriverCacheManager:
     return DriverCacheManager()
 
 
+class _DriverHttpClient(WDMHttpClient):
+    """Bound connection and stalled-read waits for metadata and driver downloads."""
+
+    def get(self, url, **kwargs):
+        kwargs.setdefault("timeout", (10, 30))
+        return super().get(url, **kwargs)
+
+
+def _resolve_driver_path(browser: str) -> str:
+    """Use an explicit/local driver before making any webdriver-manager requests."""
+    env_name, executable, manager = {
+        "chrome": ("CHROMEDRIVER_PATH", "chromedriver", ChromeDriverManager),
+        "edge": ("EDGEDRIVER_PATH", "msedgedriver", EdgeChromiumDriverManager),
+        "firefox": ("GECKODRIVER_PATH", "geckodriver", GeckoDriverManager),
+    }[browser]
+    override = os.getenv(env_name)
+    if override:
+        path = Path(os.path.expandvars(override)).expanduser().resolve()
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise RuntimeError(f"{env_name} is not an executable file: {path}")
+        log.info("Using local %s driver from %s: %s", browser, env_name, path)
+        return str(path)
+    local = shutil.which(executable)
+    if local:
+        log.info("Using local %s driver from PATH: %s", browser, local)
+        return local
+    log.info("No local %s; resolving online (connect timeout 10s, read timeout 30s). "
+             "For offline use, install a compatible driver on PATH or set %s.",
+             executable, env_name)
+    return manager(
+        cache_manager=_driver_cache_manager(),
+        download_manager=WDMDownloadManager(http_client=_DriverHttpClient()),
+    ).install()
+
+
 def _apply_chromium_proxy(options: ChromeOptions | EdgeOptions, proxy: BrowserProxy | None) -> None:
     """把统一代理地址转换为 Chromium 启动参数。"""
     if proxy is not None:
@@ -596,9 +633,7 @@ class ChromeDriver(BrowserDriver):
         opts.add_argument("--disable-dev-shm-usage")
         _apply_chromium_proxy(opts, proxy)
 
-        service = ChromeService(
-            ChromeDriverManager(cache_manager=_driver_cache_manager()).install()
-        )
+        service = ChromeService(_resolve_driver_path("chrome"))
         driver = webdriver.Chrome(service=service, options=opts)
 
         return _initialize_chromium_network(driver)
@@ -643,11 +678,7 @@ class EdgeDriver(BrowserDriver):
         opts.add_argument("--disable-dev-shm-usage")
         _apply_chromium_proxy(opts, proxy)
 
-        service = EdgeService(
-            EdgeChromiumDriverManager(
-                cache_manager=_driver_cache_manager()
-            ).install()
-        )
+        service = EdgeService(_resolve_driver_path("edge"))
         driver = webdriver.Edge(service=service, options=opts)
         return _initialize_chromium_network(driver)
 
@@ -695,9 +726,7 @@ class FirefoxDriver(BrowserDriver):
         _apply_firefox_proxy(opts, proxy)
         opts.add_argument("--headless")
 
-        service = FirefoxService(
-            GeckoDriverManager(cache_manager=_driver_cache_manager()).install()
-        )
+        service = FirefoxService(_resolve_driver_path("firefox"))
         return webdriver.Firefox(service=service, options=opts)
 
 
