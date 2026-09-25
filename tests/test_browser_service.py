@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from selenium.common.exceptions import WebDriverException
-from browser_service import ProcessWaitShutdown
+from browser_service import ProcessWaitShutdown, TimedFirefoxService
 
 
 class FakeService(ProcessWaitShutdown):
@@ -44,6 +44,24 @@ class BrowserServiceTests(unittest.TestCase):
         service.stop()
         opener.assert_not_called()
         service.process.wait.assert_not_called()
+
+    @patch("browser_service.request.build_opener")
+    def test_firefox_stops_owned_process_without_unsupported_shutdown_endpoint(self, opener):
+        service = self.service()
+        service.has_shutdown_endpoint = TimedFirefoxService.has_shutdown_endpoint
+        service.stop()
+        opener.assert_not_called()
+        service.process.terminate.assert_called_once()
+        self.assertIsNone(service.shutdown_details["error"])
+
+    def test_firefox_unexpected_exit_is_not_hidden_as_requested_termination(self):
+        service = self.service(exited=True)
+        service.has_shutdown_endpoint = False
+        service.process.poll.side_effect = None
+        service.process.poll.return_value = 2
+        with self.assertRaisesRegex(WebDriverException, "exited with code 2"):
+            service.stop()
+        service.process.terminate.assert_not_called()
 
     @patch("browser_service.request.build_opener")
     def test_closed_shutdown_socket_with_completed_exit_is_success(self, opener):

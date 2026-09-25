@@ -1,4 +1,4 @@
-"""Observe Chromium resource progress without imposing a five-second download limit."""
+"""Shared Chrome/Edge/Firefox request completion and quiet-window tracking."""
 
 import json
 import logging
@@ -29,6 +29,10 @@ def configure_uncached_network(driver) -> None:
 
 def _performance_events(driver):
     """Supplement ChromeDriver's log with out-of-process target events."""
+    firefox = vars(driver).get("_capture_firefox_network")
+    if firefox is not None:
+        firefox.check()
+        return [{"message": json.dumps({"message": event})} for event in firefox.network_events()]
     events = driver.get_log("performance")
     policy = vars(driver).get("_capture_cache_policy")
     if policy is not None:
@@ -62,9 +66,9 @@ def wait_for_network_idle(driver, *, idle_seconds: float = 0.5,
 def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
     """Wait for zero pending page HTTP requests and a continuous quiet interval.
 
-    Chromium performance logging and Network events must be enabled, and the
-    performance log drained *before* navigation, never between navigation and
-    this call. Buffered events retain their CDP monotonic timestamps, so time
+    CDP performance logging or Firefox BiDi must be enabled, and startup
+    events drained *before* navigation, never between navigation and this
+    call. Buffered events retain monotonic timestamps, so time
     already quiet during ``driver.get`` counts toward the interval. Downloads
     remain pending until loadingFinished/loadingFailed, including cache hits.
     WebSocket/EventSource streams are excluded; ordinary XHR/fetch are included.
@@ -74,7 +78,8 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
         raise ValueError("idle_seconds and timeout must be finite and positive")
 
     started = time.monotonic()
-    tree = driver.execute_cdp_cmd("Page.getFrameTree", {})["frameTree"]
+    firefox = vars(driver).get("_capture_firefox_network")
+    tree = firefox.frame_tree() if firefox is not None else driver.execute_cdp_cmd("Page.getFrameTree", {})["frameTree"]
     main_frame = tree["frame"]["id"]
     # A known frame's loader distinguishes this navigation from old new-tab
     # requests that can finish just after the pre-navigation log drain.
@@ -89,10 +94,13 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
             add_frame_tree(child, frame["id"])
 
     add_frame_tree(tree)
-    clock_offset = None
+    clock_offset = 0.0 if firefox is not None else None
     try:
-        driver.execute_cdp_cmd("Performance.enable", {})
-        metrics = driver.execute_cdp_cmd("Performance.getMetrics", {})
+        if firefox is None:
+            driver.execute_cdp_cmd("Performance.enable", {})
+            metrics = driver.execute_cdp_cmd("Performance.getMetrics", {})
+        else:
+            metrics = {}
         metric_time = next((item["value"] for item in metrics.get("metrics", [])
                             if item["name"] == "Timestamp"), None)
         if metric_time is not None:
@@ -140,7 +148,8 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
                 if last_activity is not None else 0.0,
             "wait_seconds": now - started,
             "decision_epoch": time.time(),
-            "clock_source": "cdp_monotonic" if clock_offset is not None else "log_receipt",
+            "clock_source": "bidi_monotonic_receipt" if firefox is not None else (
+                "cdp_monotonic" if clock_offset is not None else "log_receipt"),
         }
 
     while True:
@@ -256,7 +265,9 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
                     pending.pop(request_id)
                     item["finished_timestamp"] = params.get("timestamp")
                     if method == "Network.loadingFinished":
-                        item["state"] = "finished"
+                        item["state"] = "redirected" if params.get("redirected") else "finished"
+                        if params.get("redirected"):
+                            redirect_count += 1
                         item["encoded_data_length"] = params.get("encodedDataLength")
                         finished_count += 1
                     else:
@@ -275,8 +286,8 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
         if not pending and now - last_activity >= idle_seconds:
             if not requests and tree["frame"].get("url", "").startswith(("http://", "https://")):
                 exc = TimeoutException(
-                    "No target HTTP(S) requests were observed; performance logging and "
-                    "Network events must be enabled and drained before navigation")
+                    "No target HTTP(S) requests were observed; network observation "
+                    "must be enabled and startup events drained before navigation")
                 exc.network_idle_summary = summary(now)
                 raise exc
             yield summary(now)

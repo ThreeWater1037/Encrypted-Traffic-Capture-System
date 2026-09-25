@@ -1,4 +1,6 @@
-"""Opt-in localhost Edge checks; set RUN_NETWORK_IDLE_LIVE=1 and EDGE_TEST_DRIVER.
+"""Opt-in localhost checks; set RUN_NETWORK_IDLE_LIVE=1 and EDGE_TEST_DRIVER.
+
+For Firefox also set NETWORK_TEST_BROWSER=firefox and GECKODRIVER_PATH.
 
 Uses an installed EdgeDriver, never a driver download. Each test owns its Edge
 profile and local HTTP server; no test requires public internet access.
@@ -147,6 +149,9 @@ class Handler(BaseHTTPRequestHandler):
 @unittest.skipUnless(os.environ.get("RUN_NETWORK_IDLE_LIVE") == "1", "opt-in browser test")
 class LiveNetworkIdleTests(unittest.TestCase):
     def setUp(self):
+        self.browser = os.environ.get("NETWORK_TEST_BROWSER", "edge")
+        if self.browser == "firefox":
+            return self.setup_firefox()
         driver_path = os.environ.get("EDGE_TEST_DRIVER")
         self.assertTrue(driver_path and Path(driver_path).is_file(),
                         "EDGE_TEST_DRIVER must name an existing EdgeDriver executable")
@@ -179,6 +184,22 @@ class LiveNetworkIdleTests(unittest.TestCase):
         self.driver.execute_cdp_cmd("Network.enable", {})
         self.driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
 
+    def setup_firefox(self):
+        from wiki_fetcher import FirefoxDriver
+        self.assertTrue(Path(os.environ["GECKODRIVER_PATH"]).is_file())
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.release = threading.Event()
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        self.addCleanup(self.close_server)
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        profile = tempfile.TemporaryDirectory(prefix="codex-network-idle-firefox-")
+        self.addCleanup(profile.cleanup)
+        self.driver = FirefoxDriver().build(Path(profile.name) / "keys.log", Path(profile.name))
+        self.addCleanup(self.driver.quit)
+        self.addCleanup(self.driver._capture_firefox_network.close)
+        self.driver.set_page_load_timeout(10)
+
     def close_server(self):
         self.server.release.set()
         self.server.shutdown()
@@ -186,6 +207,11 @@ class LiveNetworkIdleTests(unittest.TestCase):
         self.server_thread.join(timeout=3)
 
     def navigate(self, path):
+        if self.browser == "firefox":
+            from wiki_fetcher import _prepare_navigation
+            _prepare_navigation(self.driver, self.base_url + path)
+            self.driver.get(self.base_url + path)
+            return
         self.driver.get_log("performance")
         self.driver.get(self.base_url + path)
 
@@ -219,7 +245,7 @@ class LiveNetworkIdleTests(unittest.TestCase):
         self.assertEqual(state["imageWidth"], 1)
         self.assertGreaterEqual(state["xhrAt"] - state["domAt"], 40)
         self.assertGreaterEqual(state["fetchAt"] - state["loadAt"], 180)
-        print(f"Real Edge: DCL XHR and load+200ms fetch complete; wait={summary['wait_seconds']:.3f}s")
+        print(f"Real {self.browser}: DCL XHR and load+200ms fetch complete; wait={summary['wait_seconds']:.3f}s")
 
     def test_iframe_inserted_after_load_keeps_its_delayed_image(self):
         self.navigate("/delayed-iframe")
@@ -236,7 +262,7 @@ class LiveNetworkIdleTests(unittest.TestCase):
         state = self.driver.execute_script("return fixture")
         self.assertTrue(state["frameDone"])
         self.assertGreaterEqual(state["frameAt"] - state["loadAt"], 180)
-        print(f"Real Edge: post-load iframe and 1.2s image complete; wait={summary['wait_seconds']:.3f}s")
+        print(f"Real {self.browser}: post-load iframe and 1.2s image complete; wait={summary['wait_seconds']:.3f}s")
 
     def test_pending_body_raises_timeout_with_request_evidence(self):
         self.navigate("/timeout")
@@ -251,7 +277,7 @@ class LiveNetworkIdleTests(unittest.TestCase):
         self.assertGreaterEqual(summary["pending_count"], 1)
         self.assertGreaterEqual(elapsed, 0.8)
         self.assertLess(elapsed, 5, "The 0.8s timeout should remain bounded under local driver overhead")
-        print(f"Real Edge: unfinished fetch failed at bounded timeout ({elapsed:.3f}s)")
+        print(f"Real {self.browser}: unfinished fetch failed at bounded timeout ({elapsed:.3f}s)")
 
     def test_existing_iframe_navigation_waits_for_slow_document(self):
         self.navigate("/renavigate-frame")
@@ -262,7 +288,7 @@ class LiveNetworkIdleTests(unittest.TestCase):
         self.assertEqual(document["state"], "finished")
         self.assertGreaterEqual(document["finished_timestamp"] - document["started_timestamp"], 1.1)
         self.assertTrue(self.driver.execute_script("return fixture.frameDone"))
-        print(f"Real Edge: existing iframe slow navigation complete; wait={summary['wait_seconds']:.3f}s")
+        print(f"Real {self.browser}: existing iframe slow navigation complete; wait={summary['wait_seconds']:.3f}s")
 
     def test_recheck_waits_for_request_started_during_metadata(self):
         self.navigate("/initial-frame")
@@ -280,7 +306,7 @@ class LiveNetworkIdleTests(unittest.TestCase):
         self.assertTrue(self.driver.execute_script("return window.metadataFetchDone"))
         self.assertEqual(self.requests_by_path(summary)["/after-load-fetch"]["state"],"finished")
         self.assertGreaterEqual(time.monotonic()-started, 1.5)
-        print("Real Edge: metadata-stage fetch was included before capture stop")
+        print(f"Real {self.browser}: metadata-stage fetch was included before capture stop")
 
 
 if __name__ == "__main__":

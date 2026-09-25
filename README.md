@@ -528,7 +528,7 @@ WORKER_DATA_DIR/tasks/<task_id>/
 报告，以及 `batch_process.py` 生成的 TSV、`capture_*_flows/`、
 `capture_*_inferred/` 等后处理产物，只有在创建任务时显式启用才会生成。
 
-普通 Chrome/Edge 页面在导航前启用 Network/performance 事件，等待页面及子 frame 的
+Chrome/Edge 页面在导航前启用 CDP Network/performance 事件，Firefox 启用 BiDi 网络事件，等待页面及子 frame 的
 HTTP(S) 请求全部完成或失败，再满足连续 **500 毫秒**静默。图片、XHR、fetch 和正在
 下载的响应都会计入 pending；WebSocket/EventSource 长连接不阻塞结束。资源等待有
 90 秒上限，超时或没有有效页面网络记录会按失败处理。请求失败详情、实际静默时间
@@ -548,7 +548,7 @@ Worker 日志；接口错误、提前退出或就绪超时会失败，不会生�
 PCAP/PCAPNG 结构、非空数据包与截断情况；强制终止、非零退出码或损坏文件均失败。
 文件结构校验不能替代解密后的 HTTP 响应完整性审计。
 
-Chrome/Edge 驱动服务使用进程退出等待，避免每秒访问已关闭的 HTTP 状态端口。
+Chrome/Edge/Firefox 驱动服务使用有界进程退出等待，避免轮询已关闭的 HTTP 状态端口。
 浏览器退出、驱动服务停止、TLS 密钥复制及临时配置清理分别计时；失败保留诊断，
 不会默默继续提交成功。完成检查点和网络状态文件还包含 `capture_summary` /
 `cleanup_summary`。浏览器仍按 URL 独立启动。
@@ -557,7 +557,11 @@ Chrome/Edge 驱动服务使用进程退出等待，避免每秒访问已关闭�
 HTTP 缓存并显式绕过 Service Worker。独立浏览器 CDP 连接在新的跨进程 iframe、
 Worker 等目标运行前递归应用相同策略，保留浏览器站点隔离；其网络完成事件也用于
 静默判断。策略初始化失败、观测到本地缓存命中或 304 时，本次抓取失败，细节写入
-`network_summary.cache_policy` / `cache_hit_requests`。旧页面的缓存、Cookie
+`network_summary.cache_policy` / `cache_hit_requests`。Firefox 使用 WebDriver BiDi
+在整个会话禁用 HTTP 缓存，并核验缓存响应和 304；在全新 Profile 中禁用 Service Worker
+注册，避免其缓存或合成响应。这与 Chromium 的绕过方式不同，依赖 Service Worker 的
+页面行为可能变化，策略会明确记录在诊断文件中。BiDi 初始化失败直接报错，不退回固定等待。
+三种浏览器均保存 `network_status_<browser>.json`。旧页面的缓存、Cookie
 和 Service Worker 注册不会继承到下一 URL。不再全局注入 Cache-Control/Pragma，
 避免给跨域资源引入不被允许的预检请求。前一 URL 的抓包关闭、浏览器退出及临时
 配置清理全部完成后，默认等待 **1 秒**再访问下一项。命令行可覆盖：
@@ -567,14 +571,14 @@ python wiki_fetcher.py --input urls.txt --browsers edge --pcap --network-idle-se
 ```
 
 将 `--interval-seconds` 设为 `3` 可恢复原批次间隔；`--network-idle-seconds 2` 保留
-两秒真实网络静默窗口。Firefox/Safari 使用页面 complete 后的固定静默延时，
-没有 Chromium 的网络事件观测。500 毫秒静默不会截断已知未完成请求，但更晚才由
+两秒真实网络静默窗口。Chrome/Edge/Firefox 共用请求完成与静默判断，并在读取页面
+信息后复查新增请求；Safari 仍使用 complete 后的固定延时。500 毫秒静默不会截断已知未完成请求，但更晚才由
 定时器发起的请求不保证被观察到。
 
-Chrome/Edge 访问 `today.hit.edu.cn` 时仍采用专用资源等待策略：
+Chrome/Edge/Firefox 访问 `today.hit.edu.cn` 时采用相同的旧站屏蔽策略：
 保留 `today2.hit.edu.cn`、`myweb.hit.edu.cn` 的 HTTP/HTTPS 资源隔离；
-正文 DOM 就绪后，只有剩余资源都连续 5 秒没有响应或数据传输进展，才停止剩余加载。
-正在持续下载的图片允许超过 5 秒；资源等待另有 90 秒兜底，触发时按失败处理。
+其余资源使用统一请求账本等待完成，不因五秒无进展主动截断；网络等待有 90 秒兜底，
+触发时按失败处理并保留未完成请求。
 
 受影响页面会保留可供补抓的标记，即使没有启用 HTML/报告输出：
 
@@ -584,10 +588,10 @@ Chrome/Edge 访问 `today.hit.edu.cn` 时仍采用专用资源等待策略：
   和 `run_id`；这是历史清单，可能有同一页面的多次记录，最新状态以逐 URL 文件为准。
 - 完成检查点也包含 `skipped_resources`、`needs_recapture` 和 `resource_status`。
   `partial` 表示正文采集完成但有资源缺失，批次可以继续；不代表图片全部加载成功。
-  `isolated_legacy_host` 表示旧域名隔离，`no_progress_for_5_seconds` 表示停滞跳过。
+  `isolated_legacy_host` 表示旧域名隔离。
 
-以上五秒策略及资源标记仅适用于 Chrome/Edge 的今日哈工大页面，Firefox/Safari
-保留原有加载逻辑。已有产物不会被追溯修改。
+以上资源标记适用于三种受支持浏览器的今日哈工大页面。已有产物不会被追溯修改。
+后续采集改动必须同步检查三种浏览器，维护要求见 [AGENTS.md](AGENTS.md)。
 
 ## 9. 大批量、断点续跑与 24 小时运行
 

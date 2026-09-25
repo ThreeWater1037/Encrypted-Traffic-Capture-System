@@ -1,4 +1,4 @@
-"""Bounded local Chromium service shutdown with process-based completion."""
+"""Bounded local browser service shutdown with process-based completion."""
 
 import subprocess
 import time
@@ -7,6 +7,7 @@ from urllib import request
 from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.edge.service import Service as EdgeService
+from selenium.webdriver.firefox.service import Service as FirefoxService
 
 
 class ProcessWaitShutdown:
@@ -14,12 +15,14 @@ class ProcessWaitShutdown:
 
     shutdown_request_timeout = 1.0
     shutdown_process_timeout = 3.0
+    has_shutdown_endpoint = True
 
     def stop(self):
         if getattr(self, "_capture_stop_done", False):
             return
         started = time.perf_counter()
         details = {"forced": False, "error": None, "timings": {}}
+        termination_requested = False
         self.shutdown_details = details
         process = getattr(self, "process", None)
         try:
@@ -28,10 +31,18 @@ class ProcessWaitShutdown:
                 try:
                     # Locally created Chromium drivers listen on IPv4 loopback.
                     # Bypass proxy environment and localhost IPv6 retry delays.
-                    opener = request.build_opener(request.ProxyHandler({}))
-                    with opener.open(f"http://127.0.0.1:{self.port}/shutdown",
-                                     timeout=self.shutdown_request_timeout):
-                        pass
+                    if self.has_shutdown_endpoint:
+                        opener = request.build_opener(request.ProxyHandler({}))
+                        with opener.open(f"http://127.0.0.1:{self.port}/shutdown",
+                                         timeout=self.shutdown_request_timeout):
+                            pass
+                    else:
+                        # GeckoDriver has no /shutdown endpoint and can stay
+                        # listening after DELETE /session. Terminate our owned
+                        # driver process after Firefox.quit has ended the session.
+                        process.terminate()
+                        termination_requested = True
+                        details["stop_method"] = "terminate_owned_driver"
                 except Exception as exc:
                     # A process exiting while replying may close the socket.
                     # Its process handle below determines actual completion.
@@ -54,7 +65,7 @@ class ProcessWaitShutdown:
                 details["exit_code"] = process.poll()
                 if details["exit_code"] is None:
                     details["error"] = "Driver service is still running"
-                elif details["exit_code"] != 0 and not details["error"]:
+                elif details["exit_code"] != 0 and not termination_requested and not details["error"]:
                     details["error"] = f"Driver service exited with code {details['exit_code']}"
         except Exception as exc:
             details["error"] = str(exc)
@@ -84,3 +95,7 @@ class TimedChromeService(ProcessWaitShutdown, ChromeService):
 
 class TimedEdgeService(ProcessWaitShutdown, EdgeService):
     pass
+
+
+class TimedFirefoxService(ProcessWaitShutdown, FirefoxService):
+    has_shutdown_endpoint = False

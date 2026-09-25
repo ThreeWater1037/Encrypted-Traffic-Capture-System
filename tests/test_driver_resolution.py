@@ -79,6 +79,7 @@ class DriverResolutionTests(unittest.TestCase):
                  patch('wiki_fetcher.' + service) as service_type, \
                  patch('wiki_fetcher.webdriver.' + browser.capitalize()), \
                  patch('wiki_fetcher._initialize_chromium_network'), \
+                 patch('wiki_fetcher._initialize_firefox_network'), \
                  patch.dict(os.environ, {}, clear=False):
                 builder().build(Path('/keys'), Path('/profile'))
                 resolve.assert_called_once_with(browser)

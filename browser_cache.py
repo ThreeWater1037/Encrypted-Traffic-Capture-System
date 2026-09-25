@@ -23,6 +23,7 @@ class ChromiumCachePolicy:
     only thread able to receive it. The caller owns start/check/close lifecycle.
     """
 
+    protocol_name = "CDP"
     NETWORK_TARGETS = {"page", "iframe", "worker", "shared_worker", "service_worker"}
     TARGET_FILTER = [{"type": kind, "exclude": False} for kind in sorted(NETWORK_TARGETS)] + [
         {"exclude": True}
@@ -139,10 +140,10 @@ class ChromiumCachePolicy:
             results = []
             for _, method, item in pending:
                 if not item["event"].wait(max(0.0, deadline - time.monotonic())):
-                    raise CachePolicyError(f"CDP {method} timed out")
+                    raise CachePolicyError(f"{self.protocol_name} {method} timed out")
                 reply = item["reply"]
                 if "error" in reply:
-                    raise CachePolicyError(f"CDP {method}: {reply['error']}")
+                    raise CachePolicyError(f"{self.protocol_name} {method}: {reply['error']} {reply.get('message', '')}".rstrip())
                 results.append(reply.get("result", {}))
             return results
         finally:

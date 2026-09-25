@@ -33,7 +33,7 @@ from urllib.parse import urlsplit
 
 from selenium import webdriver
 from browser_service import TimedChromeService as ChromeService, TimedEdgeService as EdgeService
-from selenium.webdriver.firefox.service import Service as FirefoxService
+from browser_service import TimedFirefoxService as FirefoxService
 from selenium.webdriver.safari.service import Service as SafariService
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.edge.options import Options as EdgeOptions
@@ -65,6 +65,12 @@ def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
     """设置导航兜底、无缓存策略和今日哈工大旧站资源屏蔽。"""
     # Must be shorter than the WebDriver HTTP transport timeout (120s).
     driver.set_page_load_timeout(90)
+    firefox = vars(driver).get("_capture_firefox_network")
+    if firefox is not None:
+        firefox.reset_observation()
+        if urlsplit(url).hostname == "today.hit.edu.cn":
+            firefox.block_hosts(HIT_LEGACY_HOSTS)
+        return
     if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
         configure_uncached_network(driver)
         if urlsplit(url).hostname == "today.hit.edu.cn":
@@ -77,6 +83,25 @@ def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
         if policy is not None:
             policy.check()
             policy.reset_observation()
+
+
+def _initialize_firefox_network(driver):
+    from browser_firefox import FirefoxNetworkPolicy
+
+    policy = FirefoxNetworkPolicy(driver)
+    driver._capture_firefox_network = driver._capture_cache_policy = policy
+    try:
+        policy.start()
+        return driver
+    except Exception:
+        try:
+            policy.close()
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                log.exception("Browser cleanup failed after Firefox network initialization failure")
+        raise
 
 
 def _initialize_chromium_network(driver):
@@ -707,6 +732,8 @@ class FirefoxDriver(BrowserDriver):
 
         opts = FirefoxOptions()
         opts.binary_location = binary
+        opts.set_capability("webSocketUrl", True)
+        opts.page_load_strategy = "normal"
         os.environ["SSLKEYLOGFILE"] = str(key_log_path)
 
         # 不传 -profile：GeckoDriver 会为每次会话创建全新临时 Profile，并把
@@ -721,13 +748,16 @@ class FirefoxDriver(BrowserDriver):
         opts.set_preference("network.http.use-cache", False)
         opts.set_preference("network.http.cache.disk.enable", False)
         opts.set_preference("network.http.cache.memory.enable", False)
+        # BiDi has no Service Worker bypass equivalent. Disabling registration
+        # in this fresh profile prevents synthetic/cache-served responses.
+        opts.set_preference("dom.serviceWorkers.enabled", False)
 
         opts.set_preference("browser.shell.checkDefaultBrowser", False)
         _apply_firefox_proxy(opts, proxy)
         opts.add_argument("--headless")
 
         service = FirefoxService(_resolve_driver_path("firefox"))
-        return webdriver.Firefox(service=service, options=opts)
+        return _initialize_firefox_network(webdriver.Firefox(service=service, options=opts))
 
 
 class SafariDriver(BrowserDriver):
@@ -1011,7 +1041,7 @@ class WikiFetcher:
         error_html = ""
         skipped_resources = []
         block_legacy_resources = (
-            driver_key in {"chrome", "edge"}
+            driver_key in {"chrome", "edge", "firefox"}
             and urlsplit(url).hostname == "today.hit.edu.cn"
         )
 
@@ -1155,7 +1185,7 @@ class WikiFetcher:
             log.info("    Network idle: threshold=%.3fs pending=%s failed=%s",
                      self.network_idle_seconds, network_summary.get("pending_count"),
                      len(network_summary.get("failed_requests", [])))
-        if driver_key in {"chrome", "edge"}:
+        if driver_key in {"chrome", "edge", "firefox"}:
             # A failed navigation has no completion checkpoint. Persist its
             # pending URLs too, so this attempt is diagnosable without reports.
             network_status_path = url_dir / f"network_status_{driver_key}.json"
@@ -1229,8 +1259,8 @@ class WikiFetcher:
         )
 
     def _wait_for_normal_page(self, driver) -> dict:
-        if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
-            # Performance logging starts before navigation. Pending HTTP(S)
+        if isinstance(driver, (webdriver.Chrome, webdriver.Edge, webdriver.Firefox)):
+            # Protocol observation starts before navigation. Pending HTTP(S)
             # requests must finish before the quiet window can complete.
             tracker = NetworkIdleTracker(driver, idle_seconds=self.network_idle_seconds)
             driver._capture_idle_tracker = tracker
@@ -1500,7 +1530,7 @@ def main():
         help="可选：保存逐 URL report.txt 和批次 summary.txt。",
     )
     parser.add_argument("--network-idle-seconds", type=float, default=NETWORK_IDLE_SECONDS,
-                        help="Chromium 所有页面请求结束后的静默窗口（默认 0.5 秒）。")
+                        help="Chrome/Edge/Firefox 所有页面请求结束后的静默窗口（默认 0.5 秒）。")
     parser.add_argument("--interval-seconds", type=float, default=INTERVAL_BETWEEN_URLS,
                         help="前一 URL 完成资源清理后的间隔（默认 1 秒，可设为 0）。")
     args = parser.parse_args()
