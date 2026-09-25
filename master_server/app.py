@@ -364,12 +364,11 @@ def create_app(
                 409,
             )
         resume_token = f"resume-{secrets.token_hex(16)}"
-        if not master_store.resume_job(job_id, resume_token):
+        if not job_dispatcher.resume(job_id, resume_token):
             return (
                 jsonify({"error": "resume_conflict", "message": "任务状态已变化，请刷新后重试"}),
                 409,
             )
-        job_dispatcher.enqueue(job_id)
         resumed = master_store.get_job_page(job_id)
         return jsonify(summarize_job(resumed or {})), 202
 
@@ -446,6 +445,15 @@ def create_app(
             if machine is None:
                 continue
             worker_task_id = master_store.get_worker_task_id(job_id, target["machine_id"])
+            if master_store.worker_execution_statuses(job_id, target["machine_id"]) == {"CREATED"}:
+                entry = {
+                    "task_id": worker_task_id, "text": "任务正在等待该 Worker 调度，尚未生成日志。",
+                    "next_offset": 0, "eof": True,
+                }
+                if tail_lines is not None:
+                    entry.update(tail_lines=tail_lines, line_count=0, truncated=False)
+                logs.append({"machine_id": machine["machine_id"], "machine_name": machine["name"], **entry})
+                continue
             client = WorkerClient(
                 machine["base_url"], machine["token"], timeout=master_config.worker_request_timeout
             )

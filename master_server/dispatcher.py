@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -179,7 +180,7 @@ def _aggregate_execution_statuses(statuses: list[str]) -> str:
 
 
 class JobDispatcher:
-    """单主控队列；一个任务中的不同机器会并行分发。"""
+    """按 Worker 串行调度；不同 Worker 的任务独立执行和轮询。"""
 
     def __init__(
         self,
@@ -191,12 +192,14 @@ class JobDispatcher:
     ):
         self.config = config
         self.store = store
-        self._queue: queue.Queue[str | None] = queue.Queue(config.max_queue_size)
+        self._queue: queue.Queue[str | None] = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._client_factory = client_factory or self._default_client
         self._queued: set[str] = set()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._workers: dict[str, ThreadPoolExecutor] = {}
+        self._futures: dict[str, list[Future]] = {}
         if autostart:
             self.start()
 
@@ -215,29 +218,50 @@ class JobDispatcher:
         )
         self._thread.start()
         for job_id in self.store.incomplete_job_ids():
-            self.enqueue(job_id)
+            self.enqueue(job_id, recovered=True)
 
     def shutdown(self, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
         self._stop.set()
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            pass
+        self._queue.put_nowait(None)
         if self._thread:
-            self._thread.join(timeout)
+            self._thread.join(max(0, deadline - time.monotonic()))
+        with self._lock:
+            workers = list(self._workers.values())
+            futures = [future for group in self._futures.values() for future in group]
+        for worker in workers:
+            # 未执行的任务保留数据库状态，重启后恢复，不能当成用户取消。
+            worker.shutdown(wait=False, cancel_futures=True)
+        running = [future for future in futures if not future.done()]
+        if running:
+            wait(running, timeout=max(0, deadline - time.monotonic()))
 
-    def enqueue(self, job_id: str) -> None:
+    def enqueue(self, job_id: str, *, recovered: bool = False) -> None:
         with self._lock:
             if job_id in self._queued:
                 return
-            try:
-                self._queue.put_nowait(job_id)
-            except queue.Full as exc:
-                raise QueueFullError("主控任务队列已满") from exc
+            # 路由线程会立即排空入口队列，因此按所有未结束任务限制容量。
+            # 已持久化的恢复任务不受新提交容量限制。
+            if not recovered and len(self._queued) >= self.config.max_queue_size:
+                raise QueueFullError("主控任务队列已满")
             self._queued.add(job_id)
+            self._queue.put_nowait(job_id)
 
     def cancel(self, job_id: str) -> bool:
-        return self.store.request_cancel(job_id)
+        with self._lock:
+            changed = self.store.request_cancel(job_id)
+            for future in list(self._futures.get(job_id, [])):
+                future.cancel()
+            return changed
+
+    def resume(self, job_id: str, resume_token: str) -> bool:
+        with self._lock:
+            if job_id not in self._queued and len(self._queued) >= self.config.max_queue_size:
+                raise QueueFullError("主控任务队列已满")
+            if not self.store.resume_job(job_id, resume_token):
+                return False
+            self.enqueue(job_id)
+            return True
 
     def probe(self, machine_id: str) -> dict[str, Any]:
         machine = self.store.get_machine(machine_id)
@@ -267,24 +291,27 @@ class JobDispatcher:
             except queue.Empty:
                 continue
             if job_id is None:
+                self._queue.task_done()
                 break
             try:
-                self._run_job(job_id)
+                self._run_job(job_id, block=False)
             finally:
-                with self._lock:
-                    self._queued.discard(job_id)
                 self._queue.task_done()
 
-    def _run_job(self, job_id: str) -> None:
+    def _run_job(self, job_id: str, *, block: bool = True) -> None:
         job = self.store.get_job_control(job_id)
         if job is None or job["status"] in TERMINAL_STATUSES:
+            with self._lock:
+                self._queued.discard(job_id)
             return
         if job["cancel_requested"]:
-            for target in job["request"]["targets"]:
-                self.store.update_worker_executions(
-                    job_id, target["machine_id"], status="CANCELED"
-                )
-            self._sync_job_status(job_id)
+            with self._lock:
+                for target in job["request"]["targets"]:
+                    self.store.update_worker_executions(
+                        job_id, target["machine_id"], status="CANCELED"
+                    )
+                self._sync_job_status(job_id)
+                self._queued.discard(job_id)
             return
 
         self.store.update_job(
@@ -295,31 +322,52 @@ class JobDispatcher:
             error=None,
         )
         targets = job["request"]["targets"]
-        with ThreadPoolExecutor(max_workers=max(1, len(targets))) as executor:
-            futures = {
-                executor.submit(
-                    self._run_target,
-                    job_id,
-                    target,
-                    job["request"],
-                    job.get("resume_token"),
-                ): target
-                for target in targets
-            }
-            for future in as_completed(futures):
+        done = threading.Event()
+        remaining = len(targets)
+
+        def finished(future: Future, machine_id: str) -> None:
+            nonlocal remaining
+            with self._lock:
                 try:
-                    future.result()
-                except Exception as exc:
-                    target = futures[future]
-                    self.store.update_worker_executions(
-                        job_id,
-                        target["machine_id"],
-                        status="FAILED",
-                        error=f"主控内部调度错误：{type(exc).__name__}: {exc}",
+                    if not self._stop.is_set():
+                        if future.cancelled():
+                            self.store.update_worker_executions(job_id, machine_id, status="CANCELED")
+                        else:
+                            error = future.exception()
+                            if error is not None:
+                                self.store.update_worker_executions(
+                                    job_id, machine_id, status="FAILED",
+                                    error=f"主控内部调度错误：{type(error).__name__}: {error}",
+                                )
+                        self._sync_job_status(job_id, finished=remaining == 1)
+                finally:
+                    remaining -= 1
+                    if remaining == 0:
+                        self._futures.pop(job_id, None)
+                        self._queued.discard(job_id)
+                        done.set()
+
+        with self._lock:
+            if self._stop.is_set():
+                return
+            futures = []
+            for target in targets:
+                machine_id = target["machine_id"]
+                if machine_id not in self._workers:
+                    self._workers[machine_id] = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix=f"dispatch-{machine_id}"
                     )
-                self._sync_job_status(job_id)
-        if not self._stop.is_set():
-            self._sync_job_status(job_id, finished=True)
+                future = self._workers[machine_id].submit(
+                    self._run_target, job_id, target, job["request"], job.get("resume_token")
+                )
+                futures.append(future)
+            self._futures[job_id] = futures
+            for future, target in zip(futures, targets):
+                future.add_done_callback(
+                    lambda future, machine_id=target["machine_id"]: finished(future, machine_id)
+                )
+        if block:
+            done.wait()
 
     def _run_target(
         self,
@@ -576,6 +624,11 @@ class JobDispatcher:
         )
 
     def _sync_job_status(self, job_id: str, *, finished: bool = False) -> None:
+        # 不同 Worker 可以同时完成同一任务；串行化读取聚合与写回，避免旧快照覆盖终态。
+        with self._lock:
+            self._sync_job_status_locked(job_id, finished=finished)
+
+    def _sync_job_status_locked(self, job_id: str, *, finished: bool = False) -> None:
         job = self.store.get_job_status(job_id)
         if job is None:
             return
@@ -583,6 +636,9 @@ class JobDispatcher:
         statuses = list(counts)
         aggregated = _aggregate_execution_statuses(statuses)
         if aggregated in TERMINAL_STATUSES:
+            if job_id in self._futures and not finished:
+                # 所有目标的完成回调收尾后才发布终态，防止立即续跑与旧回调交叉。
+                return
             self.store.update_job(
                 job_id,
                 status=aggregated,

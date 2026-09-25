@@ -303,6 +303,14 @@ class MasterStore:
             ).fetchone()
         return str(row[0]) if row else self.worker_task_id(job_id, machine_id)
 
+    def worker_execution_statuses(self, job_id: str, machine_id: str) -> set[str]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT status FROM executions WHERE job_id = ? AND machine_id = ?",
+                (job_id, machine_id),
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+
     def job_id_exists(self, job_id: str) -> bool:
         with self._connection() as connection:
             return connection.execute("SELECT 1 FROM jobs WHERE job_id = ?", (job_id,)).fetchone() is not None
@@ -757,7 +765,7 @@ class MasterStore:
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
         with self._connection() as connection:
             rows = connection.execute(
-                f"SELECT job_id FROM jobs WHERE deleted_at IS NULL AND status IN ({placeholders})",
+                f"SELECT job_id FROM jobs WHERE deleted_at IS NULL AND status IN ({placeholders}) ORDER BY created_at, job_id",
                 tuple(sorted(ACTIVE_STATUSES)),
             ).fetchall()
         return [str(row[0]) for row in rows]

@@ -476,6 +476,7 @@ class MasterServerTests(unittest.TestCase):
     def test_job_logs_forward_per_machine_offsets(self):
         job_id = "paged-logs-001"
         self.store.create_job(self.payload(job_id))
+        self.store.update_worker_executions(job_id, "worker-local", status="QUEUED")
 
         with patch("master_server.app.WorkerClient", return_value=self.fake_worker):
             response = self.client.get(
@@ -491,6 +492,7 @@ class MasterServerTests(unittest.TestCase):
     def test_job_logs_forward_tail_line_count(self):
         job_id = "tail-logs-001"
         self.store.create_job(self.payload(job_id))
+        self.store.update_worker_executions(job_id, "worker-local", status="QUEUED")
         with (
             patch("master_server.app.WorkerClient", return_value=self.fake_worker),
             patch.object(self.fake_worker, "get_log", return_value={

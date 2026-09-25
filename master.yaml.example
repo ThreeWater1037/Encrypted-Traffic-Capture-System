@@ -11,6 +11,7 @@ paths:
 limits:
   max_content_length: 268435456
   max_items: 100000
+  # 已接受且未结束的任务上限，包含正在执行的任务；重启恢复不受此上限阻挡。
   max_queue_size: 100
   worker_request_timeout: 15
   poll_interval: 30
