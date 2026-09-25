@@ -136,6 +136,33 @@ class CaptureReadinessTests(unittest.TestCase):
         with self.assertRaises(CaptureReadinessError):
             monitor.wait_ready(0.04)
 
+    def test_linux_main_info_source_location_is_a_ready_notification(self):
+        self.path.write_bytes(shb() + idb())
+        process, monitor = self.monitor()
+        process.stderr.write_line(
+            ' ** (tshark:33463) 13:42:24.472746 [Main INFO] '
+            f'./tshark.c:2927 -- capture_input_new_file(): File: "{self.path}"'
+        )
+        self.assertTrue(monitor.wait_ready(0.2)["ready"])
+
+    def test_source_location_notification_still_requires_matching_path_and_header(self):
+        prefix = (' ** (tshark:33463) 13:42:24.472746 [Main INFO] '
+                  './tshark.c:2927 -- capture_input_new_file(): ')
+        process, monitor = self.monitor()
+        self.path.write_bytes(shb() + idb())
+        process.stderr.write_line(prefix + 'File: "different.pcap"')
+        process.stderr.write_line(prefix.replace('[Main INFO]', '[Main ERROR]')
+                                  + f'File: "{self.path}"')
+        with self.assertRaises(CaptureReadinessError) as context:
+            monitor.wait_ready(0.04)
+        self.assertIsNone(context.exception.details['notification'])
+        self.path.write_bytes(shb() + idb()[:12])
+        process.stderr.write_line(prefix + f'File: "{self.path}"')
+        with self.assertRaises(CaptureReadinessError):
+            monitor.wait_ready(0.04)
+        self.path.write_bytes(shb() + idb())
+        self.assertTrue(monitor.wait_ready(0.2)['ready'])
+
     def test_early_exit_fails_even_with_ready_header_and_notification(self):
         self.path.write_bytes(shb() + idb())
         process = Process(io.StringIO(f"File: {self.path}\npermission denied\n"))

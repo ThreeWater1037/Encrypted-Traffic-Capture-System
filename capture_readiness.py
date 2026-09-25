@@ -264,7 +264,10 @@ class CaptureReadinessMonitor:
         # cannot serve as a startup notification.
         match = re.match(
             r"^\s*(?:\*\*\s+\((?:tshark|dumpcap)(?:\.exe)?:\d+\)\s+"
-            r"\d{2}:\d{2}:\d{2}\.\d+\s+\[Main\s+INFO\]\s+--\s+)?"
+            r"\d{2}:\d{2}:\d{2}\.\d+\s+\[Main\s+INFO\]\s+"
+            # Some Linux builds include source location and function in wslog.
+            r"(?:\S+:\d+\s+--\s+capture_input_new_file\(\):\s+|--\s+)"
+            r")?"
             r"File:\s*(.*?)\s*$", line,
         )
         if match is None:

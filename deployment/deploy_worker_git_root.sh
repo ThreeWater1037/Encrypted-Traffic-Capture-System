@@ -15,7 +15,7 @@ SMOKE_TIMEOUT=600
 SKIP_SMOKE=0
 ALLOW_INTERRUPT=0
 ROTATE_TOKEN=0
-REPO_URL=https://github.com/ThreeWater1037/Encrypted-Traffic-Capture-System.git
+REPO_URL=https://gitee.com/Threewater1037/encrypted-traffic-capture-system.git
 BRANCH=main
 
 usage() {
@@ -28,17 +28,18 @@ Usage: bash deploy_worker_git_root.sh [options]
   --master-ip IPv4       Add a narrow UFW rule; print cloud security-group instructions
   --smoke-url HTTPS_URL  Default: https://example.com (choose an accessible test site)
   --smoke-timeout SEC    Default: 600 seconds, includes driver downloads and queue waits
-  --skip-smoke           Skip real Chrome/Firefox capture; NOT a full acceptance check
+  --skip-smoke           Skip real Chrome/Edge/Firefox capture; NOT a full acceptance check
   --allow-interrupt      Allow restarting an existing Worker with pending tasks
   --rotate-token         Generate a new Token; update Master afterwards
   --help                Show this help
 
 Requires root, Ubuntu amd64 and systemd. No uploaded project or existing Python/Conda needed.
-Clones GitHub main. Migrates a non-Git directory with source backups.
+Clones Gitee main. Migrates a non-Git directory with source backups.
 Re-running updates a clean Git checkout using fast-forward only.
 Does not reset/clean Git or delete task data. Same-directory Master deployment is refused.
 Existing configuration is backed up; Token, proxy and data directory are preserved.
-Uses Google Chrome + Mozilla DEB Firefox. Does not remove Snap or existing task data.
+New interactive root Bash sessions activate the project Conda environment automatically.
+Uses Google Chrome + Microsoft Edge + Mozilla DEB Firefox. Does not remove Snap or existing task data.
 Does not enable UFW or alter SSH rules. Cloud security groups require console setup.
 The script stops the Worker while changing dependencies. On failure, inspect its log.
 HELP
@@ -129,6 +130,9 @@ fi
 export DEBIAN_FRONTEND=noninteractive HOME=/root
 apt-get update
 apt-get install -y git python3 python3-yaml curl ca-certificates
+# APT installs PyYAML for Ubuntu Python, not the active Conda interpreter.
+# Isolated mode also excludes PYTHONPATH/PYTHONHOME and user site packages.
+/usr/bin/python3 -I -c 'import yaml' || die 'System Python cannot import PyYAML; repair python3-yaml before deployment.'
 
 step 'Clone and validate the Git deployment target'
 export GIT_TERMINAL_PROMPT=0
@@ -162,7 +166,7 @@ printf '%s\n' "$TARGET_COMMIT" > "$BACKUP_DIR/target-commit.txt"
 
 step 'Protect deployment configuration and data paths'
 export PROJECT_DIR
-python3 - "$TMP_DIR/source-files.txt" <<'PY'
+/usr/bin/python3 -I - "$TMP_DIR/source-files.txt" <<'PY'
 import os, subprocess, sys
 from pathlib import Path
 import yaml
@@ -201,9 +205,9 @@ PY
 step 'Check existing service'
 if systemctl is-active --quiet traffic-worker; then
   if (( ! ALLOW_INTERRUPT )); then
-    command -v curl >/dev/null && command -v python3 >/dev/null || die 'Cannot inspect current Worker; use --allow-interrupt only when appropriate.'
+    command -v curl >/dev/null && [[ -x /usr/bin/python3 ]] || die 'Cannot inspect current Worker; use --allow-interrupt only when appropriate.'
     curl --noproxy '*' -fsS --max-time 10 http://127.0.0.1:5100/api/v1/health > "$TMP_DIR/health.json" || die 'Cannot inspect current Worker; stop it explicitly or use --allow-interrupt.'
-    python3 - "$TMP_DIR/health.json" <<'PY'
+    /usr/bin/python3 -I - "$TMP_DIR/health.json" <<'PY'
 import json, sys
 h = json.load(open(sys.argv[1]))
 if h.get('status') != 'ok' or h.get('busy') or h.get('queue_size', 0):
@@ -264,7 +268,7 @@ export DEBIAN_FRONTEND=noninteractive
 printf 'wireshark-common wireshark-common/install-setuid boolean false\n' | debconf-set-selections
 apt-get update
 apt-get install -y python3 curl ca-certificates gnupg tshark fonts-noto-cjk ufw nano bzip2 iproute2
-python3 - "$MASTER_IP" "$SMOKE_URL" <<'PY'
+/usr/bin/python3 -I - "$MASTER_IP" "$SMOKE_URL" <<'PY'
 import ipaddress, sys
 from urllib.parse import urlsplit
 if sys.argv[1]:
@@ -300,6 +304,32 @@ if [[ ! -x /usr/bin/google-chrome ]]; then
   chmod 700 "$TMP_DIR"
 fi
 /usr/bin/google-chrome --version
+
+step 'Install or reuse Microsoft Edge stable'
+if [[ ! -x /usr/bin/microsoft-edge-stable ]]; then
+  # Match the package-managed filename; do not add a second Edge source.
+  for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -f $source_file && $source_file != /etc/apt/sources.list.d/microsoft-edge.list ]] || continue
+    if grep -q 'packages.microsoft.com/repos/edge' "$source_file"; then
+      die "Existing Edge repository in $source_file; consolidate it into microsoft-edge.list before retrying."
+    fi
+  done
+  install -d -m 755 /etc/apt/keyrings
+  download https://packages.microsoft.com/keys/microsoft.asc "$TMP_DIR/microsoft.asc"
+  FINGERPRINT=$(gpg --batch --show-keys --with-colons "$TMP_DIR/microsoft.asc" | awk -F: '$1 == "fpr" {print $10; exit}')
+  [[ $FINGERPRINT == BC528686B50D79E339D3721CEB3E94ADBE1229CF ]] || die 'Microsoft signing key fingerprint mismatch.'
+  backup /etc/apt/keyrings/traffic-worker-microsoft.asc
+  install -m 644 "$TMP_DIR/microsoft.asc" /etc/apt/keyrings/traffic-worker-microsoft.asc
+  backup /etc/apt/sources.list.d/microsoft-edge.list
+  cat > /etc/apt/sources.list.d/microsoft-edge.list <<'EOF'
+deb [arch=amd64 signed-by=/etc/apt/keyrings/traffic-worker-microsoft.asc] https://packages.microsoft.com/repos/edge stable main
+EOF
+  chmod 644 /etc/apt/sources.list.d/microsoft-edge.list
+  apt-get update
+  apt-get install -y microsoft-edge-stable
+fi
+[[ -x /usr/bin/microsoft-edge-stable ]] || die 'Microsoft Edge stable binary missing after install.'
+/usr/bin/microsoft-edge-stable --version
 
 step 'Install Mozilla DEB Firefox (avoid Snap/standalone GeckoDriver mismatch)'
 install -d -m 755 /etc/apt/keyrings
@@ -346,6 +376,11 @@ timeout 45s /usr/bin/google-chrome --headless=new --no-sandbox --disable-dev-shm
   --user-data-dir="$TMP_DIR/chrome-profile" --dump-dom about:blank > "$TMP_DIR/chrome.log" 2>&1 || {
   cat "$TMP_DIR/chrome.log"; die 'Chrome headless startup failed.';
 }
+mkdir "$TMP_DIR/edge-profile"
+timeout 45s /usr/bin/microsoft-edge-stable --headless=new --no-sandbox --disable-dev-shm-usage \
+  --user-data-dir="$TMP_DIR/edge-profile" --dump-dom about:blank > "$TMP_DIR/edge.log" 2>&1 || {
+  cat "$TMP_DIR/edge.log"; die 'Edge headless startup failed.';
+}
 timeout 45s /usr/lib/firefox/firefox --headless --screenshot "$TMP_DIR/firefox.png" about:blank \
   > "$TMP_DIR/firefox.log" 2>&1 || { cat "$TMP_DIR/firefox.log"; die 'Firefox headless startup failed.'; }
 [[ -s $TMP_DIR/firefox.png ]] || die 'Firefox did not produce its screenshot.'
@@ -388,8 +423,10 @@ data_path.mkdir(parents=True, exist_ok=True)
 paths.update(project_root=os.environ['PROJECT_DIR'], python_executable=os.environ['PYTHON'], data_dir=str(data_path))
 for key, value in dict(max_queue_size=10, max_items=100000, task_timeout_seconds=0, max_content_length=268435456).items():
     section('limits').setdefault(key, value)
-section('browsers').update(chrome_binary='/usr/bin/google-chrome', firefox_binary='/usr/lib/firefox/firefox')
-# Keep existing Edge, CORS and proxy settings.
+section('browsers').update(chrome_binary='/usr/bin/google-chrome',
+                           edge_binary='/usr/bin/microsoft-edge-stable',
+                           firefox_binary='/usr/lib/firefox/firefox')
+# Keep existing CORS and proxy settings.
 section('network').setdefault('proxy_url', None)
 temp = p.with_name(p.name + '.deploy-tmp')
 temp.write_text(yaml.safe_dump(d, allow_unicode=True, sort_keys=False), encoding='utf-8')
@@ -433,7 +470,7 @@ systemctl daemon-reload
 systemctl enable traffic-worker
 systemctl restart traffic-worker
 
-step 'Verify API and real Chrome/Firefox captures'
+step 'Verify API and real Chrome/Edge/Firefox captures'
 export SKIP_SMOKE SMOKE_URL SMOKE_TIMEOUT
 "$PYTHON" - <<'PY'
 import json, os, time, uuid
@@ -465,14 +502,16 @@ assert Path(caps['python']['executable']).resolve() == Path(os.environ['PYTHON']
 browser_paths = {b['name']: Path(b['path']).resolve() for b in caps['browsers']}
 assert browser_paths.get('firefox') == Path('/usr/lib/firefox/firefox').resolve(), 'Wrong Firefox binary; check service environment overrides.'
 assert browser_paths.get('chrome') == Path('/usr/bin/google-chrome').resolve(), 'Wrong Chrome binary.'
+assert browser_paths.get('edge') == Path('/usr/bin/microsoft-edge-stable').resolve(), 'Wrong Edge binary; check service environment overrides.'
 assert caps['capture']['pcap'], 'TShark not detected.'
 print('Health, authentication, task Python and browser paths verified.', flush=True)
 if os.environ['SKIP_SMOKE'] == '1':
     print('SKIPPED real capture: service deployed, capture acceptance NOT verified.', flush=True)
     raise SystemExit(0)
 task_id = 'deploy-smoke-' + uuid.uuid4().hex
+browsers = ('chrome', 'edge', 'firefox')
 payload = {'task_id': task_id, 'items': [{'id': '1', 'name': 'deployment-test', 'url': os.environ['SMOKE_URL']}],
-           'browsers': ['chrome', 'firefox'], 'pcap': True,
+           'browsers': list(browsers), 'pcap': True,
            'outputs': {'html': False, 'reports': False},
            'analysis': {'steps': [], 'with_coframe': False, 'sni_suffixes': []}}
 api('/tasks', payload)
@@ -494,11 +533,12 @@ try:
                 raise RuntimeError(f'Capture did not pass: {status}. Inspect {task_dir / "worker.log"}')
             manifest = json.loads((task_dir / 'manifest.json').read_text(encoding='utf-8'))
             units = manifest.get('units', [])
-            assert len(units) == 2 and all(u.get('status') == 'SUCCEEDED' for u in units), 'Incomplete capture units.'
-            for browser in ('chrome', 'firefox'):
+            assert len(units) == len(browsers) and all(u.get('status') == 'SUCCEEDED' for u in units), 'Incomplete capture units.'
+            assert {u.get('browser') for u in units} == set(browsers), 'Missing browser capture units.'
+            for browser in browsers:
                 assert any(f.stat().st_size > 0 for f in task_dir.rglob('tls_keys_' + browser + '.log')), f'Missing {browser} TLS keys.'
                 assert any(f.stat().st_size > 24 for f in task_dir.rglob('capture_' + browser + '.pcap')), f'Missing {browser} PCAP.'
-            print('PASS: Chrome and Firefox captures SUCCEEDED, manifest and artifacts verified.', flush=True)
+            print('PASS: Chrome, Edge and Firefox captures SUCCEEDED, manifest and artifacts verified.', flush=True)
             break
         time.sleep(3)
     else:
@@ -523,9 +563,45 @@ ufw status
 printf 'UFW was not enabled automatically; preserve SSH access before enabling it.\n'
 systemctl is-enabled traffic-worker
 systemctl is-active traffic-worker
+
+step 'Set the default Conda environment for root Bash terminals'
+backup /root/.bashrc
+export CONDA_ROOT CONDA_ENV
+"$PYTHON" - <<'PY'
+import os, re
+from pathlib import Path
+
+rc = Path('/root/.bashrc')
+start = '# >>> traffic-worker conda environment >>>'
+end = '# <<< traffic-worker conda environment <<<'
+text = rc.read_text(encoding='utf-8') if rc.exists() else ''
+if text.count(start) != text.count(end) or text.count(start) > 1:
+    raise SystemExit('Malformed traffic-worker block in /root/.bashrc; inspect before retrying.')
+pattern = re.escape(start) + r'.*?' + re.escape(end) + r'\n?'
+if start in text and not re.search(pattern, text, flags=re.S):
+    raise SystemExit('Malformed traffic-worker block order in /root/.bashrc.')
+text = re.sub(pattern, '', text, flags=re.S)
+hook = Path(os.environ['CONDA_ROOT']) / 'etc/profile.d/conda.sh'
+env = Path(os.environ['CONDA_ENV'])
+if not hook.is_file():
+    raise SystemExit('Missing Conda shell hook: ' + str(hook))
+# Paths have already been restricted to absolute paths without shell metacharacters.
+# Append after any existing conda init block so this environment wins over base.
+block = f'''{start}
+if [[ $- == *i* && -r '{hook}' && -x '{env}/bin/python' ]]; then
+    source '{hook}'
+    conda activate '{env}'
+fi
+{end}
+'''
+rc.write_text(text.rstrip('\n') + '\n\n' + block, encoding='utf-8')
+PY
+
 printf '\nDeployment finished. Configuration: %s\nBackups: %s\nLog: %s\n' "$CONFIG_FILE" "$BACKUP_DIR" "$LOG"
 printf 'Git commit: %s\n' "$TARGET_COMMIT"
 printf 'Master URL: http://<Worker-IP>:5100 (do not append /api/v1).\n'
 printf 'Read the Token locally from worker.yaml; it was not printed to this deployment log.\n'
 printf 'Direct Worker smoke tasks do not appear in the Master task list.\n'
+printf 'New root Bash terminals activate: %s\n' "$CONDA_ENV"
+printf 'For the current terminal, run: source /root/.bashrc\n'
 exit 0
