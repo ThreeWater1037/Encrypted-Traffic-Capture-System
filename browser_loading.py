@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from browser_request_policy import FORBES_RECAPTCHA_REASON
 
 log = logging.getLogger("wiki_fetcher")
 RESOURCE_STALL_SECONDS = 5.0
@@ -137,6 +138,8 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
         return {
             "request_count": len(requests), "finished_count": finished_count,
             "redirect_count": redirect_count, "failed_requests": failures,
+            "intentionally_blocked_requests": [item.copy() for item in failures
+                                               if item.get("policy_reason")],
             "pending_count": len(pending), "pending_requests": list(pending.values()),
             "detached_requests": detached, "ignored_request_count": ignored_count,
             "requests": requests, "idle_seconds": idle_seconds,
@@ -283,6 +286,10 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float):
                         for key in ("blockedReason", "corsErrorStatus"):
                             if key in params:
                                 item[key] = params[key]
+                        if ((item.get("blockedReason") == "inspector"
+                             or item.get("error") == "net::ERR_BLOCKED_BY_CLIENT")
+                                and item["url"] in vars(driver).get("_capture_blocked_urls", [])):
+                            item["policy_reason"] = FORBES_RECAPTCHA_REASON
                         failures.append(item.copy())
                     activity(params, now)
 

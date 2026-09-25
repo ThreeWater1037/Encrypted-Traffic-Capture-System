@@ -48,6 +48,7 @@ from webdriver_manager.core.http import WDMHttpClient
 
 from browser_discovery import discover_browser
 from browser_proxy import BrowserProxy, parse_browser_proxy
+from browser_request_policy import blocked_urls_for_page
 from browser_loading import (
     HIT_LEGACY_HOSTS, NetworkIdleTracker, configure_uncached_network,
 )
@@ -62,17 +63,29 @@ log = logging.getLogger(__name__)
 
 
 def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
-    """设置导航兜底、无缓存策略和今日哈工大旧站资源屏蔽。"""
+    """设置导航兜底、无缓存策略和站点范围内的资源屏蔽。"""
     # Must be shorter than the WebDriver HTTP transport timeout (120s).
     driver.set_page_load_timeout(90)
+    blocked_urls = blocked_urls_for_page(url)
+    previous_urls = vars(driver).get("_capture_blocked_urls", [])
+    driver._capture_blocked_urls = blocked_urls
+    if blocked_urls:
+        log.info("    Intentional request blocking: %s", ", ".join(blocked_urls))
     firefox = vars(driver).get("_capture_firefox_network")
     if firefox is not None:
         firefox.reset_observation()
+        if blocked_urls or previous_urls:
+            firefox.set_blocked_urls(blocked_urls)
         if urlsplit(url).hostname == "today.hit.edu.cn":
             firefox.block_hosts(HIT_LEGACY_HOSTS)
         return
     if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
         configure_uncached_network(driver)
+        policy = vars(driver).get("_capture_cache_policy")
+        if blocked_urls or previous_urls:
+            if policy is None:
+                raise RuntimeError("Request blocking requires the Chromium subtarget policy")
+            policy.set_blocked_urls(blocked_urls)
         if urlsplit(url).hostname == "today.hit.edu.cn":
             driver.execute_cdp_cmd("Network.setBlockedURLs", {
                 "urls": [f"{scheme}://{host}/*"
@@ -1196,6 +1209,8 @@ class WikiFetcher:
                 "error": error_msg, "network_summary": network_summary,
                 "phase_timings": phase_timings,
                 "capture_summary": capture_summary, "cleanup_summary": cleanup_summary,
+                "request_blocking": {"urls": blocked_urls_for_page(url),
+                                     "scope": "initial_page_host"},
             }, ensure_ascii=False, indent=2), encoding="utf-8")
             temporary.replace(network_status_path)
 

@@ -24,6 +24,7 @@ class FirefoxNetworkPolicy(ChromiumCachePolicy):
     def __init__(self, driver, *, timeout=5.0):
         super().__init__(driver, timeout=timeout)
         self._intercepts = []
+        self._url_intercept = None
         self._blocked = set()
         self._blocking = set()
         self._subscription = None
@@ -129,6 +130,19 @@ class FirefoxNetworkPolicy(ChromiumCachePolicy):
             "urlPatterns": [{"type": "pattern", "protocol": scheme, "hostname": host}
                             for host in sorted(hosts) for scheme in ("http", "https")]})
         self._intercepts.append(result["intercept"])
+
+    def set_blocked_urls(self, urls):
+        """Replace exact URL exclusions; keep legacy host intercepts separate."""
+        if self._url_intercept is not None:
+            self._request("network.removeIntercept", {"intercept": self._url_intercept})
+            self._intercepts.remove(self._url_intercept)
+            self._url_intercept = None
+        if urls:
+            result = self._request("network.addIntercept", {
+                "phases": ["beforeRequestSent"],
+                "urlPatterns": [{"type": "string", "pattern": url} for url in urls]})
+            self._url_intercept = result["intercept"]
+            self._intercepts.append(self._url_intercept)
 
     def _initialize_loop(self):
         # Never await protocol replies on the receiver thread.

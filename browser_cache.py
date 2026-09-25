@@ -34,6 +34,8 @@ class ChromiumCachePolicy:
         self.timeout = timeout
         self._lock = threading.RLock()
         self._send_lock = threading.Lock()
+        self._block_config_lock = threading.Lock()
+        self._blocked_urls = []
         self._condition = threading.Condition(self._lock)
         self._pending = {}
         self._next_id = 0
@@ -211,6 +213,9 @@ class ChromiumCachePolicy:
                     target["detached"] = True
                     target["paused"] = False
                 self._condition.notify_all()
+        elif method == "Fetch.requestPaused":
+            # The receiver must remain free to process the command's reply.
+            self._initializations.put((message["sessionId"], params))
         elif method.startswith("Page."):
             with self._lock:
                 self._events.append(message)
@@ -237,16 +242,54 @@ class ChromiumCachePolicy:
                     self._cache_hits.append({"session_id": session_id, "request_id": request_id,
                                              "url": url, "reasons": reasons})
 
+    def set_blocked_urls(self, urls):
+        """Cover current and future targets, including cross-origin iframes."""
+        with self._block_config_lock:
+            with self._lock:
+                self._blocked_urls = list(urls)
+                sessions = [sid for sid, item in self._targets.items()
+                            if item["initialized"] and not item["detached"]
+                            and item["type"] in {"page", "iframe"}]
+            for session_id in sessions:
+                try:
+                    method, params = self._blocking_command()
+                    self._request(method, params, session_id)
+                except Exception as exc:
+                    self._record_error(exc)
+                    raise
+
+    def _blocking_command(self):
+        # Network.setBlockedURLs treats plain strings as substring patterns.
+        # Fetch plus an equality check keeps similar paths and query URLs intact.
+        # Configure page/iframe sessions only: their Fetch interception covers
+        # owned dedicated workers, whose own sessions have no Fetch domain.
+        if self._blocked_urls:
+            return "Fetch.enable", {"patterns": [
+                {"urlPattern": url, "requestStage": "Request"} for url in self._blocked_urls]}
+        return "Fetch.disable", {}
+
     def _initialize_loop(self):
         while True:
             session_id = self._initializations.get()
             if session_id is None:
                 return
+            if isinstance(session_id, tuple):
+                session_id, params = session_id
+                try:
+                    with self._lock:
+                        blocked = params["request"]["url"] in self._blocked_urls
+                    self._request("Fetch.failRequest" if blocked else "Fetch.continueRequest",
+                                  {"requestId": params["requestId"], **(
+                                      {"errorReason": "BlockedByClient"} if blocked else {})}, session_id)
+                except Exception as exc:
+                    self._record_error(exc)
+                continue
             with self._lock:
                 target = self._targets[session_id]
                 if target["detached"] or self._closing:
                     continue
             error = None
+            self._block_config_lock.acquire()
             try:
                 if target["type"] in {"page", "iframe"}:
                     self._request("Page.enable", {}, session_id)
@@ -256,6 +299,8 @@ class ChromiumCachePolicy:
                     ("Network.setBypassServiceWorker", {"bypass": True}),
                     ("Target.setAutoAttach", self._auto_attach(True)),
                 ]
+                if self._blocked_urls and target["type"] in {"page", "iframe"}:
+                    commands.insert(3, self._blocking_command())
                 if target["type"] == "service_worker" and target["paused"]:
                     # A newly registered SW can defer Network.enable until
                     # startup is released. Queue all policy commands first,
@@ -285,6 +330,7 @@ class ChromiumCachePolicy:
                         target["error"] = error
                         self._errors.append(f"{target['type']} {target['target_id']}: {error}")
                     self._condition.notify_all()
+                self._block_config_lock.release()
 
     def _raise_errors(self):
         if self._errors:

@@ -583,6 +583,15 @@ python wiki_fetcher.py --input urls.txt --browsers edge --pcap --network-idle-se
 信息后复查新增请求；Safari 仍使用 complete 后的固定延时。500 毫秒静默不会截断已知未完成请求，但更晚才由
 定时器发起的请求不保证被观察到。
 
+Chrome/Edge/Firefox 采集 `forbeschina.com` 及其子域名时，在导航前精确屏蔽
+`https://www.google.com/recaptcha/api2/aframe`（仅此完整 URL，不匹配其他路径或带查询参数的 URL）。
+Chrome/Edge 使用 CDP，并覆盖后续创建的子页面和 Worker；Firefox 使用 BiDi 拦截。
+规则按输入页面域名启用，不对其他站点全局屏蔽。结果属于主动排除该组件后的流量。
+`network_status_<browser>.json` 的 `request_blocking` 记录规则；请求账本保留原始失败事件，
+并通过 `policy_reason=forbes_recaptcha_exclusion` 和 `intentionally_blocked_requests`
+标识命中的主动屏蔽。其余请求仍须正常结束，超时仍报失败。
+Firefox 临时 Profile 禁用 Service Worker、Chrome/Edge 绕过 Service Worker 的策略不变。
+
 Chrome/Edge/Firefox 访问 `today.hit.edu.cn` 时采用相同的旧站屏蔽策略：
 保留 `today2.hit.edu.cn`、`myweb.hit.edu.cn` 的 HTTP/HTTPS 资源隔离；
 其余资源使用统一请求账本等待完成，不因五秒无进展主动截断；网络等待有 90 秒兜底，
