@@ -21,7 +21,7 @@ class ProcessWaitShutdown:
         if getattr(self, "_capture_stop_done", False):
             return
         started = time.perf_counter()
-        details = {"forced": False, "error": None, "timings": {}}
+        details = {"forced": False, "error": None, "warnings": [], "timings": {}}
         termination_requested = False
         self.shutdown_details = details
         process = getattr(self, "process", None)
@@ -53,8 +53,11 @@ class ProcessWaitShutdown:
                     process.wait(timeout=self.shutdown_process_timeout)
                 except subprocess.TimeoutExpired:
                     details["forced"] = True
-                    details["error"] = "Driver service did not exit after shutdown"
+                    details["warnings"].append(
+                        "Driver service did not exit after shutdown; forced termination required"
+                    )
                     process.terminate()
+                    termination_requested = True
                     try:
                         process.wait(timeout=2.0)
                     except subprocess.TimeoutExpired:
@@ -71,6 +74,7 @@ class ProcessWaitShutdown:
             details["error"] = str(exc)
         finally:
             stopped = process is None or process.poll() is not None
+            details["stopped"] = stopped
             self._capture_stop_done = stopped
             if stopped and process is not None:
                 for stream in (process.stdin, process.stdout, process.stderr):

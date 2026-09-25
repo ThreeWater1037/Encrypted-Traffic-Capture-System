@@ -1180,6 +1180,7 @@ class WikiFetcher:
                 details = getattr(service, "shutdown_details", None)
                 if isinstance(details, dict):
                     cleanup_summary["service"] = details
+                    cleanup_summary.setdefault("warnings", []).extend(details.get("warnings", []))
                     if details.get("error"):
                         cleanup_summary["error"] = details["error"]
                         error_msg = error_msg or details["error"]
@@ -1194,8 +1195,10 @@ class WikiFetcher:
             remove_started = time.perf_counter()
             try:
                 # Only the absolute directory created by mkdtemp above is owned
-                # by this attempt. Preserve it on a failed browser shutdown.
-                if not cleanup_summary.get("error"):
+                # by this attempt. A killed driver does not prove that every
+                # browser child has exited; preserve its profile for diagnosis.
+                service_forced = cleanup_summary.get("service", {}).get("forced", False)
+                if not cleanup_summary.get("error") and not service_forced:
                     shutil.rmtree(profile_dir)
                 else:
                     cleanup_summary["retained_profile"] = str(profile_dir)
@@ -1211,6 +1214,10 @@ class WikiFetcher:
         log.info("    Phase seconds: %s", " ".join(
             f"{name}={seconds:.3f}" for name, seconds in phase_timings.items()
         ))
+        for warning in cleanup_summary.get("warnings", []):
+            log.warning("    Cleanup warning: %s", warning)
+        if error_msg:
+            log.warning("    Capture failed: %s", error_msg)
         if network_summary:
             log.info("    Network observation: threshold=%.3fs pending=%s failed=%s",
                      self.network_idle_seconds, network_summary.get("pending_count"),

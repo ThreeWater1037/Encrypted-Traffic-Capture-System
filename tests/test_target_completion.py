@@ -140,6 +140,55 @@ class TargetCompletionTests(unittest.TestCase):
         self.assertEqual(len(cdp_block_patterns(rules)), 2)
         self.assertEqual(bidi_block_patterns(rules)[0]["pathname"], "/g/collect")
 
+    def test_cleanup_warning_preserves_checkpoint_but_real_failures_do_not(self):
+        for browser, cls in (("chrome", webdriver.Chrome), ("edge", webdriver.Edge),
+                             ("firefox", webdriver.Firefox)):
+            for failure in (None, "navigation", "driver", "keylog", "pcap"):
+                with self.subTest(browser=browser, failure=failure), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    profile = root / "profile"
+                    profile.mkdir()
+                    driver = MagicMock(spec=cls)
+                    driver.command_executor = MagicMock()
+                    driver.current_url, driver.title, driver.page_source = "https://example.com/", "OK", "<html>OK</html>"
+                    details = {"forced": True, "stopped": failure != "driver", "exit_code": -9,
+                               "warnings": ["Driver service required forced termination"],
+                               "error": "Driver service is still running" if failure == "driver" else None}
+                    driver.service = SimpleNamespace(shutdown_details=details)
+                    if failure == "driver":
+                        driver.quit.side_effect = WebDriverException(details["error"])
+                    if failure == "navigation":
+                        driver.get.side_effect = TimeoutException("navigation timed out")
+                    builder = MagicMock()
+                    builder.build.return_value = driver
+                    (root / f"tls_keys_{browser}.log").write_text("" if failure == "keylog" else "test-key")
+                    pcap = root / f"capture_{browser}.pcap"
+                    pcap.write_bytes(b"test-pcap")
+                    capture = MagicMock(summary={"error": "Invalid PCAP"} if failure == "pcap" else {})
+                    capture.stop.return_value = None if failure == "pcap" else pcap
+                    fetcher = WikiFetcher(root, [browser], True)
+                    summary = {"completion_policy": "target_document", "resource_status": "complete"}
+                    with patch.dict("wiki_fetcher.AVAILABLE_DRIVERS", {browser: builder}), \
+                         patch("wiki_fetcher.tempfile.mkdtemp", return_value=str(profile)), \
+                         patch("wiki_fetcher.PacketCapture", return_value=capture), \
+                         patch.object(fetcher, "_wait_for_normal_page", return_value=summary), \
+                         self.assertLogs("wiki_fetcher", level="WARNING") as logs:
+                        record = fetcher._fetch_with(driver.current_url, browser, root)
+                    self.assertTrue(any("Cleanup warning:" in line for line in logs.output))
+                    if failure in ("driver", "navigation", "pcap"):
+                        self.assertIsNotNone(record.error)
+                        self.assertTrue(any("Capture failed:" in line for line in logs.output))
+                    else:
+                        self.assertIsNone(record.error)
+                    self.assertEqual(record.cleanup_summary["retained_profile"], str(profile))
+                    entry = UrlEntry("1", "test", driver.current_url)
+                    self.assertEqual(fetcher._mark_complete(entry, root, browser, record), failure is None)
+                    status = json.loads((root / f"network_status_{browser}.json").read_text())
+                    self.assertEqual(status["cleanup_summary"]["warnings"], details["warnings"])
+                    if failure is None:
+                        marker = json.loads((root / f"capture_{browser}.complete.json").read_text())
+                        self.assertEqual(marker["cleanup_summary"]["warnings"], details["warnings"])
+
     def test_startup_navigation_metadata_and_quit_use_distinct_budgets(self):
         class Base:
             def execute(self, command, params=None):
