@@ -74,6 +74,53 @@ class WorkerAgentApiTests(unittest.TestCase):
         self.assertIn("no-store", response.headers["Cache-Control"])
         self.assertEqual(response.headers["Pragma"], "no-cache")
 
+    def test_temp_cleanup_runs_at_startup_and_hourly(self) -> None:
+        summary = {"deleted": 1, "missing": 0, "skipped": 0, "errors": 0}
+        with patch("worker_agent.task_runner.time.monotonic", return_value=100) as clock, \
+             patch("worker_agent.task_runner.cleanup_retained_directories", return_value=summary) as clean:
+            self.manager._cleanup_temp_if_due()
+            clean.assert_called_once_with(self.config.data_dir / "temp_cleanup")
+            clock.return_value = 3699
+            self.manager._cleanup_temp_if_due()
+            self.assertEqual(clean.call_count, 1)
+            clock.return_value = 3700
+            self.manager._cleanup_temp_if_due()
+            self.assertEqual(clean.call_count, 2)
+        self.assertIn('"deleted": 1', (self.config.data_dir / "temp_cleanup.log").read_text())
+
+    def test_temp_cleanup_failure_does_not_stop_queue(self) -> None:
+        with patch("worker_agent.task_runner.cleanup_retained_directories", side_effect=OSError("denied")), \
+             self.assertLogs("worker_agent.task_runner", level="WARNING") as logs:
+            self.manager._cleanup_temp_if_due()
+        self.assertIn("postponed", logs.output[0])
+        self.assertFalse(self.manager._stop_event.is_set())
+
+    def test_capture_child_receives_worker_owned_cleanup_registry(self) -> None:
+        payload = self.payload("cleanup-env")
+        self.manager.submit(payload)
+        log_path = self.config.tasks_dir / "cleanup-env" / "worker.log"
+        with patch("worker_agent.task_runner.subprocess.Popen") as popen:
+            popen.return_value.poll.return_value = 0
+            popen.return_value.pid = 1234
+            self.assertEqual(self.manager._run_command("cleanup-env", ["fixture"], log_path, None), 0)
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(environment["CAPTURE_TEMP_CLEANUP_REGISTRY"],
+                         str((self.config.data_dir / "temp_cleanup").resolve()))
+
+    def test_cleanup_is_only_called_outside_task_execution(self) -> None:
+        events = []
+        payload = self.payload("cleanup-order")
+        self.manager.submit(payload)
+        def execute(task):
+            events.append("task")
+            self.assertEqual(self.manager.active_task_id, "cleanup-order")
+            self.manager._stop_event.set()
+        with patch.object(self.manager, "_cleanup_temp_if_due", side_effect=lambda: events.append("cleanup")), \
+             patch.object(self.manager, "_run_task", side_effect=execute):
+            self.manager._worker_loop()
+        self.assertEqual(events, ["cleanup", "task"])
+        self.assertIsNone(self.manager.active_task_id)
+
     def test_internal_endpoints_require_token(self) -> None:
         response = self.client.get("/api/v1/capabilities")
         self.assertEqual(response.status_code, 401)

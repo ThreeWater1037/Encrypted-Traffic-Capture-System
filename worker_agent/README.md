@@ -227,6 +227,20 @@ URL，包含该 URL 的汇总 `status` 和 `browser_statuses[]`；顶层 `status
 
 ## 长任务恢复语义
 
+Worker 启动后及此后每小时，在任务之间的空闲时段检查残留采集临时目录；
+若整批任务持续超过一小时，清理顺延到该批任务结束，避免与抓包争用磁盘。
+只清理采集程序登记到 `WORKER_DATA_DIR/temp_cleanup/`、保留超过 24 小时的
+`wb_chrome_*`、`wb_edge_*`、`wb_firefox_*` 目录。正在运行对应浏览器或驱动、
+进程状态无法确认、目录包含链接或仍被占用时，本轮跳过或留待下轮重试。
+清理统计写入 `WORKER_DATA_DIR/temp_cleanup.log`。正式 PCAP、TLS 密钥副本、
+结果目录及驱动缓存不在清理范围内；升级前未登记的旧目录不会自动删除。
+该机制随 Worker 运行，Worker 停止时不执行；直接运行采集脚本仍只尝试即时清理。
+
+目录删除失败仅记 `cleanup_summary.warnings` 和 `retained_profile`，不影响
+已通过抓包及缓存校验的检查点。每次采集仍使用新目录：Firefox 的实际 Profile
+由 GeckoDriver 单独创建并禁用 Service Worker，Chrome/Edge 绕过 Service Worker；
+目录清理不改变这些策略。
+
 默认 `TASK_TIMEOUT_SECONDS=0`，即不设置整批任务总超时。每个采集单元成功落盘后会
 原子生成 `capture_<browser>.complete.json`；只有标记中的 URL、浏览器和各产物精确
 大小都匹配时，续跑才会跳过该单元。中断时正在写入的 URL 会清理半截文件并重抓，

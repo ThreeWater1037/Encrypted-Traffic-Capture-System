@@ -1,6 +1,7 @@
 """Target success is independent of stalled optional resources, never of HTML."""
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -188,6 +189,72 @@ class TargetCompletionTests(unittest.TestCase):
                     if failure is None:
                         marker = json.loads((root / f"capture_{browser}.complete.json").read_text())
                         self.assertEqual(marker["cleanup_summary"]["warnings"], details["warnings"])
+
+    def test_profile_deletion_failure_is_nonfatal_without_hiding_capture_failures(self):
+        for browser, cls in (("chrome", webdriver.Chrome), ("edge", webdriver.Edge),
+                             ("firefox", webdriver.Firefox)):
+            for failure in (None, "navigation", "driver", "keylog_missing",
+                            "keylog_copy", "pcap", "cache_hit", "cache_policy"):
+                with self.subTest(browser=browser, failure=failure), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    profile = root / "profile"
+                    profile.mkdir()
+                    if failure != "keylog_missing":
+                        (profile / f"tls_keys_{browser}.log").write_text("test-key")
+                    driver = MagicMock(spec=cls)
+                    driver.command_executor = MagicMock()
+                    driver.current_url, driver.title, driver.page_source = "https://example.com/", "OK", "<html>OK</html>"
+                    driver.service = SimpleNamespace(shutdown_details={
+                        "forced": False, "stopped": True, "error": None, "warnings": []})
+                    if failure == "navigation":
+                        driver.get.side_effect = TimeoutException("navigation timed out")
+                    if failure == "driver":
+                        driver.quit.side_effect = WebDriverException("Browser still running")
+                    if failure == "cache_policy":
+                        policy = driver._capture_cache_policy = MagicMock()
+                        policy.check.side_effect = RuntimeError("cache policy failed")
+                        policy.snapshot.return_value = {"errors": ["cache policy failed"]}
+                    builder = MagicMock()
+                    builder.build.return_value = driver
+                    pcap = root / f"capture_{browser}.pcap"
+                    pcap.write_bytes(b"test-pcap")
+                    capture = MagicMock(summary={"error": "Invalid PCAP"} if failure == "pcap" else {})
+                    capture.stop.return_value = None if failure == "pcap" else pcap
+                    fetcher = WikiFetcher(root, [browser], True)
+                    summary = {"completion_policy": "target_document", "resource_status": "complete",
+                               "target_document": {"request_id": "doc", "status": 200, "state": "finished"}}
+                    if failure == "cache_hit":
+                        summary["cache_hit_requests"] = [{"request_id": "doc"}]
+                    cleanup_error = PermissionError("[WinError 32] TLS keylog is in use")
+                    with patch.dict("wiki_fetcher.AVAILABLE_DRIVERS", {browser: builder}), \
+                         patch("wiki_fetcher.tempfile.mkdtemp", return_value=str(profile)), \
+                         patch("wiki_fetcher.PacketCapture", return_value=capture), \
+                         patch.object(fetcher, "_wait_for_normal_page", return_value=summary), \
+                         patch("wiki_fetcher.shutil.copy2", wraps=shutil.copy2) as copy_keylog, \
+                         patch("wiki_fetcher.shutil.rmtree", side_effect=cleanup_error) as remove_profile:
+                        if failure == "keylog_copy":
+                            copy_keylog.side_effect = PermissionError("keylog copy denied")
+                        record = fetcher._fetch_with(driver.current_url, browser, root)
+                    if failure == "driver":
+                        # Known shutdown failures already retain the directory.
+                        remove_profile.assert_not_called()
+                    else:
+                        remove_profile.assert_called_once_with(profile)
+                        self.assertEqual(record.cleanup_summary["profile_error"], str(cleanup_error))
+                        self.assertIn("temporary directory retained", record.cleanup_summary["warnings"][0])
+                    self.assertEqual(record.cleanup_summary["retained_profile"], str(profile))
+                    self.assertEqual(record.error is None, failure in (None, "keylog_missing"))
+                    entry = UrlEntry("1", "test", driver.current_url)
+                    self.assertEqual(fetcher._mark_complete(entry, root, browser, record), failure is None)
+                    status = json.loads((root / f"network_status_{browser}.json").read_text())
+                    self.assertEqual(status["error"], record.error)
+                    self.assertEqual(status["cleanup_summary"], record.cleanup_summary)
+                    if failure is None:
+                        marker = json.loads((root / f"capture_{browser}.complete.json").read_text())
+                        self.assertFalse(marker["needs_recapture"])
+                        self.assertEqual(marker["cleanup_summary"], record.cleanup_summary)
+                        self.assertEqual((root / f"tls_keys_{browser}.log").read_text(), "test-key")
+                        self.assertTrue(fetcher._checkpoint_valid(entry, root, browser))
 
     def test_startup_navigation_metadata_and_quit_use_distinct_budgets(self):
         class Base:

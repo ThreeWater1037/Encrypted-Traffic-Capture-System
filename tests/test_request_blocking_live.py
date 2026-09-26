@@ -5,6 +5,7 @@ Use CHROMEDRIVER_PATH / EDGEDRIVER_PATH / GECKODRIVER_PATH for offline drivers.
 """
 
 from collections import Counter
+from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -19,7 +20,7 @@ from unittest.mock import patch
 from selenium.common.exceptions import TimeoutException
 
 from browser_loading import NetworkIdleTracker
-from wiki_fetcher import AVAILABLE_DRIVERS, PacketCapture, WikiFetcher, _prepare_navigation
+from wiki_fetcher import AVAILABLE_DRIVERS, PacketCapture, WikiFetcher, UrlEntry, _prepare_navigation
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -124,6 +125,13 @@ class RequestBlockingLiveTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("RUN_REQUEST_BLOCKING_CAPTURE_LIVE") == "1", "opt-in TLS/PCAP test")
     def test_blocking_preserves_decryptable_https_capture(self):
+        self.check_https_capture()
+
+    @unittest.skipUnless(os.environ.get("RUN_REQUEST_BLOCKING_CAPTURE_LIVE") == "1", "opt-in TLS/PCAP test")
+    def test_profile_cleanup_warning_preserves_decryptable_capture_and_checkpoint(self):
+        self.check_https_capture(profile_cleanup_failure=True)
+
+    def check_https_capture(self, profile_cleanup_failure=False):
         root = Path(self.temp.name)
         config = root / "openssl.cnf"
         config.write_text("[req]\ndistinguished_name=dn\n[dn]\n", encoding="ascii")
@@ -154,19 +162,43 @@ class RequestBlockingLiveTests(unittest.TestCase):
             if self.browser != "firefox":
                 driver.execute_cdp_cmd("Security.setIgnoreCertificateErrors", {"ignore": True})
             return driver
+        remove_tree = shutil.rmtree
+        def fail_profile_cleanup(path, *args, **kwargs):
+            if Path(path).name.startswith(f"wb_{self.browser}_"):
+                self.addCleanup(remove_tree, path, ignore_errors=True)
+                raise PermissionError("[WinError 32] injected profile deletion failure")
+            return remove_tree(path, *args, **kwargs)
+        cleanup_patch = (patch("wiki_fetcher.shutil.rmtree", side_effect=fail_profile_cleanup)
+                         if profile_cleanup_failure else nullcontext())
+        registry = root / "temp_cleanup"
         # Record only this fixture's loopback port; trust its test certificate only in this session.
         with patch("wiki_fetcher.blocked_urls_for_page", return_value=[blocked]), \
              patch.object(AVAILABLE_DRIVERS[self.browser], "build", side_effect=build), \
              patch.object(PacketCapture, "_list_interfaces_tshark", return_value=loopbacks), \
              patch("wiki_fetcher.PacketCapture", side_effect=lambda pcap_path: PacketCapture(
-                 pcap_path, capture_filter=f"tcp port {server.server_port}")):
-            record = WikiFetcher(root, [self.browser], True)._fetch_with(
+                 pcap_path, capture_filter=f"tcp port {server.server_port}")), cleanup_patch, \
+             patch.dict(os.environ, {"CAPTURE_TEMP_CLEANUP_REGISTRY": str(registry)}):
+            fetcher = WikiFetcher(root, [self.browser], True)
+            record = fetcher._fetch_with(
                 f"https://127.0.0.1:{server.server_port}/", self.browser, root)
         self.assertIsNone(record.error, record.error)
         self.assertEqual(server.hits["/recaptcha/api2/aframe"], 0)
         self.assertEqual(len(record.network_summary["intentionally_blocked_requests"]), 4)
         self.assertTrue(record.key_log_path and Path(record.key_log_path).stat().st_size > 0)
         self.assertTrue(record.pcap_path and Path(record.pcap_path).stat().st_size > 0)
+        self.assertEqual(record.network_summary["cache_hit_requests"], [])
+        self.assertEqual(record.network_summary["cache_policy"]["errors"], [])
+        if profile_cleanup_failure:
+            self.assertIn("injected profile deletion failure", record.cleanup_summary["profile_error"])
+            self.assertTrue(record.cleanup_summary["warnings"])
+            entry = UrlEntry("1", "cleanup fixture", record.url)
+            self.assertTrue(fetcher._mark_complete(entry, root, self.browser, record))
+            self.assertTrue(fetcher._checkpoint_valid(entry, root, self.browser))
+            registrations = list(registry.glob("*.json"))
+            self.assertEqual(len(registrations), 1)
+            registration = json.loads(registrations[0].read_text())
+            self.assertEqual(registration["path"], record.cleanup_summary["retained_profile"])
+            self.assertEqual(registration["browser"], self.browser)
         decoded = subprocess.run([tool[1], "-n", "-2", "-r", record.pcap_path,
             "-o", f"tls.keylog_file:{record.key_log_path}", "-d", f"tcp.port=={server.server_port},tls",
             "-Y", "http.response", "-T", "fields", "-e", "http.file_data"],

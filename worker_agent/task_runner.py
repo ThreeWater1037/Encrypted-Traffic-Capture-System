@@ -7,6 +7,7 @@ CPU 与磁盘。执行器负责状态流转、取消、超时、日志和最终�
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import queue
@@ -18,6 +19,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from capture_temp_cleanup import CLEANUP_INTERVAL_SECONDS, REGISTRY_ENV, cleanup_retained_directories
 
 from .config import WorkerConfig
 from .task_store import TERMINAL_STATUSES, TaskStore, utc_now
@@ -75,6 +78,7 @@ class TaskManager:
             name="worker-task-runner",
             daemon=True,
         )
+        self._next_temp_cleanup = 0.0
         self.recovered_task_count = self.store.recover_incomplete_tasks()
         for task_id in self.store.queued_task_ids():
             self._queue.put_nowait(task_id)
@@ -185,6 +189,7 @@ class TaskManager:
     def _worker_loop(self) -> None:
         """串行消费队列；单个任务失败不会终止整个 Worker。"""
         while not self._stop_event.is_set():
+            self._cleanup_temp_if_due()
             try:
                 task_id = self._queue.get(timeout=0.5)
             except queue.Empty:
@@ -212,6 +217,18 @@ class TaskManager:
                     self._active_task_id = None
                     self._active_process = None
                 self._queue.task_done()
+
+    def _cleanup_temp_if_due(self) -> None:
+        """Run between tasks, at most hourly; never race this Worker's capture."""
+        if time.monotonic() < self._next_temp_cleanup:
+            return
+        self._next_temp_cleanup = time.monotonic() + CLEANUP_INTERVAL_SECONDS
+        try:
+            summary = cleanup_retained_directories(self.config.data_dir / "temp_cleanup")
+            if any(summary.values()):
+                self._append_log(self.config.data_dir / "temp_cleanup.log", json.dumps(summary))
+        except Exception:
+            logging.getLogger(__name__).warning("Capture temporary directory cleanup postponed", exc_info=True)
 
     def _run_task(self, task: dict[str, Any]) -> None:
         """执行 PREPARING→CAPTURING→ANALYZING→VALIDATING 状态机。"""
@@ -424,6 +441,7 @@ class TaskManager:
         # 固定放到 WORKER_DATA_DIR/.wdm，避免服务账户无法写用户主目录。
         environment.pop("WDM_LOCAL", None)
         environment["WDM_CACHE_DIR"] = str(self.config.data_dir)
+        environment[REGISTRY_ENV] = str((self.config.data_dir / "temp_cleanup").resolve())
         popen_kwargs: dict[str, Any] = {
             "cwd": self.config.data_dir,
             "env": environment,

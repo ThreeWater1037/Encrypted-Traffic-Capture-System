@@ -54,6 +54,7 @@ from browser_loading import (
     HIT_LEGACY_HOSTS, NetworkIdleTracker, configure_uncached_network,
 )
 from capture_readiness import CaptureReadinessMonitor, validate_capture_file
+from capture_temp_cleanup import register_retained_directory
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1205,8 +1206,19 @@ class WikiFetcher:
             except OSError as exc:
                 cleanup_summary["profile_error"] = str(exc)
                 cleanup_summary["retained_profile"] = str(profile_dir)
-                error_msg = error_msg or f"Browser profile cleanup failed: {exc}"
+                # This attempt's temporary directory is never reused. Deletion
+                # is housekeeping, independent of capture/cache validation and
+                # keylog copying; keep any earlier error and report this as a
+                # warning for Chrome, Edge and Firefox alike.
+                cleanup_summary.setdefault("warnings", []).append(
+                    f"Browser profile cleanup failed; temporary directory retained: {exc}")
             phase_timings["profile_cleanup"] = time.perf_counter() - remove_started
+            if cleanup_summary.get("retained_profile"):
+                try:
+                    register_retained_directory(profile_dir, driver_key)
+                except (OSError, ValueError) as exc:
+                    cleanup_summary.setdefault("warnings", []).append(
+                        f"Temporary directory cleanup registration failed: {exc}")
             os.environ.pop("SSLKEYLOGFILE", None)
             phase_timings["browser_cleanup"] = time.perf_counter() - phase_started
 
