@@ -200,6 +200,7 @@ async function copyPath(path) {
         <div class="panel-heading"><div><h3>Worker 日志 · 最新 10 行</h3><p>仅在点击“读取日志”或“刷新日志”时更新，每次替换为最新内容</p></div><button class="secondary-button" :disabled="logsLoading" @click="emit('logs', selectedJob.job_id)"><RefreshCw :size="15" />{{ logsLoading ? '读取中…' : '刷新日志' }}</button></div>
         <article v-for="entry in logs" :key="entry.machine_id">
           <div class="log-meta"><strong>{{ entry.machine_name }}</strong><span v-if="!entry.error">本次显示 {{ entry.line_count || 0 }} 行{{ entry.truncated ? ' · 超长日志已截断' : '' }}</span></div>
+          <p v-if="entry.task_id" class="artifact-path">Worker 任务目录名：<code>{{ entry.task_id }}</code></p>
           <pre>{{ entry.error || entry.text || '暂无日志' }}</pre>
         </article>
       </div>
@@ -222,6 +223,11 @@ async function copyPath(path) {
                 <div><strong>{{ execution.machine_name }}</strong><span>{{ execution.browser }}</span></div>
                 <StatusPill :status="execution.status" />
                 <small>{{ statusLabel(execution.stage) }}</small>
+                <div v-if="execution.worker_task_id" class="artifact-path">
+                  <span>Worker 任务目录名</span>
+                  <code>{{ execution.worker_task_id }}</code>
+                  <button class="secondary-button" @click="copyPath(execution.worker_task_id)">复制目录名</button>
+                </div>
                 <p v-if="execution.result?.status === 'CAPTURED' && execution.status !== 'CAPTURED'" class="capture-evidence">已有采集完成证据；当前状态不代表这些产物已丢失，最终校验结果尚未确认。</p>
                 <p v-if="execution.error">{{ execution.error }}</p>
                 <p v-if="execution.result?.batch_error">批次异常：{{ execution.result.batch_error }}</p>

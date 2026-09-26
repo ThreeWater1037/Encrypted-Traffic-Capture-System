@@ -504,7 +504,7 @@ components:
         execution_id: { type: integer }
         machine_id: { type: string }
         machine_name: { type: string }
-        worker_task_id: { type: string }
+        worker_task_id: { type: string, description: 实际 Worker 任务 ID 和目录名。新任务沿用 job_id；历史任务保留原映射，不适合作目录的显式 ID 会安全转换。 }
         item_id: { type: string }
         browser: { type: string }
         status: { type: string }

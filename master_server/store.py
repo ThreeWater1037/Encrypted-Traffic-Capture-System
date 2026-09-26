@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from .schema import named_task_id
+from .schema import worker_directory_id
 
 
 TERMINAL_STATUSES = {"SUCCEEDED", "PARTIAL", "FAILED", "CANCELED", "INTERRUPTED"}
@@ -254,17 +254,13 @@ class MasterStore:
                     now,
                 ),
             )
-            worker_task_ids = {
-                target["machine_id"]: named_task_id(
-                    request_data["name"], f"{request_data['job_id']}\0{target['machine_id']}"
-                )
-                for target in request_data["targets"]
-            }
+            # 不同 Worker 的存储相互独立，同一任务沿用同一个 ID，避免重复哈希。
+            task_id = worker_directory_id(request_data["job_id"])
             rows = (
                 (
                     request_data["job_id"],
                     target["machine_id"],
-                    worker_task_ids[target["machine_id"]],
+                    task_id,
                     item["id"],
                     item["name"],
                     item["url"],

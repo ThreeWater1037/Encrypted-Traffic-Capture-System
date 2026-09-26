@@ -13,6 +13,7 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 JOB_ID_RE = re.compile(r"^[^\W_][\w.-]{0,63}$")
 ALLOWED_BROWSERS = ("chrome", "edge", "firefox")
 ALLOWED_STEPS = ("extract", "classify", "infer")
+WINDOWS_RESERVED_RE = re.compile(r"^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)", re.IGNORECASE)
 
 
 class ValidationError(ValueError):
@@ -23,7 +24,7 @@ def named_task_id(name: str, seed: str) -> str:
     """保留可读名称，限制字符和 UTF-8 字节长度，并使用独立哈希防重。"""
     slug = "".join(char if char.isalnum() or char in "._-" else "-" for char in name)
     slug = re.sub(r"-+", "-", slug).strip("._-")
-    if re.match(r"^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)", slug, re.IGNORECASE):
+    if WINDOWS_RESERVED_RE.match(slug):
         slug = f"task-{slug}"
     slug = slug[:47].encode("utf-8")[:96].decode("utf-8", errors="ignore").rstrip("._-") or "task"
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
@@ -32,6 +33,13 @@ def named_task_id(name: str, seed: str) -> str:
 
 def new_job_id(name: str = "task") -> str:
     return named_task_id(name, uuid.uuid4().hex)
+
+
+def worker_directory_id(job_id: str) -> str:
+    """新任务共用 Master ID；仅对不适合作目录的显式 ID 保留安全转换。"""
+    if WINDOWS_RESERVED_RE.match(job_id) or job_id.endswith(".") or len(job_id.encode("utf-8")) > 240:
+        return named_task_id(job_id, job_id)
+    return job_id
 
 
 def _text(value: Any, field: str, *, maximum: int) -> str:

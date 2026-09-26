@@ -8,9 +8,9 @@ from unittest.mock import patch
 
 from werkzeug.serving import make_server
 
-from master_server.schema import new_job_id, named_task_id
+from master_server.schema import new_job_id, named_task_id, worker_directory_id
 from master_server.store import MasterStore
-from master_server.worker_client import WorkerClient
+from master_server.worker_client import WorkerClient, WorkerRequestError
 from tests import test_master_server as master_fixtures
 from tests import test_worker_agent as worker_fixtures
 
@@ -115,14 +115,61 @@ class JobManagementTests(unittest.TestCase):
         job_id = response.get_json()['job_id']
         task_id = self.master.store.get_worker_task_id(job_id, 'worker-local')
         self.assertRegex(task_id, r'^中文采集实验-[0-9a-f]{16}$')
-        self.assertNotEqual(task_id, named_task_id(payload['name'], f'{job_id}\0another-machine'))
+        self.assertEqual(task_id, job_id)
         # Existing execution mappings must win, even after upgrading the naming rule.
-        legacy = MasterStore.worker_task_id(job_id, 'worker-local')
-        with self.master.store._connection() as connection:
-            connection.execute('UPDATE executions SET worker_task_id=? WHERE job_id=?', (legacy, job_id))
-        self.master.dispatcher._run_job(job_id)
-        self.assertEqual(self.master.fake_worker.task_id, legacy)
-        self.assertEqual(self.master.store.get_worker_task_id(job_id, 'worker-local'), legacy)
+        for legacy in (MasterStore.worker_task_id(job_id, 'worker-local'),
+                       named_task_id(payload['name'], f'{job_id}\0worker-local')):
+            with self.subTest(legacy=legacy):
+                with self.master.store._connection() as connection:
+                    connection.execute('UPDATE executions SET worker_task_id=? WHERE job_id=?', (legacy, job_id))
+                self.master.dispatcher._run_job(job_id)
+                self.assertEqual(self.master.fake_worker.task_id, legacy)
+                self.assertTrue(self.master.store.resume_job(job_id, 'legacy-resume'))
+                reopened = MasterStore(self.master.config.database_path)
+                self.assertEqual(reopened.get_worker_task_id(job_id, 'worker-local'), legacy)
+                detail = self.master.client.get('/api/v1/jobs/' + quote(job_id, safe='') + '?unit=url').get_json()
+                self.assertTrue(all(unit['worker_task_id'] == legacy for unit in detail['executions']))
+                with patch('master_server.app.WorkerClient', return_value=self.master.fake_worker):
+                    logs = self.master.client.get('/api/v1/jobs/' + quote(job_id, safe='') + '/logs').get_json()
+                self.assertEqual(logs['logs'][0]['task_id'], legacy)
+                with patch('master_server.app.WorkerClient') as worker_client:
+                    worker_client.return_value.get_log.side_effect = WorkerRequestError('offline')
+                    logs = self.master.client.get('/api/v1/jobs/' + quote(job_id, safe='') + '/logs').get_json()
+                self.assertEqual(logs['logs'][0]['task_id'], legacy)
+
+    def test_all_workers_share_job_id_and_new_round_gets_fresh_directory(self):
+        machine = self.master.store.get_machine('worker-local')
+        self.master.store.upsert_machine({**machine, 'machine_id': 'worker-other'})
+        payload = self.master.payload(); payload.pop('job_id')
+        payload['targets'] = [
+            {'machine_id': machine_id, 'browsers': ['chrome', 'edge', 'firefox']}
+            for machine_id in ('worker-local', 'worker-other')
+        ]
+        ids = []
+        for _ in range(2):
+            response = self.master.client.post('/api/v1/jobs', json=payload)
+            self.assertEqual(response.status_code, 202)
+            job_id = response.get_json()['job_id']
+            ids.append(job_id)
+            units = self.master.store.get_job(job_id)['executions']
+            self.assertEqual(len(units), 12)
+            self.assertEqual({unit['worker_task_id'] for unit in units}, {job_id})
+        self.assertNotEqual(*ids)
+        self.master.store.update_job(ids[0], status='FAILED')
+        response = self.master.client.post('/api/v1/jobs/' + quote(ids[0], safe='') + '/restart', json={})
+        self.assertEqual(response.status_code, 202)
+        restarted = response.get_json()['job_id']
+        self.assertNotIn(restarted, ids)
+        self.assertEqual({unit['worker_task_id'] for unit in self.master.store.get_job(restarted)['executions']}, {restarted})
+
+    def test_explicit_ids_keep_portable_directory_names(self):
+        self.assertEqual(worker_directory_id('custom-job-123'), 'custom-job-123')
+        for job_id in ('CON', 'NUL.txt', 'custom.', '\U00020000' * 64):
+            with self.subTest(job_id=job_id):
+                directory = worker_directory_id(job_id)
+                self.assertNotEqual(directory, job_id)
+                self.assertFalse(directory.endswith('.'))
+                self.assertLessEqual(len(directory.encode('utf-8')), 240)
 
     def test_chinese_ids_work_over_real_worker_http_and_create_named_directory(self):
         worker = worker_fixtures.WorkerAgentApiTests(); worker.setUp()
@@ -131,10 +178,20 @@ class JobManagementTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
         try:
             client = WorkerClient(f'http://127.0.0.1:{server.server_port}', 'test-token')
-            task_id = new_job_id('中文采集实验')
-            payload = worker.payload(task_id)
-            client.submit_task(payload)
+            payload = self.master.payload(); payload.pop('job_id'); payload['name'] = '中文采集实验'
+            payload['targets'][0]['browsers'] = ['chrome', 'edge', 'firefox']
+            response = self.master.client.post('/api/v1/jobs', json=payload)
+            self.assertEqual(response.status_code, 202)
+            task_id = response.get_json()['job_id']
+            capabilities = {'browsers': [{'name': browser} for browser in ('chrome', 'edge', 'firefox')]}
+            with patch.object(self.master.fake_worker, 'submit_task', side_effect=client.submit_task), \
+                 patch.object(self.master.fake_worker, 'capabilities', return_value=capabilities):
+                self.master.dispatcher._run_job(task_id)
             self.assertTrue((worker.config.tasks_dir / task_id).is_dir())
+            self.assertEqual(worker.store.get_task(task_id)['request']['browsers'], ['chrome', 'edge', 'firefox'])
+            detail = self.master.client.get('/api/v1/jobs/' + quote(task_id, safe='') + '?unit=url').get_json()
+            self.assertEqual(detail['job_id'], task_id)
+            self.assertTrue(all(unit['worker_task_id'] == task_id for unit in detail['executions']))
             self.assertEqual(client.get_task(task_id)['task_id'], task_id)
             self.assertEqual(client.get_capture_progress(task_id)['task_id'], task_id)
             self.assertEqual(client.get_log(task_id, tail_lines=10)['tail_lines'], 10)

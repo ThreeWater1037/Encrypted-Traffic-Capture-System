@@ -467,7 +467,7 @@ def create_app(
                 )
                 logs.append({"machine_id": machine["machine_id"], "machine_name": machine["name"], **entry})
             except WorkerRequestError as exc:
-                logs.append({"machine_id": machine["machine_id"], "machine_name": machine["name"], "text": "", "error": str(exc)})
+                logs.append({"machine_id": machine["machine_id"], "machine_name": machine["name"], "task_id": worker_task_id, "text": "", "error": str(exc)})
         return jsonify({"job_id": job_id, "logs": logs})
 
     return app
