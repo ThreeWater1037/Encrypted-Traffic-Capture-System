@@ -6,8 +6,9 @@ import unittest
 from unittest.mock import patch
 
 from capture_temp_cleanup import (
-    REGISTRY_ENV, RETENTION_SECONDS, cleanup_retained_directories,
+    REGISTRY_ENV, cleanup_retained_directories,
     register_retained_directory, running_capture_browsers,
+    main,
 )
 
 
@@ -23,7 +24,7 @@ class CaptureTempCleanupTests(unittest.TestCase):
         patch.dict(os.environ, {REGISTRY_ENV: str(self.registry)}).start()
         self.running = patch("capture_temp_cleanup.running_capture_browsers", return_value=set()).start()
 
-    def register(self, browser="firefox", *, age=RETENTION_SECONDS + 1):
+    def register(self, browser="firefox", *, age=0):
         path = Path(tempfile.mkdtemp(prefix=f"wb_{browser}_", dir=self.root))
         (path / "keys.log").write_text("fixture")
         with patch("capture_temp_cleanup.time.time", return_value=self.now - age):
@@ -33,18 +34,18 @@ class CaptureTempCleanupTests(unittest.TestCase):
         return path, entry
 
     def clean(self):
-        return cleanup_retained_directories(self.registry, now=self.now)
+        return cleanup_retained_directories(self.registry)
 
-    def test_only_expired_registered_directories_deleted_for_all_browsers(self):
+    def test_registered_idle_directories_deleted_immediately_for_all_browsers(self):
         for browser in ("chrome", "edge", "firefox"):
             old, entry = self.register(browser)
-            recent, _ = self.register(browser, age=RETENTION_SECONDS - 1)
+            recent, _ = self.register(browser, age=0)
             unknown = self.root / f"wb_{browser}_unregistered"
             unknown.mkdir()
-            self.assertEqual(self.clean()["deleted"], 1)
+            self.assertEqual(self.clean()["deleted"], 2)
             self.assertFalse(old.exists())
             self.assertFalse(entry.exists())
-            self.assertTrue(recent.exists())
+            self.assertFalse(recent.exists())
             self.assertTrue(unknown.exists())
 
     def test_running_browsers_are_skipped_and_later_retried(self):
@@ -81,13 +82,12 @@ class CaptureTempCleanupTests(unittest.TestCase):
         self.assertEqual(self.clean()["deleted"], 1)
         self.assertFalse(path.exists())
 
-    def test_arbitrary_paths_wrong_identity_and_invalid_age_are_never_deleted(self):
+    def test_arbitrary_paths_and_wrong_identity_are_never_deleted(self):
         path, entry = self.register()
         original = json.loads(entry.read_text())
         for update in ({"path": str(self.root)}, {"path": str(self.registry)},
                        {"path": str(self.root.parent / path.name)}, {"inode": -1},
-                       {"browser": "chrome"}, {"retained_at": float("nan")},
-                       {"retained_at": float("-inf")}, {"version": 999}):
+                       {"browser": "chrome"}, {"version": 999}):
             with self.subTest(update=update):
                 entry.write_text(json.dumps({**original, **update}))
                 self.assertEqual(self.clean()["deleted"], 0)
@@ -124,6 +124,99 @@ class CaptureTempCleanupTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             register_retained_directory(self.root, "firefox")
         self.assertFalse(self.registry.exists())
+
+    def test_screenshot_browser_directories_are_cleaned_without_age_or_registration(self):
+        names = ["rust_mozprofile9CyUIY",
+                 "com.google.Chrome.chrome_chrome_url_fetcher_.ABC123",
+                 "com.google.Chrome.chrome_chrome_Unpacker_BeginUnzipping.ABC123",
+                 "com.microsoft.Edge.msedge_chrome_Unpacker_BeginUnzipping.ABC123",
+                 "com.microsoft.Edge.msedge_url_fetcher_.ABC123",
+                 "chrome_url_fetcher_ABC123", "chrome_Unpacker_BeginUnzippingABC123",
+                 "msedge_url_fetcher_ABC123"]
+        for name in names:
+            path = self.root / name
+            path.mkdir()
+            (path / "fresh-file").write_text("just created")
+        self.assertFalse(self.registry.exists())
+        self.assertEqual(self.clean()["deleted"], len(names))
+        self.assertTrue(all(not (self.root / name).exists() for name in names))
+
+    def test_unknown_files_directories_and_nested_candidates_are_preserved(self):
+        for name in ("other-cache", "rust_mozprofile", "com.google.Chrome.downloads",
+                     "com.microsoft.Edge.msedge_url_fetcher_", "capture_firefox.pcap"):
+            (self.root / name).mkdir()
+        nested = self.root / "other-cache" / "rust_mozprofileABC123"
+        nested.mkdir()
+        named_file = self.root / "rust_mozprofileABC123"
+        named_file.write_text("not a directory")
+        self.assertEqual(self.clean()["deleted"], 0)
+        self.assertTrue(nested.exists())
+        self.assertTrue(named_file.is_file())
+
+    def test_busy_browser_and_updater_prevent_legacy_directory_deletion(self):
+        names = {"rust_mozprofileABC123": {"firefox"},
+                 "com.google.Chrome.chrome_chrome_url_fetcher_.ABC123": {"chrome"},
+                 "com.microsoft.Edge.msedge_url_fetcher_.ABC123": {"edge"},
+                 "chrome_url_fetcher_ABC123": {"chrome", "edge"}}
+        for name, browsers in names.items():
+            path = self.root / name
+            path.mkdir()
+            for browser in browsers:
+                self.running.return_value = {browser}
+                self.assertEqual(self.clean()["deleted"], 0)
+                self.assertTrue(path.exists())
+            self.running.return_value = set()
+            self.assertEqual(self.clean()["deleted"], 1)
+
+    def test_registered_firefox_profile_retains_identity_protection(self):
+        path = self.root / "rust_mozprofileABC123"
+        path.mkdir()
+        register_retained_directory(path, "firefox")
+        entry = next(self.registry.glob("*.json"))
+        record = json.loads(entry.read_text())
+        entry.write_text(json.dumps({**record, "inode": -1}))
+        self.assertEqual(self.clean()["deleted"], 0)
+        self.assertTrue(path.exists(), "Legacy scanning must not bypass a failed registry identity check")
+
+    def test_other_unix_users_directories_are_not_deleted(self):
+        path = self.root / "rust_mozprofileABC123"
+        path.mkdir()
+        with patch("capture_temp_cleanup.os.getuid", return_value=path.stat().st_uid + 1, create=True):
+            self.assertEqual(self.clean()["deleted"], 0)
+        self.assertTrue(path.exists())
+
+    def test_legacy_links_are_skipped_but_firefox_lock_leaf_is_safe(self):
+        path = self.root / "rust_mozprofileABC123"
+        path.mkdir()
+        outside = self.root / "keep.txt"
+        outside.write_text("keep")
+        try:
+            (path / "lock").symlink_to(outside)
+        except OSError as exc:
+            self.skipTest(f"Symlink creation unavailable: {exc}")
+        self.assertEqual(self.clean()["deleted"], 1)
+        self.assertEqual(outside.read_text(), "keep")
+        path.mkdir()
+        (path / "other-link").symlink_to(outside)
+        self.assertEqual(self.clean()["deleted"], 0)
+        self.assertTrue(path.exists())
+
+    def test_deploy_cli_cleans_configured_temp_root_and_preserves_outputs(self):
+        config = self.root / "worker.yaml"
+        config.write_text("paths:\n  data_dir: data\n")
+        output = self.root / "data" / "tasks"
+        output.mkdir(parents=True)
+        (output / "capture.pcap").write_text("keep")
+        profile = self.root / "rust_mozprofileABC123"
+        profile.mkdir()
+        with patch("sys.argv", ["cleanup", "--worker-config", str(config), "--temp-root", str(self.root)]):
+            self.assertEqual(main(), 0)
+        self.assertFalse(profile.exists())
+        self.assertEqual((output / "capture.pcap").read_text(), "keep")
+
+    def test_filesystem_root_is_never_accepted(self):
+        with self.assertRaises(ValueError):
+            cleanup_retained_directories(self.registry, temp_root=Path(self.root.anchor))
 
     def test_process_names_cover_three_browsers_and_drivers(self):
         output = ('"firefox.exe","1"\n"msedgedriver.exe","2"\n"chrome.exe","3"'

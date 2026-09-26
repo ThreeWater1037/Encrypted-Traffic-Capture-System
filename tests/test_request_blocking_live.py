@@ -195,8 +195,10 @@ class RequestBlockingLiveTests(unittest.TestCase):
             self.assertTrue(fetcher._mark_complete(entry, root, self.browser, record))
             self.assertTrue(fetcher._checkpoint_valid(entry, root, self.browser))
             registrations = list(registry.glob("*.json"))
-            self.assertEqual(len(registrations), 1)
-            registration = json.loads(registrations[0].read_text())
+            entries = [json.loads(path.read_text()) for path in registrations]
+            matches = [entry for entry in entries if entry["path"] == record.cleanup_summary["retained_profile"]]
+            self.assertEqual(len(matches), 1)
+            registration = matches[0]
             self.assertEqual(registration["path"], record.cleanup_summary["retained_profile"])
             self.assertEqual(registration["browser"], self.browser)
         decoded = subprocess.run([tool[1], "-n", "-2", "-r", record.pcap_path,

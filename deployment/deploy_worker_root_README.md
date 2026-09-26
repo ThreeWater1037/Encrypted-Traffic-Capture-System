@@ -6,6 +6,12 @@
 
 ## 使用方法
 
+每次部署在停止旧 Worker 后、新 Worker 启动前运行内嵌的临时目录清理程序。
+它直接清理已闲置的登记目录、Firefox `rust_mozprofile*` 和 Chrome/Edge 下载、
+解包目录，不等待 24 小时；运行中、被占用、其他用户所属或带非预期链接的目录跳过。
+正式 PCAP、密钥副本和结果不会删除。新源码中的 Worker 每小时在任务间隙再次清理；
+已有服务器要更新常驻 Worker 的清理逻辑，需要使用 `--update-code`。
+
 在本地 Windows PowerShell 上传这一个文件（替换服务器公网 IP）：
 
 ```powershell

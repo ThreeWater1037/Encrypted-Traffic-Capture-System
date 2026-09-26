@@ -229,12 +229,19 @@ URL，包含该 URL 的汇总 `status` 和 `browser_statuses[]`；顶层 `status
 
 Worker 启动后及此后每小时，在任务之间的空闲时段检查残留采集临时目录；
 若整批任务持续超过一小时，清理顺延到该批任务结束，避免与抓包争用磁盘。
-只清理采集程序登记到 `WORKER_DATA_DIR/temp_cleanup/`、保留超过 24 小时的
-`wb_chrome_*`、`wb_edge_*`、`wb_firefox_*` 目录。正在运行对应浏览器或驱动、
-进程状态无法确认、目录包含链接或仍被占用时，本轮跳过或留待下轮重试。
+每轮直接清理已不再使用的临时目录，不再等待 24 小时。范围包括登记到
+`WORKER_DATA_DIR/temp_cleanup/` 的 `wb_chrome_*`、`wb_edge_*`、`wb_firefox_*`，
+以及系统临时目录第一层中名称匹配白名单的 `rust_mozprofile*`、Chrome/Edge
+`url_fetcher` 下载目录和 `Unpacker_BeginUnzipping` 解包目录（含产品名前缀）。
+浏览器自身产生的这些旧目录无需登记，也会纳入检查；不批量清空 `/tmp`。
+对应浏览器、驱动或更新进程仍运行、进程状态无法确认、存在非预期链接、目录属于
+其他系统用户或仍被占用时，本轮跳过或留待下轮重试。Firefox 的 Unix Profile
+`lock`/`.parentlock` 叶子链接仅删除链接本身，不访问其目标。
 清理统计写入 `WORKER_DATA_DIR/temp_cleanup.log`。正式 PCAP、TLS 密钥副本、
-结果目录及驱动缓存不在清理范围内；升级前未登记的旧目录不会自动删除。
+结果目录及驱动缓存不在清理范围内；未登记的旧 `wb_*` 仍不自动删除。
 该机制随 Worker 运行，Worker 停止时不执行；直接运行采集脚本仍只尝试即时清理。
+Ubuntu 两种部署脚本及 Windows 部署脚本会在旧 Worker 停止后、新 Worker 启动前
+额外执行一次相同清理；目录被占用或进程检查失败只跳过，不中断部署。
 
 目录删除失败仅记 `cleanup_summary.warnings` 和 `retained_profile`，不影响
 已通过抓包及缓存校验的检查点。每次采集仍使用新目录：Firefox 的实际 Profile

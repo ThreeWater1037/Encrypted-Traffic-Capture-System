@@ -896,6 +896,8 @@ if __name__ == '__main__':
     sys.exit(main())
 '@
     Write-Utf8 $Runner $runnerCode
+    Write-Host 'Cleaning unused browser temporary directories before Worker startup...'
+    Invoke-Native $Python @((Join-Path $ProjectDir 'capture_temp_cleanup.py'), '--worker-config', $ConfigFile)
     Write-Host "Registering startup task for $($TaskCredential.UserName)..."
     Register-WorkerStartupTask $TaskCredential
     Start-ScheduledTask -TaskName $TaskName -TaskPath '\'

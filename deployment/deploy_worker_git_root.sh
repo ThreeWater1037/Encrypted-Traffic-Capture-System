@@ -435,6 +435,9 @@ temp.replace(p)
 print('Data directory:', data_path)
 PY
 
+step 'Clean unused browser temporary directories before Worker startup'
+"$PYTHON" "$PROJECT_DIR/capture_temp_cleanup.py" --worker-config "$CONFIG_FILE"
+
 step 'Install root systemd service'
 UNIT=/etc/systemd/system/traffic-worker.service
 backup "$UNIT"

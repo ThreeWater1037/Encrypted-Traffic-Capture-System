@@ -1052,6 +1052,7 @@ class WikiFetcher:
             capture = PacketCapture(pcap_path=self._pcap_path(url_dir, driver_key))
 
         driver = None
+        firefox_profile = None
         error_msg = None
         final_url = url
         page_title = ""
@@ -1072,6 +1073,10 @@ class WikiFetcher:
             log.info("    Starting %s ...", bd.name)
             phase_started = time.perf_counter()
             driver = bd.build(browser_key_log, profile_dir, self.proxy)
+            if driver_key == "firefox":
+                actual_profile = driver.capabilities.get("moz:profile")
+                if isinstance(actual_profile, str) and actual_profile:
+                    firefox_profile = Path(actual_profile)
             phase_timings["browser_start"] = time.perf_counter() - phase_started
 
             t0 = time.perf_counter()
@@ -1219,6 +1224,14 @@ class WikiFetcher:
                 except (OSError, ValueError) as exc:
                     cleanup_summary.setdefault("warnings", []).append(
                         f"Temporary directory cleanup registration failed: {exc}")
+            if firefox_profile is not None:
+                try:
+                    if firefox_profile.is_dir():
+                        cleanup_summary["retained_browser_profile"] = str(firefox_profile)
+                        register_retained_directory(firefox_profile, "firefox")
+                except (OSError, ValueError) as exc:
+                    cleanup_summary.setdefault("warnings", []).append(
+                        f"Firefox Profile cleanup registration failed: {exc}")
             os.environ.pop("SSLKEYLOGFILE", None)
             phase_timings["browser_cleanup"] = time.perf_counter() - phase_started
 
