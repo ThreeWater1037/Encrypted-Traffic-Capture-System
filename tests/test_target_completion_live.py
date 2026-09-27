@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
+from browser_request_policy import FORBES_AD_URLS, FORBES_GOOGLE_ANALYTICS_URL
 from wiki_fetcher import AVAILABLE_DRIVERS, WikiFetcher, UrlEntry, _prepare_navigation
 
 
@@ -22,7 +23,13 @@ class Handler(BaseHTTPRequestHandler):
         self.server.hits[self.path] += 1
         path = urlsplit(self.path).path
         port = self.server.server_port
-        if path == "/page":
+        if path == "/exclusions":
+            paths = [urlsplit(url).path for url in (FORBES_GOOGLE_ANALYTICS_URL, *FORBES_AD_URLS)]
+            body = ('<!doctype html><title>Exclusions OK</title><link rel="icon" href="data:,">'
+                    + ''.join(f'<script>fetch("{p}?v=2").catch(()=>{{}});'
+                              f'fetch("{p}-other").then(r=>r.text());</script><iframe src="{p}?frame=1"></iframe>'
+                              for p in paths) + '<body>Target content</body>').encode()
+        elif path == "/page":
             body = (f'<!doctype html><title>Target OK</title><link rel="icon" href="data:,">'
                     f'<script>fetch("http://localhost:{port}/g/collect?v=2&en=page_view").catch(()=>{{}});'
                     'fetch("/g/collect-other");</script>'
@@ -113,6 +120,37 @@ class TargetCompletionLiveTests(unittest.TestCase):
         print(f"{self.browser}: target complete, iframe warning, GA query blocked; "
               f"navigation={record.phase_timings['navigation']:.2f}s "
               f"resource_wait={record.phase_timings['network_idle']:.2f}s")
+
+    def test_observed_forbes_exclusions_allow_network_idle_and_can_be_cleared(self):
+        # Use owned endpoints to prove blocked fetches/iframes never reach the
+        # server while adjacent paths still load. Keep production path names.
+        paths = [urlsplit(url).path for url in (FORBES_GOOGLE_ANALYTICS_URL, *FORBES_AD_URLS)]
+        rules = [self.base + path for path in paths]
+        driver = AVAILABLE_DRIVERS[self.browser].build(self.root / "keys.log", self.root)
+        self.addCleanup(driver.quit)
+        self.addCleanup(driver._capture_cache_policy.close)
+        with patch("browser_request_policy.FORBES_GOOGLE_ANALYTICS_URL", rules[0]), \
+             patch("browser_request_policy.FORBES_AD_URLS", tuple(rules[1:])), \
+             patch("wiki_fetcher.blocked_urls_for_page", return_value=rules):
+            _prepare_navigation(driver, self.base + "/exclusions")
+            driver.get(self.base + "/exclusions")
+            summary = WikiFetcher(self.root, [self.browser], False)._wait_for_normal_page(driver)
+        self.assertEqual(summary["completion_reason"], "network_idle", json.dumps(summary))
+        self.assertEqual(summary["pending_count"], 0)
+        self.assertEqual(summary["target_document"]["status"], 200)
+        blocked = summary["intentionally_blocked_requests"]
+        self.assertEqual(len(blocked), 2 * len(paths), json.dumps(summary))
+        self.assertEqual({r["policy_reason"] for r in blocked},
+                         {"forbes_analytics_exclusion", "forbes_ad_exclusion"})
+        for path in paths:
+            self.assertEqual(self.server.hits[path + "?v=2"], 0)
+            self.assertEqual(self.server.hits[path + "?frame=1"], 0)
+            self.assertEqual(self.server.hits[path + "-other"], 1)
+        _prepare_navigation(driver, self.base + "/normal")
+        driver.get(self.base + paths[0] + "?v=2")
+        self.assertEqual(self.server.hits[paths[0] + "?v=2"], 1)
+        driver._capture_cache_policy.check()
+        print(f"{self.browser}: all five new endpoints blocked for fetch/iframe; network_idle")
 
     def test_target_http_failure_is_fast_and_has_no_checkpoint(self):
         fetcher = WikiFetcher(self.root, [self.browser], False)
