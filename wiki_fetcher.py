@@ -54,7 +54,7 @@ from browser_loading import (
     HIT_LEGACY_HOSTS, NetworkIdleTracker, configure_uncached_network,
 )
 from capture_readiness import CaptureReadinessMonitor, validate_capture_file
-from capture_temp_cleanup import register_retained_directory
+from capture_temp_cleanup import CaptureTempMaintenance, ensure_capture_storage, register_retained_directory
 
 logging.basicConfig(
     level=logging.INFO,
@@ -893,6 +893,7 @@ class WikiFetcher:
         self.interval_seconds = interval_seconds
         self.progress_run_id = uuid.uuid4().hex
         self.all_records: list[SessionRecord] = []   # flat list across all URLs
+        self.temp_maintenance = CaptureTempMaintenance()
 
     # ------------------------------------------------------------------
     # Per-URL output directory
@@ -1039,6 +1040,11 @@ class WikiFetcher:
         timestamp = datetime.now().isoformat()
 
         profile_dir = Path(tempfile.mkdtemp(prefix=f"wb_{driver_key}_"))
+        # Register before launching: a hard crash may never reach finally.
+        try:
+            register_retained_directory(profile_dir, driver_key)
+        except Exception as exc:
+            log.warning("Temporary profile registration failed: %s", exc)
         key_log = self._key_log_path(url_dir, driver_key)
         # Chrome on Windows does not reliably write --ssl-key-log-file to
         # non-ASCII paths. Write inside the ASCII temp profile first, then copy
@@ -1384,6 +1390,8 @@ class WikiFetcher:
                 continue
 
             log.info("  → %s", AVAILABLE_DRIVERS[key].name)
+            self.temp_maintenance.run_if_due()
+            ensure_capture_storage(url_dir)
             self._clear_incomplete_artifacts(url_dir, key)
             record = self._fetch_with(entry.url, key, url_dir)
             url_records.append(record)

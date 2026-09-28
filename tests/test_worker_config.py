@@ -114,6 +114,18 @@ network:
             with self.assertRaisesRegex(ValueError, "未知字段"):
                 WorkerConfig.from_env()
 
+    def test_temp_and_stall_settings_support_environment_override(self):
+        self.write_config()
+        with patch.dict(os.environ, {"WORKER_CONFIG_FILE": str(self.config_path)}, clear=True):
+            config = WorkerConfig.from_env()
+            self.assertEqual(config.capture_temp_dir, (self.root / "runtime/tmp").resolve())
+            self.assertEqual(config.capture_stall_seconds, 600)
+            os.environ["WORKER_TEMP_DIR"] = str(self.root / "data-temp")
+            os.environ["CAPTURE_STALL_SECONDS"] = "300"
+            config = WorkerConfig.from_env()
+            self.assertEqual(config.capture_temp_dir, (self.root / "data-temp").resolve())
+            self.assertEqual(config.capture_stall_seconds, 300)
+
     def test_invalid_proxy_url_is_rejected(self) -> None:
         self.write_config()
         with patch.dict(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import argparse
+import errno
 import hashlib
 import io
 import json
@@ -20,6 +21,7 @@ import time
 
 REGISTRY_ENV = "CAPTURE_TEMP_CLEANUP_REGISTRY"
 CLEANUP_INTERVAL_SECONDS = 3600
+MIN_CAPTURE_FREE_BYTES = 1024 ** 3
 _NAME = re.compile(r"wb_(chrome|edge|firefox)_[A-Za-z0-9_-]+")
 _BROWSER_TEMP_NAMES = (
     (re.compile(r"rust_mozprofile[A-Za-z0-9_-]{6,}"), {"firefox"}),
@@ -44,6 +46,47 @@ _PROCESSES = {
                 "socket process", "rdd process", "utility process"},
 }
 log = logging.getLogger(__name__)
+
+
+def configure_temp_directory(path: Path) -> None:
+    """Use one explicit writable root for Python and all browser descendants."""
+    path = path.resolve(strict=True)
+    if path == Path(path.anchor):
+        raise ValueError("A filesystem root is not a capture temp directory")
+    # Explicit dir avoids tempfile's silent fallback to the system disk.
+    with tempfile.TemporaryFile(dir=path):
+        pass
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        os.environ[name] = str(path)
+    tempfile.tempdir = str(path)
+
+
+class CaptureTempMaintenance:
+    """Called synchronously between browser captures, including long batches."""
+    def __init__(self):
+        self.next_cleanup = 0.0
+
+    def run_if_due(self) -> None:
+        registry = os.environ.get(REGISTRY_ENV)
+        if not registry or time.monotonic() < self.next_cleanup:
+            return
+        self.next_cleanup = time.monotonic() + CLEANUP_INTERVAL_SECONDS
+        try:
+            summary = cleanup_retained_directories(Path(registry))
+            log.info("Hourly capture temp cleanup: %s", json.dumps(summary))
+        except Exception:
+            log.warning("Capture temporary directory cleanup postponed", exc_info=True)
+
+
+def ensure_capture_storage(output_dir: Path) -> None:
+    """Fail this capture attempt before disk exhaustion; Worker retries are bounded."""
+    if not os.environ.get(REGISTRY_ENV):
+        return
+    for path in {output_dir.resolve(), Path(tempfile.gettempdir()).resolve()}:
+        available = shutil.disk_usage(path).free
+        if available < MIN_CAPTURE_FREE_BYTES:
+            raise OSError(errno.ENOSPC,
+                          f"Capture storage below 1 GiB reserve ({available} bytes free)", str(path))
 
 
 def _is_link(path: Path) -> bool:
@@ -185,6 +228,18 @@ def cleanup_retained_directories(registry: Path, *, temp_root: Path | None = Non
     # Also cover old Firefox profiles and Chromium download/unpack leftovers that
     # were created by the browser itself and therefore have no project registry.
     for path in temp_root.iterdir():
+        # Firefox leaves these empty startup-bundle files after normal exits.
+        if re.fullmatch(r"remote-settings-startup-bundle--[0-9]+", path.name):
+            try:
+                info = path.lstat()
+                if ("firefox" not in active and stat.S_ISREG(info.st_mode)
+                        and not _is_link(path) and info.st_size == 0
+                        and (not hasattr(os, "getuid") or info.st_uid == os.getuid())):
+                    path.unlink()
+                    summary["deleted"] += 1
+            except OSError:
+                summary["errors"] += 1
+            continue
         if path in handled or not _browsers_for_name(path.name):
             continue
         try:
@@ -212,7 +267,16 @@ def main() -> int:
         data = Path(os.path.expandvars(settings.get("paths", {}).get("data_dir") or "./worker_data")).expanduser()
         if not data.is_absolute():
             data = config.parent / data
-        summary = cleanup_retained_directories(data / "temp_cleanup", temp_root=args.temp_root)
+        configured_temp = settings.get("paths", {}).get("temp_dir")
+        temp_root = args.temp_root
+        if temp_root is None and configured_temp:
+            temp_root = Path(os.path.expandvars(configured_temp)).expanduser()
+            if not temp_root.is_absolute():
+                temp_root = config.parent / temp_root
+        if temp_root is None:
+            temp_root = data / "tmp"
+        temp_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        summary = cleanup_retained_directories(data / "temp_cleanup", temp_root=temp_root)
         print(json.dumps(summary), flush=True)
     except Exception as exc:
         # Redeployment may proceed; uncertainty postpones deletion, not startup.

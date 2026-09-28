@@ -28,6 +28,8 @@ class TempCleanupDeploymentTests(unittest.TestCase):
                 self.assertLess(command.end(), source.index("systemctl restart traffic-worker"))
                 if name == "deploy_worker_root.sh":
                     self.assertIn('"$TMP_DIR/source/capture_temp_cleanup.py"', command.group())
+                for directive in ("WatchdogSec=180", "NotifyAccess=main", "WatchdogSignal=SIGTERM", "LimitCORE=0"):
+                    self.assertIn(directive, source)
 
     def test_windows_cleanup_follows_stop_and_code_update_before_normal_startup(self):
         source = (ROOT / "deployment/deploy_worker_windows.ps1").read_text(encoding="utf-8")
@@ -54,7 +56,8 @@ class TempCleanupDeploymentTests(unittest.TestCase):
                 path = Path(tmp) / member.name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(data)
-            for name in ("capture_temp_cleanup.py", "wiki_fetcher.py", "worker_agent/task_runner.py"):
+            for name in ("capture_temp_cleanup.py", "wiki_fetcher.py", "worker_agent/task_runner.py",
+                         "worker_agent/watchdog.py", "worker_agent/config.py", "worker_agent/__main__.py"):
                 self.assertEqual((Path(tmp) / name).read_text(encoding="utf-8"), (ROOT / name).read_text(encoding="utf-8"))
             # Import only the extracted source in a fresh isolated interpreter,
             # catching missing new browser/cleanup dependencies in the uploadable archive.

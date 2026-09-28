@@ -22,11 +22,12 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "worker.yaml"
 
 _SCHEMA = {
     "worker": {"id", "host", "port", "token"},
-    "paths": {"project_root", "python_executable", "data_dir"},
+    "paths": {"project_root", "python_executable", "data_dir", "temp_dir"},
     "limits": {
         "max_queue_size",
         "max_items",
         "task_timeout_seconds",
+        "capture_stall_seconds",
         "max_content_length",
     },
     "cors": {"allowed_origins"},
@@ -169,6 +170,12 @@ class WorkerConfig:
     )
     proxy_url: str | None = None
     config_file: Path | None = None
+    temp_dir: Path | None = None
+    capture_stall_seconds: int = 600
+
+    @property
+    def capture_temp_dir(self) -> Path:
+        return (self.temp_dir or self.data_dir / "tmp").resolve()
 
     @property
     def tasks_dir(self) -> Path:
@@ -250,6 +257,14 @@ class WorkerConfig:
             project_root=project_root,
             python_executable=python_executable,
             data_dir=data_dir,
+            temp_dir=_path(
+                _value(settings, "paths", "temp_dir", "WORKER_TEMP_DIR", str(data_dir / "tmp")),
+                "paths.temp_dir", base_dir=base_dir,
+            ),
+            capture_stall_seconds=_integer(
+                _value(settings, "limits", "capture_stall_seconds", "CAPTURE_STALL_SECONDS", 600),
+                "limits.capture_stall_seconds", minimum=0,
+            ),
             max_queue_size=_integer(
                 _value(settings, "limits", "max_queue_size", "MAX_QUEUE_SIZE", 10),
                 "limits.max_queue_size",
@@ -296,6 +311,14 @@ class WorkerConfig:
         """创建数据目录，并检查解释器与核心脚本是否真实存在。"""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.capture_temp_dir
+        if (temporary == Path(temporary.anchor)
+                or temporary in {self.data_dir.resolve(), self.project_root.resolve()}
+                or temporary == self.tasks_dir.resolve()
+                or self.tasks_dir.resolve() in temporary.parents
+                or temporary in self.data_dir.resolve().parents):
+            raise ValueError("paths.temp_dir must be a dedicated directory outside task outputs")
+        temporary.mkdir(parents=True, exist_ok=True, mode=0o700)
 
         if not self.project_root.is_dir():
             raise RuntimeError(f"PROJECT_ROOT 不存在：{self.project_root}")

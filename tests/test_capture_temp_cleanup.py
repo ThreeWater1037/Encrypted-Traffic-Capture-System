@@ -8,7 +8,7 @@ from unittest.mock import patch
 from capture_temp_cleanup import (
     REGISTRY_ENV, cleanup_retained_directories,
     register_retained_directory, running_capture_browsers,
-    main,
+    main, ensure_capture_storage,
 )
 
 
@@ -228,6 +228,29 @@ class CaptureTempCleanupTests(unittest.TestCase):
             run.return_value.stdout = ""
             with self.assertRaises(RuntimeError):
                 running_capture_browsers()
+
+    def test_only_idle_empty_firefox_startup_bundles_are_deleted(self):
+        empty = self.root / "remote-settings-startup-bundle--123"
+        nonempty = self.root / "remote-settings-startup-bundle--124"
+        unknown = self.root / "remote-settings-startup-bundle-user"
+        empty.touch()
+        nonempty.write_text("preserve")
+        unknown.touch()
+        self.running.return_value = {"firefox"}
+        self.assertEqual(self.clean()["deleted"], 0)
+        self.running.return_value = set()
+        self.assertEqual(self.clean()["deleted"], 1)
+        self.assertFalse(empty.exists())
+        self.assertTrue(nonempty.exists())
+        self.assertTrue(unknown.exists())
+
+    def test_worker_refuses_new_capture_when_temp_or_output_disk_is_low(self):
+        from types import SimpleNamespace
+        with patch("capture_temp_cleanup.shutil.disk_usage", return_value=SimpleNamespace(free=512)):
+            with self.assertRaisesRegex(OSError, "1 GiB reserve"):
+                ensure_capture_storage(self.root)
+        with patch("capture_temp_cleanup.shutil.disk_usage", return_value=SimpleNamespace(free=2 * 1024 ** 3)):
+            ensure_capture_storage(self.root)
 
 
 if __name__ == "__main__":

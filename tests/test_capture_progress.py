@@ -167,5 +167,107 @@ class CaptureProgressSyncTests(unittest.TestCase):
                 self.assertTrue(resumed["has_more"])
 
 
+class CaptureProgressLookupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.output = root / "lookup" / "fetch_output"
+        self.output.mkdir(parents=True)
+        self.items = [
+            {"id": str(i), "name": "Example", "url": f"https://example.com/{i}"}
+            for i in range(100)
+        ]
+        self.items.append({"id": "a-wiki-b", "name": "old-wiki-name", "url": "https://example.com/special"})
+        self.browsers = ["chrome", "edge", "firefox"]
+        self.manager = object.__new__(TaskManager)
+        self.manager.config = SimpleNamespace(tasks_dir=root)
+        self.manager.store = SimpleNamespace(
+            get_task_status=lambda _: {"status": "CAPTURING"},
+            get_task=lambda _: {"request": {"items": self.items, "browsers": self.browsers}},
+        )
+        (self.output / "capture_progress.json").write_text(json.dumps({
+            "run_id": "lookup-run", "last_processed_position": len(self.items),
+            "total_urls": len(self.items),
+        }), encoding="utf-8")
+        for item in self.items:
+            for browser in self.browsers:
+                self.write_checkpoint(item, browser)
+
+    def write_checkpoint(self, item, browser, suffix="renamed-wiki-entry"):
+        directory = self.output / f"{item['id']}-wiki-{suffix}"
+        directory.mkdir(exist_ok=True)
+        sizes = {f"capture_{browser}.pcap": 4, f"tls_keys_{browser}.log": 3}
+        for name, size in sizes.items():
+            (directory / name).write_bytes(b"x" * size)
+        marker = directory / f"capture_{browser}.complete.json"
+        marker.write_text(json.dumps({
+            "item_id": item["id"], "url": item["url"], "browser": browser,
+            "artifacts": sizes,
+        }), encoding="utf-8")
+        return marker
+
+    def test_large_three_browser_page_enumerates_directory_once(self):
+        # Directory count must not multiply filesystem enumeration by page size
+        # or browser count. Avoid timing assertions that depend on the host.
+        for i in range(1000):
+            (self.output / f"unrelated-{i}-wiki-other").mkdir()
+        scans = []
+        original = Path.iterdir
+
+        def tracked(path):
+            scans.append(path)
+            return original(path)
+
+        with patch.object(Path, "iterdir", tracked), patch.object(
+            Path, "glob", side_effect=AssertionError("Repeated glob scan")
+        ):
+            result = self.manager.capture_progress("lookup")
+        self.assertEqual(scans, [self.output])
+        self.assertEqual(len(result["units"]), len(self.items) * 3)
+        self.assertEqual(
+            [(u["item_id"], u["browser"]) for u in result["units"]],
+            [(item["id"], browser) for item in self.items for browser in self.browsers],
+        )
+
+    def test_pagination_and_caught_up_poll_keep_the_same_contract(self):
+        first = self.manager.capture_progress("lookup", limit=2)
+        self.assertEqual(first["next_position"], 2)
+        self.assertTrue(first["has_more"])
+        second = self.manager.capture_progress("lookup", run_id="lookup-run", after_position=2, limit=2)
+        self.assertEqual({u["item_id"] for u in second["units"]}, {"2", "3"})
+        with patch.object(Path, "iterdir", side_effect=AssertionError("Caught-up poll must not scan")):
+            caught_up = self.manager.capture_progress("lookup", run_id="lookup-run", after_position=len(self.items))
+        self.assertEqual(caught_up["units"], [])
+
+    def test_stale_corrupt_and_incomplete_checkpoints_are_not_reported(self):
+        for i, browser in enumerate(self.browsers):
+            item = self.items[i]
+            marker = self.write_checkpoint(item, browser)
+            data = json.loads(marker.read_text())
+            if browser == "chrome":
+                data["url"] = "https://example.com/stale"
+                marker.write_text(json.dumps(data))
+            elif browser == "edge":
+                (marker.parent / "capture_edge.pcap").write_bytes(b"truncated")
+            else:
+                marker.write_text("[]")
+        result = self.manager.capture_progress("lookup")
+        pairs = {(u["item_id"], u["browser"]) for u in result["units"]}
+        for i, browser in enumerate(self.browsers):
+            self.assertNotIn((str(i), browser), pairs)
+        self.assertEqual(len(pairs), len(self.items) * 3 - 3)
+
+    def test_new_checkpoint_is_visible_on_next_poll(self):
+        item = self.items[-1]
+        marker = self.write_checkpoint(item, "firefox")
+        marker.unlink()
+        first = self.manager.capture_progress("lookup")
+        self.write_checkpoint(item, "firefox", suffix="new-location")
+        second = self.manager.capture_progress("lookup")
+        self.assertEqual(len(second["units"]), len(first["units"]) + 1)
+        self.assertTrue(any(u["item_id"] == item["id"] and u["browser"] == "firefox" for u in second["units"]))
+
+
 if __name__ == "__main__":
     unittest.main()

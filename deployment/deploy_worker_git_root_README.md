@@ -157,3 +157,10 @@ Master 添加 Worker 的地址为 `http://Worker-IP:5100`，不要附加 `/api/v
 如果提示 `mozilla.list` 与 `mozilla.sources` 重复，先检查 `/etc/apt/sources.list.d/`，整理已有 Mozilla 软件源后重跑。如果 Gitee 不通，先解决服务器到 Gitee 的网络访问。不要通过删除项目目录或强制重置来跳过错误。
 
 脚本已做本地 Bash 语法和隔离仓库逻辑验证；系统依赖、浏览器和 systemd 的最终结果以目标 Ubuntu 上的执行及抓包验收为准。
+
+
+### 临时文件与故障恢复（2026-09-28）
+
+Worker 临时目录现在默认使用 `paths.data_dir` 下的 `tmp`，可在 `worker.yaml` 设置 `paths.temp_dir: /data/traffic-worker-tmp`，三浏览器共用这个专用临时根目录；迁移前先停止 Worker，保留 `tasks` 与检查点。每小时清理改为在长任务的浏览器采集间隙执行。临时盘或结果盘不足 1 GiB 时退出本轮，沿用有上限的重试。
+
+Linux 服务增加 HTTP 健康驱动的 systemd 看门狗（180 秒、SIGTERM、禁止 core dump）；采集子进程另有 `limits.capture_stall_seconds: 600` 的检查点无进展保护。重启会从检查点继续。完整行为、Windows 差异和可配置项见 `worker_agent/README.md`。

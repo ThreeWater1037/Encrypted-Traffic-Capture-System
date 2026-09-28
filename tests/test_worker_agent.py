@@ -79,7 +79,8 @@ class WorkerAgentApiTests(unittest.TestCase):
         with patch("worker_agent.task_runner.time.monotonic", return_value=100) as clock, \
              patch("worker_agent.task_runner.cleanup_retained_directories", return_value=summary) as clean:
             self.manager._cleanup_temp_if_due()
-            clean.assert_called_once_with(self.config.data_dir / "temp_cleanup")
+            clean.assert_called_once_with(self.config.data_dir / "temp_cleanup",
+                                          temp_root=self.config.capture_temp_dir)
             clock.return_value = 3699
             self.manager._cleanup_temp_if_due()
             self.assertEqual(clean.call_count, 1)
@@ -106,6 +107,8 @@ class WorkerAgentApiTests(unittest.TestCase):
         environment = popen.call_args.kwargs["env"]
         self.assertEqual(environment["CAPTURE_TEMP_CLEANUP_REGISTRY"],
                          str((self.config.data_dir / "temp_cleanup").resolve()))
+        for name in ("TMPDIR", "TEMP", "TMP"):
+            self.assertEqual(environment[name], str(self.config.capture_temp_dir))
 
     def test_cleanup_is_only_called_outside_task_execution(self) -> None:
         events = []

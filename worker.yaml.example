@@ -11,11 +11,15 @@ paths:
   project_root: .
   python_executable:
   data_dir: ./worker_data
+  # 留空时使用 data_dir/tmp；Linux 可指定 /data/traffic-worker-tmp。
+  temp_dir:
 
 limits:
   max_queue_size: 10
   max_items: 10000
   task_timeout_seconds: 21600
+  # 采集子进程连续无 URL 检查点推进的秒数，超时按现有上限重试；0 禁用。
+  capture_stall_seconds: 600
   max_content_length: 20971520
 
 cors:

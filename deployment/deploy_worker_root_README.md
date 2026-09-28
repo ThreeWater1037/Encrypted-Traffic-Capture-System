@@ -133,3 +133,10 @@ journalctl -u traffic-worker -n 100 --no-pager
 - [Mozilla DEB 安装](https://support.mozilla.org/en-US/kb/install-firefox-linux)
 - [Snap 与 GeckoDriver 文件系统问题](https://firefox-source-docs.mozilla.org/testing/geckodriver/Usage.html)
 - [Miniconda 非交互安装](https://www.anaconda.com/docs/getting-started/advanced-install/silent-mode)
+
+
+### 临时文件与故障恢复（2026-09-28）
+
+Worker 临时目录现在默认使用 `paths.data_dir` 下的 `tmp`，可在 `worker.yaml` 设置 `paths.temp_dir: /data/traffic-worker-tmp`，三浏览器共用这个专用临时根目录；迁移前先停止 Worker，保留 `tasks` 与检查点。每小时清理改为在长任务的浏览器采集间隙执行。临时盘或结果盘不足 1 GiB 时退出本轮，沿用有上限的重试。
+
+Linux 服务增加 HTTP 健康驱动的 systemd 看门狗（180 秒、SIGTERM、禁止 core dump）；采集子进程另有 `limits.capture_stall_seconds: 600` 的检查点无进展保护。重启会从检查点继续。完整行为、Windows 差异和可配置项见 `worker_agent/README.md`。

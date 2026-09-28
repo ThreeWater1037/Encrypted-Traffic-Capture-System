@@ -6,6 +6,17 @@ Worker Flask 将现有 `wiki_fetcher.py` 和 `batch_process.py` 包装为内部 
 
 ## 固定约束
 
+### 临时目录与故障恢复
+
+- `paths.temp_dir` / `WORKER_TEMP_DIR` 指定专用临时根目录，默认是 `data_dir/tmp`。例如 Linux 使用 `/data/traffic-worker-tmp`；Windows 建议使用本地数据盘上的 ASCII 路径。Worker 会创建并验证目录可写，再统一设置 `TMPDIR`、`TEMP`、`TMP`，并传给 Chrome、Edge、Firefox 和驱动。目录不可写时启动失败，不回退到系统临时盘。
+- 每小时的清理检查在每次实际浏览器采集前执行，因此数天的大批任务也会触发；上一轮 PCAP、TLS 密钥复制和浏览器关闭已经完成。存在对应浏览器/驱动进程时跳过该类目录，未识别路径、链接、其他用户文件继续保留。新 Profile 在创建时登记，可回收异常退出的遗留目录。Firefox 遗留的空 `remote-settings-startup-bundle--数字` 文件也只在 Firefox 空闲时清理。
+- 临时盘或结果盘可用空间低于 1 GiB 时，不再启动下一次浏览器采集；本轮退出后按现有最多 5 次重试恢复，仍失败则结束任务，保留已有检查点。
+- `limits.capture_stall_seconds` / `CAPTURE_STALL_SECONDS` 默认为 600：采集子进程连续 10 分钟没有推进 URL 检查点，终止其进程树并进入现有有上限的断点重试。该限制不用于分析阶段；0 可禁用，与总任务超时独立。
+- Linux systemd 部署启用 `WatchdogSec=180`。只有真实 HTTP 健康检查成功才发送心跳；接口长期无响应时 systemd 通过 SIGTERM 停止服务并按 `Restart=always` 重启，保留检查点续跑。禁用 core dump，避免故障文件占盘。Windows/手工启动不启用 systemd 看门狗，不能把配置声明当作自动重启验收。
+- Chrome/Edge 仍绕过 Service Worker，Firefox 仍在独立临时 Profile 中禁用 Service Worker；临时目录变化不改变无缓存与完成判定。
+
+### 采集约束
+
 - 监听端口：`5100/TCP`
 - API 前缀：`/api/v1`
 - 单机采集并发：`1`

@@ -460,6 +460,10 @@ Environment=PATH=$CONDA_ENV/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 ExecStart=$PYTHON -m worker_agent
 Restart=always
 RestartSec=5
+NotifyAccess=main
+WatchdogSec=180
+WatchdogSignal=SIGTERM
+LimitCORE=0
 TimeoutStopSec=60
 KillMode=mixed
 UMask=0077

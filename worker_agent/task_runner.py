@@ -224,7 +224,8 @@ class TaskManager:
             return
         self._next_temp_cleanup = time.monotonic() + CLEANUP_INTERVAL_SECONDS
         try:
-            summary = cleanup_retained_directories(self.config.data_dir / "temp_cleanup")
+            summary = cleanup_retained_directories(
+                self.config.data_dir / "temp_cleanup", temp_root=self.config.capture_temp_dir)
             if any(summary.values()):
                 self._append_log(self.config.data_dir / "temp_cleanup.log", json.dumps(summary))
         except Exception:
@@ -442,6 +443,8 @@ class TaskManager:
         environment.pop("WDM_LOCAL", None)
         environment["WDM_CACHE_DIR"] = str(self.config.data_dir)
         environment[REGISTRY_ENV] = str((self.config.data_dir / "temp_cleanup").resolve())
+        for name in ("TMPDIR", "TEMP", "TMP"):
+            environment[name] = str(self.config.capture_temp_dir)
         popen_kwargs: dict[str, Any] = {
             "cwd": self.config.data_dir,
             "env": environment,
@@ -463,11 +466,29 @@ class TaskManager:
                 self._active_process = process
             self.store.update_task(task_id, pid=process.pid)
 
+            progress_path = (
+                self.config.tasks_dir / task_id / "fetch_output" / "capture_progress.json"
+                if len(command) > 1 and Path(command[1]).name == "wiki_fetcher.py" else None
+            )
+            progress_stamp = self._progress_stamp(progress_path)
+            last_progress = time.monotonic()
+
             try:
                 while True:
                     return_code = process.poll()
                     if return_code is not None:
                         return return_code
+                    if progress_path is not None and self.config.capture_stall_seconds > 0:
+                        stamp = self._progress_stamp(progress_path)
+                        if stamp != progress_stamp:
+                            progress_stamp = stamp
+                            last_progress = time.monotonic()
+                        elif time.monotonic() - last_progress >= self.config.capture_stall_seconds:
+                            self._append_log(log_path,
+                                f"Capture made no checkpoint progress for {self.config.capture_stall_seconds}s; "
+                                "terminating capture process tree for bounded checkpoint retry")
+                            self._terminate_process_tree(process)
+                            return 124
                     if self.store.is_cancel_requested(task_id):
                         self._terminate_process_tree(process)
                         raise TaskCanceledError()
@@ -482,6 +503,16 @@ class TaskManager:
                     if self._active_process is process:
                         self._active_process = None
                 self.store.update_task(task_id, pid=None)
+
+    @staticmethod
+    def _progress_stamp(path: Path | None) -> tuple[int, int] | None:
+        if path is None:
+            return None
+        try:
+            info = path.stat()
+            return info.st_mtime_ns, info.st_size
+        except OSError:
+            return None
 
     def _raise_if_canceled(self, task_id: str) -> None:
         """把持久化取消标记转换为控制流异常。"""
@@ -601,26 +632,42 @@ class TaskManager:
         observed_position = min(observed_position, len(items))
         end = min(observed_position, start + limit)
 
+        # Scan the batch directory once per page, not once per URL/browser.
+        # Keep all matching names: renamed entries may leave older directories,
+        # and the checkpoint's ID/URL/browser still decides which one is valid.
+        page_items = items[start:end]
+        item_dirs: dict[str, list[Path]] = {item["id"]: [] for item in page_items}
+        if output_dir.is_dir():
+            for candidate in output_dir.iterdir():
+                name = candidate.name
+                separator = name.find("-wiki-")
+                while separator >= 0:
+                    item_id = name[:separator]
+                    if item_id in item_dirs:
+                        item_dirs[item_id].append(candidate)
+                    # IDs and entry names can themselves contain "-wiki-".
+                    separator = name.find("-wiki-", separator + 1)
+
         units: list[dict[str, Any]] = []
-        for item in items[start:end]:
+        for item in page_items:
             for browser in request_data.get("browsers") or []:
                 marker_payload: dict[str, Any] | None = None
                 marker_dir: Path | None = None
-                if output_dir.is_dir():
-                    for candidate in output_dir.glob(f"{item['id']}-wiki-*"):
-                        marker = candidate / f"capture_{browser}.complete.json"
-                        try:
-                            loaded = json.loads(marker.read_text(encoding="utf-8"))
-                        except (OSError, UnicodeError, json.JSONDecodeError):
-                            continue
-                        if (
-                            loaded.get("item_id") == item["id"]
-                            and loaded.get("url") == item["url"]
-                            and loaded.get("browser") == browser
-                        ):
-                            marker_payload = loaded
-                            marker_dir = candidate
-                            break
+                for candidate in item_dirs[item["id"]]:
+                    marker = candidate / f"capture_{browser}.complete.json"
+                    try:
+                        loaded = json.loads(marker.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeError, json.JSONDecodeError):
+                        continue
+                    if (
+                        isinstance(loaded, dict)
+                        and loaded.get("item_id") == item["id"]
+                        and loaded.get("url") == item["url"]
+                        and loaded.get("browser") == browser
+                    ):
+                        marker_payload = loaded
+                        marker_dir = candidate
+                        break
                 if marker_payload is None or marker_dir is None:
                     continue
 
