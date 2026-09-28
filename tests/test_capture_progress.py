@@ -111,6 +111,42 @@ class CaptureProgressSyncTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return response.get_json()
 
+    def test_windows_replace_conflict_does_not_reset_live_progress(self):
+        snapshot = {"run_id": "stable-run", "last_processed_position": 5000,
+                    "total_urls": 5000}
+        self.progress_path.write_text(json.dumps(snapshot), encoding="utf-8")
+        original = Path.read_text
+        for code in (2, 5, 32, 33):
+            with self.subTest(winerror=code):
+                attempts = []
+                error = OSError("temporarily unavailable during replacement")
+                error.winerror = code
+
+                def read(path, *args, **kwargs):
+                    if path == self.progress_path:
+                        attempts.append(1)
+                        if len(attempts) < 3:
+                            raise error
+                    return original(path, *args, **kwargs)
+
+                with patch.object(Path, "read_text", read), patch("worker_agent.task_runner.time.sleep"):
+                    page = self.read_page(run_id="stable-run", after_position=4989)
+                self.assertEqual(page["run_id"], "stable-run")
+                self.assertEqual(page["observed_position"], 5000)
+                self.assertEqual(page["next_position"], 5000)
+                self.assertEqual([u["item_id"] for u in page["units"]], ["5000"])
+
+    def test_persistently_unreadable_progress_still_returns_bounded_fallback(self):
+        error = PermissionError("still locked")
+        error.winerror = 5
+        with patch.object(Path, "read_text", side_effect=error) as read, \
+             patch("worker_agent.task_runner.time.sleep") as sleep:
+            page = self.read_page()
+        self.assertEqual(read.call_count, 6)
+        self.assertLessEqual(sum(c.args[0] for c in sleep.call_args_list), 0.25)
+        self.assertIsNone(page["run_id"])
+        self.assertEqual(page["units"], [])
+
     def test_master_catches_up_while_5000_url_snapshot_keeps_changing(self):
         for legacy in (True, False):
             with self.subTest(legacy=legacy):

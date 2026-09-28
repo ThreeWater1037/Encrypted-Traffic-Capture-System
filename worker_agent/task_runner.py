@@ -6,6 +6,7 @@ CPU 与磁盘。执行器负责状态流转、取消、超时、日志和最终�
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -27,6 +28,20 @@ from .task_store import TERMINAL_STATUSES, TaskStore, utc_now
 
 
 MAX_CAPTURE_RETRIES = 5
+
+
+def _read_progress_snapshot(path: Path) -> dict:
+    """Retry brief Windows replacement conflicts before reporting no progress."""
+    for attempt in range(6):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            # Python's CRT-backed open() can omit winerror and report errno only.
+            transient = (getattr(exc, "winerror", None) in {2, 5, 32, 33}
+                         or (os.name == "nt" and exc.errno in {errno.ENOENT, errno.EACCES}))
+            if not transient or attempt == 5:
+                raise
+            time.sleep(min(0.01 * (2 ** attempt), 0.1))
 
 
 class QueueFullError(RuntimeError):
@@ -584,7 +599,7 @@ class TaskManager:
         progress_path = output_dir / "capture_progress.json"
 
         try:
-            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            progress = _read_progress_snapshot(progress_path)
         except (OSError, UnicodeError, json.JSONDecodeError):
             return {
                 "task_id": task_id,

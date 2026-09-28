@@ -10,9 +10,42 @@ import unittest
 from unittest.mock import patch
 
 from wiki_fetcher import SessionRecord, UrlEntry, WikiFetcher, _replace_capture_file
+from worker_agent.task_runner import _read_progress_snapshot
 
 
 class AtomicCaptureWriteTests(unittest.TestCase):
+    def test_concurrent_progress_polling_reads_complete_monotonic_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "capture_progress.json"
+            source = target.with_suffix(".json.tmp")
+            target.write_text('{"position": 0}')
+            done = threading.Event()
+            failures = []
+
+            def writer():
+                try:
+                    for position in range(1, 301):
+                        source.write_text(json.dumps({"position": position}))
+                        _replace_capture_file(source, target)
+                except Exception as exc:
+                    failures.append(exc)
+                finally:
+                    done.set()
+
+            thread = threading.Thread(target=writer)
+            thread.start()
+            positions = []
+            try:
+                while not done.is_set():
+                    positions.append(_read_progress_snapshot(target)["position"])
+                    done.wait(0.001)
+            finally:
+                thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(positions, sorted(positions))
+            self.assertEqual(_read_progress_snapshot(target)["position"], 300)
+
     def test_transient_windows_errors_keep_old_json_until_replacement(self):
         for code in (5, 32, 33):
             with self.subTest(winerror=code), tempfile.TemporaryDirectory() as tmp:
