@@ -64,6 +64,24 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def _replace_capture_file(temporary: Path, destination: Path) -> None:
+    """Keep JSON publication atomic while tolerating brief Windows reader locks.
+
+    A normal Windows file reader can prevent replacement until its handle closes.
+    Retry only access/sharing/lock errors, for at most about four seconds. Never
+    unlink the old checkpoint or fall back to writing a partially readable file;
+    persistent errors still propagate with the previous destination intact.
+    """
+    for attempt in range(20):
+        try:
+            temporary.replace(destination)
+            return
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 19:
+                raise
+            time.sleep(min(0.02 * (2 ** attempt), 0.25))
+
+
 def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
     """设置导航兜底、无缓存策略和站点范围内的资源屏蔽。"""
     # Navigation must expire before the local driver HTTP transport budget.
@@ -991,7 +1009,7 @@ class WikiFetcher:
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        temporary.replace(marker)
+        _replace_capture_file(temporary, marker)
         return True
 
     def _write_progress(
@@ -1023,7 +1041,7 @@ class WikiFetcher:
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        temporary.replace(path)
+        _replace_capture_file(temporary, path)
 
     # ------------------------------------------------------------------
     # Single browser fetch
@@ -1273,7 +1291,7 @@ class WikiFetcher:
                 "request_blocking": {"urls": blocked_urls_for_page(url),
                                      "scope": "initial_page_host"},
             }, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(network_status_path)
+            _replace_capture_file(temporary, network_status_path)
 
         content_hash = hashlib.sha256(html.encode()).hexdigest() if html else ""
         html_length = len(html.encode())
@@ -1302,7 +1320,7 @@ class WikiFetcher:
             temporary = assessment_path.with_suffix(".json.tmp")
             temporary.write_text(json.dumps(assessment, ensure_ascii=False, indent=2),
                                  encoding="utf-8")
-            temporary.replace(assessment_path)
+            _replace_capture_file(temporary, assessment_path)
             if assessment["needs_recapture"]:
                 assessment["artifact_dir"] = str(url_dir)
                 with (self.output_dir / "pages_needing_recapture.jsonl").open(
