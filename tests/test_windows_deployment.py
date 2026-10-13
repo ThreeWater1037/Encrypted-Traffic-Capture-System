@@ -70,6 +70,27 @@ class DeploymentFixture:
 
 
 class DeploymentConfigTests(DeploymentFixture, unittest.TestCase):
+    def test_migration_preserves_identity_but_resets_old_absolute_data_path(self):
+        old_data = self.root / 'old-c-disk-data'
+        old_data.mkdir()
+        sentinel = old_data / 'outside-legacy-root.txt'
+        sentinel.write_text('keep outside deployment')
+        self.save(dict(worker=dict(id='server-01', token='existing-private-token'),
+                       paths=dict(data_dir=str(old_data)),
+                       network=dict(proxy_url='http://127.0.0.1:7890')))
+        self.runtime['reset_data_dir'] = True
+        self.helper.prepare(self.runtime, check_only=True)
+        self.assertFalse((self.project / 'worker_data').exists())
+        self.helper.prepare(self.runtime)
+        result = yaml.safe_load(self.config.read_text(encoding='utf-8'))
+        self.assertEqual(result['paths']['data_dir'], str(self.project / 'worker_data'))
+        self.assertEqual(result['worker']['id'], 'server-01')
+        self.assertEqual(result['worker']['token'], 'existing-private-token')
+        self.assertEqual(result['network']['proxy_url'], 'http://127.0.0.1:7890')
+        self.assertEqual(sentinel.read_text(), 'keep outside deployment')
+        for browser in ('chrome', 'edge', 'firefox'):
+            self.assertEqual(result['browsers'][browser + '_binary'], self.runtime['browsers'][browser])
+
     def test_preserves_token_id_proxy_limits_and_data(self):
         self.save(dict(worker=dict(id='existing', token='secret-existing'),
                        paths=dict(data_dir='../capture data'), limits=dict(max_items=123),
@@ -188,7 +209,7 @@ class RunnerEnvironmentTests(unittest.TestCase):
                 ('CHROMEDRIVER_PATH', 'chromedriver.exe'), ('EDGEDRIVER_PATH', 'msedgedriver.exe'),
                 ('GECKODRIVER_PATH', 'geckodriver.exe'))}
             runtime = dict(project=str(root), python=sys.executable, logs=str(root / 'logs'),
-                           tshark=str(root / 'tshark.exe'), drivers=drivers)
+                           tshark=str(root / 'tshark.exe'), drivers=drivers, temp=str(root / 'temp'))
             (root / 'runtime.json').write_text(json.dumps(runtime), encoding='utf-8')
             module = types.ModuleType('deployment_runner')
             module.__file__ = str(root / 'run_worker.py')
@@ -201,6 +222,9 @@ class RunnerEnvironmentTests(unittest.TestCase):
                 for name, path in drivers.items():
                     self.assertEqual(env[name], path)
                 self.assertNotIn('WORKER_TOKEN', env)
+                self.assertEqual(env['TEMP'], runtime['temp'])
+                self.assertEqual(env['TMP'], runtime['temp'])
+                self.assertTrue(Path(runtime['temp']).is_dir())
 
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows PowerShell HTTP JSON semantics')

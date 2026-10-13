@@ -1,6 +1,7 @@
 """Bounded local browser service shutdown with process-based completion."""
 
 import subprocess
+import sys
 import time
 from urllib import request
 
@@ -8,14 +9,29 @@ from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.webdriver.firefox.service import Service as FirefoxService
+from process_ownership import LINUX, LinuxProcessOwner
 
 
 class ProcessWaitShutdown:
-    """Stop only this service's child; do not poll a closed HTTP port."""
+    """Stop the owned driver and its Linux browser family."""
 
     shutdown_request_timeout = 1.0
     shutdown_process_timeout = 3.0
     has_shutdown_endpoint = True
+
+    def _start_process(self, path):
+        if LINUX:
+            if sys.version_info < (3, 11):
+                raise RuntimeError("Linux browser process cleanup requires Python 3.11 or newer")
+            self._capture_process_owner = LinuxProcessOwner("CAPTURE_BROWSER_OWNER")
+            self.env = self._capture_process_owner.environment(self.env)
+            # Keep the task's session, but isolate this driver's process group.
+            # No preexec_fn: browser launches can happen in threaded Workers.
+            self.popen_kw["process_group"] = 0
+        result = super()._start_process(path)
+        if LINUX:
+            self._capture_process_owner.bind(self.process)
+        return result
 
     def stop(self):
         if getattr(self, "_capture_stop_done", False):
@@ -73,7 +89,23 @@ class ProcessWaitShutdown:
         except Exception as exc:
             details["error"] = str(exc)
         finally:
-            stopped = process is None or process.poll() is not None
+            owner = vars(self).get("_capture_process_owner")
+            family_stopped = True
+            if owner is not None:
+                try:
+                    family = details["process_family"] = owner.terminate()
+                    family_stopped = not family["remaining_pids"]
+                    if family["signaled_pids"]:
+                        details["forced"] = True
+                        details["warnings"].append("Remaining owned browser processes required termination")
+                    if not family_stopped:
+                        details["error"] = f"Owned browser processes still running: {family['remaining_pids']}"
+                    if process is not None and process.poll() is None and family_stopped:
+                        process.wait(timeout=2.0)
+                except Exception as exc:
+                    family_stopped = False
+                    details["error"] = f"Owned browser cleanup failed: {exc}"
+            stopped = (process is None or process.poll() is not None) and family_stopped
             details["stopped"] = stopped
             self._capture_stop_done = stopped
             if stopped and process is not None:

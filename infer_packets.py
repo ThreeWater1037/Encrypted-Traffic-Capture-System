@@ -13,6 +13,7 @@ TLS 加密开销：
 """
 
 import csv
+from analysis_scripts.tcp_flags import empty_tcp_category, TCP_CONTROL_FIELDS, tcp_flags_text
 import sys
 import shutil
 import logging
@@ -74,13 +75,15 @@ PKT_FIELDS = [
     "frame_no",
     "time_rel",              # 相对于 pcap 第一包的时间（秒）
     "pkt_len",
-    "tcp_payload_len",       # TCP payload 字节数（0 = 纯 ACK）
+    "tcp_payload_len",       # TCP payload 字节数（0 表示无载荷，需结合 flags 分类）
     "tls_content_type",      # 明文可见：Handshake / ApplicationData / -
     "tls_record_len",        # 明文可见：各 TLS record 的加密载荷长度（逗号分隔）
     "est_plaintext_len",     # 推算：tls_record_len − overhead（逗号分隔）
     "inferred_h2_type",      # 推测 H2 帧类型（逗号分隔，对应各 TLS record）
     "est_h2_payload_range",  # 推测 H2 payload 长度范围（逗号分隔）
     "category",              # ack / handshake / control / header / data / unknown
+    "tcp_flags",        # 原始 TCP flags 位掩码
+    "tcp_flags_text",   # SYN、SYN|ACK、FIN|ACK、RST 等可读标志
 ]
 
 # ---------------------------------------------------------------------------
@@ -95,6 +98,7 @@ TSHARK_FIELDS = [
     "ipv6.src", "ipv6.dst",
     "tcp.srcport", "tcp.dstport",
     "tcp.len",
+    "tcp.flags",
     "tls.record.content_type",
     "tls.record.length",
 ]
@@ -247,6 +251,7 @@ def infer_packet(
     direction: str,
     overhead: int,
     with_ctrl: bool = False,
+    tcp_flags=None,
 ) -> dict:
     """
     返回推测结果字典，包含：
@@ -261,7 +266,7 @@ def infer_packet(
             "est_plaintext_len":   "-",
             "inferred_h2_type":    "-",
             "est_h2_payload_range": "-",
-            "category":            "ack",
+            "category":            empty_tcp_category(tcp_flags),
         }
 
     # --- TCP 续传包（大 TLS record 跨多个 TCP segment，此包内既无 content_type 也无 record_len）---
@@ -422,6 +427,7 @@ def process(pcap: Path, flow_tsv: Path, output_dir: Path, with_ctrl: bool = Fals
             raw_ct_list, raw_rec_len_list,
             tcp_payload_len, meta["direction"], overhead,
             with_ctrl=with_ctrl,
+            tcp_flags=pkt.get("tcp.flags"),
         )
 
         flow_pkts[key].append({
@@ -429,6 +435,8 @@ def process(pcap: Path, flow_tsv: Path, output_dir: Path, with_ctrl: bool = Fals
             "time_rel":             f"{ts:.6f}",
             "pkt_len":              pkt_len,
             "tcp_payload_len":      tcp_payload_len,
+            "tcp_flags": pkt.get("tcp.flags", ""),
+            "tcp_flags_text": tcp_flags_text(pkt.get("tcp.flags")),
             **inferred,
         })
 
@@ -463,6 +471,7 @@ def process(pcap: Path, flow_tsv: Path, output_dir: Path, with_ctrl: bool = Fals
                      f" header={cats['header']} data={cats['data']}"
                      f" ack={cats['ack']} tls_segment={cats['tls_segment']}"
                      f" unknown={cats['unknown']}"
+                     + "".join(f" {field}={cats[field]}" for field in TCP_CONTROL_FIELDS)
                      + "\n")
             fh.write("#\n")
 
@@ -514,7 +523,7 @@ def main():
             "\n"
             "  tcp_payload_len\n"
             "      TCP payload 字节数（即 tcp.len）。\n"
-            "      为 0 表示纯 ACK，无应用层数据。\n"
+            "      为 0 只表示无载荷，分类还需读取 tcp_flags。\n"
             "\n"
             "  tls_content_type\n"
             "      TLS record 头部的 content_type 字段，明文可见，无需解密。\n"
@@ -566,7 +575,9 @@ def main():
             "\n"
             "  category\n"
             "      推测的包类别（基于上述所有字段综合判断）：\n"
-            "        ack         纯 ACK，tcp_payload_len == 0\n"
+            "        ack         零载荷且 tcp_flags == 0x10 的纯 ACK\n"
+            "        syn/syn_ack/fin/fin_ack/rst/rst_ack  零载荷 TCP 标志组合\n"
+            "        tcp_other   其他零载荷标志组合，具体标志见 tcp_flags_text\n"
             "        handshake   TLS 握手包（content_type = Handshake / ChangeCipherSpec）\n"
             "        control     推测为 H2 控制帧（SETTINGS / WINDOW_UPDATE / PING 等）\n"
             "        header      推测为 H2 HEADERS 帧（请求头或响应头）\n"

@@ -45,6 +45,32 @@ class BrowserServiceTests(unittest.TestCase):
         opener.assert_not_called()
         service.process.wait.assert_not_called()
 
+    def test_exited_driver_still_cleans_orphaned_family_for_all_browsers(self):
+        for cls in (TimedChromeService, TimedEdgeService, TimedFirefoxService):
+            with self.subTest(browser=cls.__name__):
+                service = self.service(exited=True)
+                service.has_shutdown_endpoint = cls.has_shutdown_endpoint
+                owner = service._capture_process_owner = MagicMock()
+                owner.terminate.return_value = {"signaled_pids": [123], "remaining_pids": [], "forced": True}
+                service.stop()
+                owner.terminate.assert_called_once()
+                self.assertTrue(service.shutdown_details["stopped"])
+                self.assertTrue(service.shutdown_details["forced"])
+
+    def test_surviving_family_cannot_be_reported_stopped_for_all_browsers(self):
+        for cls in (TimedChromeService, TimedEdgeService, TimedFirefoxService):
+            with self.subTest(browser=cls.__name__):
+                service = self.service(exited=True)
+                service.has_shutdown_endpoint = cls.has_shutdown_endpoint
+                owner = service._capture_process_owner = MagicMock()
+                owner.terminate.return_value = {"signaled_pids": [123], "remaining_pids": [123], "forced": True}
+                with self.assertRaisesRegex(WebDriverException, "still running"):
+                    service.stop()
+                self.assertFalse(service._capture_stop_done)
+                owner.terminate.return_value = {"signaled_pids": [], "remaining_pids": [], "forced": False}
+                service.stop()
+                self.assertTrue(service._capture_stop_done)
+
     @patch("browser_service.request.build_opener")
     def test_firefox_stops_owned_process_without_unsupported_shutdown_endpoint(self, opener):
         service = self.service()

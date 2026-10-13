@@ -204,13 +204,13 @@ step 'Install or reuse Miniconda'
 if [[ ! -x $CONDA_ROOT/bin/conda ]]; then
   [[ ! -e $CONDA_ROOT ]] || die "Incomplete Conda directory: $CONDA_ROOT; inspect before retrying."
   mkdir -p "$(dirname "$CONDA_ROOT")"
-  download https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh "$TMP_DIR/miniconda.sh"
+  download https://mirrors.nju.edu.cn/anaconda/miniconda/Miniconda3-latest-Linux-x86_64.sh "$TMP_DIR/miniconda.sh"
   bash "$TMP_DIR/miniconda.sh" -b -p "$CONDA_ROOT"
 fi
 export HOME=/root
 if [[ ! -x $CONDA_ENV/bin/python ]]; then
   [[ ! -e $CONDA_ENV ]] || die "Incomplete environment: $CONDA_ENV; inspect before retrying."
-  "$CONDA_ROOT/bin/conda" create -y --prefix "$CONDA_ENV" --override-channels -c conda-forge python=3.12 pip
+  "$CONDA_ROOT/bin/conda" create -y --prefix "$CONDA_ENV" --override-channels -c https://mirrors.nju.edu.cn/anaconda/cloud/conda-forge python=3.12 pip
 fi
 PYTHON=$CONDA_ENV/bin/python
 "$PYTHON" -c 'import sys; assert sys.version_info >= (3, 10), "Python >= 3.10 required"; print(sys.version)'

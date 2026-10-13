@@ -7,7 +7,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy_worker_windows.
 #>
 [CmdletBinding()]
 param(
-    [string]$InstallRoot = 'C:\TrafficWorker',
+    [string]$InstallRoot = 'D:\TrafficWorker',
     [string]$WorkerId = '',
     [string]$MasterIP = '',
     [string]$InstallerDirectory = '',
@@ -134,6 +134,183 @@ function Assert-PlainPath {
 function Write-Utf8 {
     param([string]$Path, [string]$Content)
     [IO.File]::WriteAllText($Path, $Content, (New-Object Text.UTF8Encoding $false))
+}
+function Assert-PlainTree {
+    param([string]$Path)
+    Assert-PlainPath $Path
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    # Inspect each directory before descending; never traverse a junction.
+    foreach ($item in Get-ChildItem -LiteralPath $Path -Force) {
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Junction/symlink is not supported: $($item.FullName)" }
+        if ($item.PSIsContainer) { Assert-PlainTree $item.FullName }
+    }
+}
+function Get-LegacyCleanupTargets {
+    param([string]$Root)
+    $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    if ($rootPath.Length -le 3) { throw 'Unsafe legacy cleanup root.' }
+    Assert-PlainTree $rootPath
+    $ownership = Join-Path $rootPath 'windows-worker-deployment.json'
+    if (-not (Test-Path -LiteralPath $ownership -PathType Leaf) -or
+        (Get-Content -Raw -LiteralPath $ownership | ConvertFrom-Json).managed_by -ne 'deploy_worker_windows.ps1') {
+        throw 'Legacy directory is not a managed deployment; refusing cleanup.'
+    }
+    foreach ($item in Get-ChildItem -LiteralPath $rootPath -Force) {
+        # Chrome installed by earlier script versions must remain at the same path.
+        if ($item.Name -in @('browsers','windows-worker-deployment.json')) { continue }
+        $target = [IO.Path]::GetFullPath($item.FullName)
+        if (-not $target.StartsWith($rootPath + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe legacy cleanup target.' }
+        $target
+    }
+}
+function Remove-LegacyDeployment {
+    param([string]$Root)
+    $targets = @(Get-LegacyCleanupTargets $Root)
+    foreach ($target in $targets) {
+        Assert-PlainTree $target
+        Remove-Item -LiteralPath $target -Recurse -Force
+    }
+    # Keep the ownership marker until all deletions succeed, so retries are safe.
+    $ownership = [IO.Path]::GetFullPath((Join-Path $Root 'windows-worker-deployment.json'))
+    Assert-PlainPath $ownership
+    Remove-Item -LiteralPath $ownership -Force
+    if (-not @(Get-ChildItem -LiteralPath $Root -Force).Count) { Remove-Item -LiteralPath $Root }
+}
+function Assert-WorkerTaskOwner {
+    param($Task, [string]$Root)
+    $expectedPython = Join-Path $Root 'miniconda\envs\traffic-worker\python.exe'
+    $expectedRunner = Join-Path $Root 'run\run_worker.py'
+    if ($Task.Description -ne $TaskDescription -or @($Task.Actions).Count -ne 1 -or
+        $Task.Actions[0].Execute -ne $expectedPython -or $Task.Actions[0].Arguments -ne "-u `"$expectedRunner`"") {
+        throw 'Existing scheduled task is not owned by this deployment directory.'
+    }
+}
+function Uninstall-LegacyPackage {
+    param([ValidateSet('Git','Wireshark','Miniconda')][string]$Name, [string]$Root, [string]$Binary)
+    $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $binaryPath = [IO.Path]::GetFullPath($Binary)
+    if ($rootPath.Length -le 3 -or -not $binaryPath.StartsWith($rootPath + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Unsafe legacy software path.'
+    }
+    Assert-PlainTree $rootPath
+    # Wireshark defines UNINSTALLER_NAME in packaging/nsis/wireshark-common.nsh.
+    # Modern packages use uninstall-wireshark.exe; retain the old name as fallback.
+    $names = if ($Name -eq 'Git') { @('unins000.exe') } elseif ($Name -eq 'Miniconda') { @('Uninstall-Miniconda3.exe') } else { @('uninstall-wireshark.exe','uninstall.exe') }
+    $uninstaller = $null
+    foreach ($fileName in $names) {
+        $candidate = Join-Path $rootPath $fileName
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $uninstaller = $candidate; break }
+    }
+    if (-not $uninstaller) { throw "Missing $Name uninstaller in $rootPath . Checked: $($names -join ', '). The installation has not been deleted." }
+    Assert-PlainPath $uninstaller
+    Write-Host "Uninstalling ${Name}: $uninstaller"
+    # These executables belong to an already installed, administrator-owned tree.
+    # Use the product uninstaller to remove registration; never delete Program Files.
+    # _?= keeps NSIS in the waited process instead of spawning a detached copy.
+    $arguments = if ($Name -eq 'Git') { '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' } else { "/S _?=$rootPath" }
+    # Miniconda's optional bootstrapper self-update can wait on an external
+    # channel with all output redirected to NUL. Keep the product uninstaller
+    # and every other hook action; bypass only the exact known update command.
+    $hook = Join-Path $rootPath 'pre_uninstall.bat'
+    $originalHook = $null
+    try {
+        if ($Name -eq 'Miniconda' -and (Test-Path -LiteralPath $hook -PathType Leaf)) {
+            Assert-PlainPath $hook
+            $bytes = [IO.File]::ReadAllBytes($hook)
+            # A byte-preserving encoding keeps the batch file's BOM, codepage,
+            # line endings, and unrelated commands unchanged.
+            $encoding = [Text.Encoding]::GetEncoding(28591)
+            $content = $encoding.GetString($bytes)
+            $pattern = '(?im)^[ \t]*"%PREFIX%\\_conda\.exe"[ \t]+constructor[ \t]+update-bootstrapper[ \t]+>NUL[ \t]+2>&1[ \t]*(?=\r?$)'
+            $matches = [regex]::Matches($content, $pattern)
+            $otherContent = [regex]::Replace($content, $pattern, '')
+            if ($matches.Count -eq 1 -and $otherContent -notmatch '(?i)update-bootstrapper') {
+                $backup = Join-Path $BackupDir ('miniconda-pre-uninstall-' + [guid]::NewGuid().ToString('N') + '.bat')
+                Assert-PlainPath $backup
+                [IO.File]::WriteAllBytes($backup, $bytes)
+                $originalHook = $bytes
+                $patched = [regex]::Replace($content, $pattern, 'REM Worker migration: skip optional bootstrapper self-update.')
+                [IO.File]::WriteAllBytes($hook, $encoding.GetBytes($patched))
+                Write-Host "Skipping optional Miniconda bootstrapper self-update; original hook: $backup"
+            } elseif ($content -match '(?i)update-bootstrapper') {
+                throw "Unrecognized Miniconda bootstrapper update command in $hook . Hook unchanged; inspect before uninstalling."
+            }
+        }
+        Install-PackageFile $uninstaller $arguments
+    } finally {
+        # On failure restore a surviving hook; successful uninstall normally
+        # removes it. The durable backup also survives a terminated deployment.
+        if ($null -ne $originalHook -and (Test-Path -LiteralPath $hook -PathType Leaf)) {
+            Assert-PlainPath $hook
+            [IO.File]::WriteAllBytes($hook, $originalHook)
+        }
+    }
+    # Do not continue if the main program survived the waited uninstaller.
+    for ($i = 0; $i -lt 120 -and (Test-Path -LiteralPath $binaryPath); $i++) { Start-Sleep -Seconds 1 }
+    if (Test-Path -LiteralPath $binaryPath) { throw "$Name uninstall did not finish; close its processes and rerun deployment." }
+    # NSIS _?= cannot delete the running uninstaller itself. After it exits,
+    # remove only that known file and an empty directory, never leftover user files.
+    if ($Name -ne 'Git' -and (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
+        Assert-PlainPath $uninstaller
+        Remove-Item -LiteralPath $uninstaller -Force
+    }
+    if ((Test-Path -LiteralPath $rootPath -PathType Container) -and -not @(Get-ChildItem -LiteralPath $rootPath -Force).Count) {
+        Assert-PlainPath $rootPath
+        Remove-Item -LiteralPath $rootPath
+    }
+}
+function Find-ExistingBrowser {
+    param([ValidateSet('chrome','edge','firefox')][string]$Name)
+    $relative = @{chrome='Google\Chrome\Application\chrome.exe'; edge='Microsoft\Edge\Application\msedge.exe'; firefox='Mozilla Firefox\firefox.exe'}
+    $exe = @{chrome='chrome.exe'; edge='msedge.exe'; firefox='firefox.exe'}
+    $candidates = @()
+    # Keep paths from the previous runtime, including custom installations.
+    foreach ($runtimePath in @((Join-Path $RunDir 'runtime.json'), (Join-Path $RunDir 'legacy-runtime.json'))) {
+        if (Test-Path -LiteralPath $runtimePath -PathType Leaf) {
+            $saved = Get-Content -LiteralPath $runtimePath -Raw | ConvertFrom-Json
+            if ($saved.PSObject.Properties['browsers'] -and $saved.browsers.PSObject.Properties[$Name]) { $candidates += $saved.browsers.$Name }
+        }
+    }
+    $candidates += Find-MachineFile $relative[$Name]
+    foreach ($hive in @('HKLM','HKCU')) {
+        $key = "${hive}:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$($exe[$Name])"
+        if (Test-Path -LiteralPath $key) { $candidates += (Get-Item -LiteralPath $key).GetValue('') }
+    }
+    if ($env:LOCALAPPDATA) { $candidates += Join-Path $env:LOCALAPPDATA $relative[$Name] }
+    if ($Name -eq 'chrome') { $candidates += Join-Path $BrowserDir 'chrome-win64\chrome.exe' }
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            Assert-PlainPath $candidate
+            if ($Name -eq 'chrome' -and $candidate.StartsWith($BrowserDir + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                $directory = Split-Path $candidate -Parent
+                if (-not (Test-Path -LiteralPath (Join-Path $directory 'chrome.dll')) -or -not (Test-Path -LiteralPath (Join-Path $directory 'resources.pak'))) {
+                    Write-Warning "Incomplete portable Chrome at $candidate; the verified archive will be extracted again."
+                    continue
+                }
+            }
+            return $candidate
+        }
+    }
+    return $null
+}
+function Publish-ManagedChrome {
+    param([string]$Binary, [string[]]$ShortcutDirectories = @([Environment]::GetFolderPath('CommonDesktopDirectory'), [Environment]::GetFolderPath('CommonPrograms')))
+    Write-Host "Chrome executable: $Binary"
+    if (-not $Binary.StartsWith($BrowserDir + '\', [StringComparison]::OrdinalIgnoreCase)) { return }
+    $shell = New-Object -ComObject WScript.Shell
+    try {
+        foreach ($folder in $ShortcutDirectories) {
+            $shortcut = $shell.CreateShortcut((Join-Path $folder 'Chrome for Testing.lnk'))
+            try {
+                $shortcut.TargetPath = $Binary
+                $shortcut.WorkingDirectory = Split-Path $Binary -Parent
+                $shortcut.IconLocation = "$Binary,0"
+                $shortcut.Description = 'Chrome for Testing (Traffic Worker browser)'
+                $shortcut.Save()
+            } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
+        }
+    } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+    Write-Host 'Chrome for Testing is portable: desktop and Start menu shortcuts created; it does not appear in Installed apps.'
 }
 function Backup-IncompleteEnvironment {
     param([ValidateSet('miniconda','miniconda\envs\traffic-worker')][string]$RelativePath)
@@ -295,8 +472,11 @@ function Install-ManagedChrome {
     } -Archive -ExpectedSha256 $Sources.ChromeZipSha256
     Expand-SafeArchive $archive $BrowserDir
     $binary = Join-Path $BrowserDir 'chrome-win64\chrome.exe'
-    if (-not (Test-Path -LiteralPath $binary -PathType Leaf) -or (Get-BrowserVersion $binary) -ne $Sources.ChromeVersion) {
-        throw 'Verified Chrome archive does not contain the configured ChromeVersion.'
+    if (-not (Test-Path -LiteralPath $binary -PathType Leaf) -or
+        -not (Test-Path -LiteralPath (Join-Path $BrowserDir 'chrome-win64\chrome.dll') -PathType Leaf) -or
+        -not (Test-Path -LiteralPath (Join-Path $BrowserDir 'chrome-win64\resources.pak') -PathType Leaf) -or
+        (Get-BrowserVersion $binary) -ne $Sources.ChromeVersion) {
+        throw 'Verified Chrome archive is incomplete or does not contain the configured ChromeVersion.'
     }
     return $binary
 }
@@ -389,6 +569,58 @@ function Find-MachineFile {
     }
     return $null
 }
+function Get-InstalledGitRoots {
+    # Git can install machine-wide in a user's AppData directory. Program Files
+    # alone misses that case (including the installer's writable-directory fallback).
+    $candidates = @()
+    foreach ($key in @('HKLM:\SOFTWARE\GitForWindows', 'HKCU:\SOFTWARE\GitForWindows',
+                       'HKLM:\SOFTWARE\WOW6432Node\GitForWindows', 'HKCU:\SOFTWARE\WOW6432Node\GitForWindows')) {
+        $entry = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+        if ($entry -and $entry.PSObject.Properties['InstallPath'] -and $entry.InstallPath) { $candidates += [string]$entry.InstallPath }
+    }
+    foreach ($base in @($env:ProgramW6432, ${env:ProgramFiles(x86)})) {
+        if ($base) { $candidates += Join-Path $base 'Git' }
+    }
+    if ($env:LOCALAPPDATA) { $candidates += Join-Path $env:LOCALAPPDATA 'Programs\Git' }
+    $candidates += 'C:\Program Files\Git'
+    $seen = @{}
+    foreach ($candidate in $candidates) {
+        if ($candidate -notmatch '^[A-Za-z]:\\' -or $candidate -match '["\r\n]') { throw 'Invalid registered Git installation path.' }
+        $root = [IO.Path]::GetFullPath($candidate).TrimEnd('\')
+        if ($root.Length -le 3) { throw 'Invalid registered Git installation root.' }
+        if ($seen.ContainsKey($root)) { continue }
+        $seen[$root] = $true
+        Assert-PlainPath $root
+        if ((Test-Path -LiteralPath (Join-Path $root 'cmd\git.exe') -PathType Leaf) -or
+            (Test-Path -LiteralPath (Join-Path $root 'unins000.exe') -PathType Leaf)) { $root }
+    }
+}
+function Find-ExistingGit {
+    foreach ($root in @(Get-InstalledGitRoots)) {
+        $binary = Join-Path $root 'cmd\git.exe'
+        if ($root -like 'C:\*' -and (Test-Path -LiteralPath $binary -PathType Leaf)) { return $binary }
+    }
+    return $null
+}
+function Initialize-SoftwareDirectory {
+    param([string]$Path)
+    Assert-PlainPath $Path
+    # Git's installer may silently change /DIR when its directory probe fails.
+    # Create the full path ourselves, then verify access before invoking it.
+    New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    $probe = Join-Path $Path ('.deploy-write-test-' + [guid]::NewGuid().ToString('N'))
+    try { Write-Utf8 $probe 'deployment write check' }
+    finally { if (Test-Path -LiteralPath $probe -PathType Leaf) { Remove-Item -LiteralPath $probe -Force } }
+}
+function Assert-GitInstallation {
+    param([string]$Binary, [string]$LogPath)
+    if (-not (Test-Path -LiteralPath $Binary -PathType Leaf)) {
+        $found = @(Get-InstalledGitRoots)
+        $locations = if ($found.Count) { $found -join '; ' } else { '(none detected)' }
+        throw "Git installation did not create $Binary . Detected installation roots: $locations . Installer log: $LogPath"
+    }
+    Invoke-Native $Binary @('--version')
+}
 function Get-LocalHealth {
     $request = [Net.HttpWebRequest]::Create('http://127.0.0.1:5100/api/v1/health')
     $request.Proxy = $null
@@ -449,7 +681,23 @@ if ($InstallRoot -notmatch '^[A-Za-z]:\\' -or $InstallRoot -match '["\r\n;]') { 
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 if ($InstallRoot.Length -le 3) { throw 'A drive root cannot be the installation directory.' }
 Assert-PlainPath $InstallRoot
+if (-not (Test-Path -LiteralPath ([IO.Path]::GetPathRoot($InstallRoot)) -PathType Container)) { throw 'Installation drive does not exist. Bring the D: disk online and format it first.' }
 if ($PSCommandPath.StartsWith($InstallRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Copy this script outside InstallRoot before running it.' }
+$LegacyRoot = 'C:\TrafficWorker'
+$MigrateLegacy = -not $RepairTaskOnly -and $InstallRoot -ne $LegacyRoot -and (Test-Path -LiteralPath (Join-Path $LegacyRoot 'windows-worker-deployment.json'))
+if (-not $RepairTaskOnly -and $InstallRoot -ne $LegacyRoot -and -not $MigrateLegacy -and (Test-Path -LiteralPath $LegacyRoot)) {
+    Assert-PlainPath $LegacyRoot
+    if (@(Get-ChildItem -LiteralPath $LegacyRoot -Force | Where-Object Name -ne 'browsers').Count) { throw 'C:\TrafficWorker contains unmanaged files; refusing automatic migration.' }
+}
+if ($MigrateLegacy) {
+    if ($InstallRoot -notlike 'D:\*') { throw 'Automatic C: cleanup requires a D: installation destination.' }
+    [void]@(Get-LegacyCleanupTargets $LegacyRoot)
+    foreach ($inputPath in @($PSCommandPath, $InstallerDirectory, $DownloadConfig, $NpcapOemInstaller)) {
+        if ($inputPath -and [IO.Path]::GetFullPath($inputPath).StartsWith($LegacyRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Copy the deployment script and installer/config inputs outside C:\TrafficWorker before migration.'
+        }
+    }
+}
 $TaskCredential = Get-WorkerTaskCredential $TaskCredential $identity.Name $identity.User.Value
 $ProjectDir = Join-Path $InstallRoot 'project'
 $CondaRoot = Join-Path $InstallRoot 'miniconda'
@@ -457,7 +705,11 @@ $CondaEnv = Join-Path $CondaRoot 'envs\traffic-worker'
 $Python = Join-Path $CondaEnv 'python.exe'
 $RunDir = Join-Path $InstallRoot 'run'
 $DriverDir = Join-Path $InstallRoot 'drivers'
-$BrowserDir = Join-Path $InstallRoot 'browsers'
+$BrowserDir = 'C:\TrafficWorkerBrowsers'
+if (Test-Path -LiteralPath (Join-Path $LegacyRoot 'browsers') -PathType Container) { $BrowserDir = Join-Path $LegacyRoot 'browsers' }
+$GitRoot = 'C:\Program Files\Git'
+$WiresharkRoot = Join-Path $InstallRoot 'tools\Wireshark'
+$TempDir = Join-Path $InstallRoot 'temp'
 $Runner = Join-Path $RunDir 'run_worker.py'
 $ConfigFile = Join-Path $ProjectDir 'worker.yaml'
 $CacheDir = Join-Path $InstallRoot 'installers'
@@ -468,6 +720,8 @@ $marker = Join-Path $InstallRoot 'windows-worker-deployment.json'
 $lock = New-Object Threading.Mutex($false, 'Global\TrafficCaptureWorkerDeployment')
 $locked = $false
 $transcript = $false
+$previousTemp = $env:TEMP
+$previousTmp = $env:TMP
 try {
     try { $locked = $lock.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
     if (-not $locked) { throw 'Another Windows Worker deployment is running.' }
@@ -475,18 +729,24 @@ try {
     if ((Test-Path -LiteralPath $InstallRoot) -and -not (Test-Path -LiteralPath $marker)) {
         if (@(Get-ChildItem -Force -LiteralPath $InstallRoot).Count) { throw 'InstallRoot is nonempty and unmanaged. Choose a new dedicated directory.' }
     }
-    foreach ($path in @($ProjectDir, $CondaRoot, $CondaEnv, $RunDir, $CacheDir, $BackupDir, $LogDir, $DriverDir, $BrowserDir, $marker, $ConfigFile)) { Assert-PlainPath $path }
+    foreach ($path in @($ProjectDir, $CondaRoot, $CondaEnv, $RunDir, $CacheDir, $BackupDir, $LogDir, $DriverDir, $BrowserDir, $marker, $ConfigFile, $GitRoot, $WiresharkRoot, $TempDir)) { Assert-PlainPath $path }
     if (Test-Path -LiteralPath $marker) {
         if ((Get-Content -Raw -LiteralPath $marker | ConvertFrom-Json).managed_by -ne 'deploy_worker_windows.ps1') { throw 'Unknown deployment marker.' }
     }
     New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
     # The elevated task runs downloaded project code: only administrators and SYSTEM may write here.
     Invoke-Native "$env:SystemRoot\System32\icacls.exe" @($InstallRoot, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F') | Out-Null
-    foreach ($path in @($RunDir, $CacheDir, $BackupDir, $LogDir, $DriverDir, $BrowserDir)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
+    foreach ($path in @($RunDir, $CacheDir, $BackupDir, $LogDir, $DriverDir, $BrowserDir, $TempDir)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
+    Invoke-Native "$env:SystemRoot\System32\icacls.exe" @($BrowserDir, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F') | Out-Null
     if (-not (Test-Path -LiteralPath $marker)) { Write-Utf8 $marker '{"managed_by":"deploy_worker_windows.ps1"}' }
     Start-Transcript -Path (Join-Path $LogDir "deploy-$stamp.log") | Out-Null
     $transcript = $true
-    Write-Host 'Windows Worker deployment revision: 2026-09-25.8 (simple HTTPS capture acceptance)'
+    Write-Host 'Windows Worker deployment revision: 2026-09-26.4 (skip optional Miniconda uninstall self-update; Git and browsers stay on C:)'
+    $env:TEMP = $TempDir
+    $env:TMP = $TempDir
+    $env:PIP_CACHE_DIR = Join-Path $InstallRoot 'cache\pip'
+    $env:CONDA_PKGS_DIRS = Join-Path $InstallRoot 'cache\conda-pkgs'
+    $env:CONDA_ENVS_PATH = Join-Path $CondaRoot 'envs'
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $env:GIT_TERMINAL_PROMPT = '0'
     $env:PYTHONUTF8 = '1'
@@ -502,11 +762,10 @@ try {
     }
     Write-Host 'Checking managed task and active work...'
     $oldTask = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
+    $taskRoot = $InstallRoot
     if ($oldTask) {
-        if ($oldTask.Description -ne $TaskDescription -or @($oldTask.Actions).Count -ne 1 -or
-            $oldTask.Actions[0].Execute -ne $Python -or $oldTask.Actions[0].Arguments -ne "-u `"$Runner`"") {
-            throw 'Existing scheduled task is not owned by this deployment directory.'
-        }
+        if ($MigrateLegacy -and @($oldTask.Actions).Count -eq 1 -and $oldTask.Actions[0].Execute -eq (Join-Path $LegacyRoot 'miniconda\envs\traffic-worker\python.exe')) { $taskRoot = $LegacyRoot }
+        Assert-WorkerTaskOwner $oldTask $taskRoot
         if ($oldTask.State -eq 'Running' -and -not $AllowInterrupt) {
             $health = Get-LocalHealth
             if ($health.status -ne 'ok' -or $health.busy -or $health.queue_size -gt 0) { throw 'Worker has pending work. Wait, or explicitly use -AllowInterrupt.' }
@@ -514,9 +773,49 @@ try {
         Export-ScheduledTask -TaskName $TaskName -TaskPath '\' | Set-Content -LiteralPath (Join-Path $BackupDir 'scheduled-task.xml') -Encoding UTF8
         Disable-ScheduledTask -TaskName $TaskName -TaskPath '\' | Out-Null
         Stop-ScheduledTask -TaskName $TaskName -TaskPath '\'
-        for ($i = 0; $i -lt 30 -and @(Get-Listeners).Count; $i++) { Start-Sleep -Seconds 1 }
+        for ($i = 0; $i -lt 30; $i++) {
+            $stoppedTask = Get-ScheduledTask -TaskName $TaskName -TaskPath '\'
+            if ($stoppedTask.State -ne 'Running' -and -not @(Get-Listeners).Count) { break }
+            Start-Sleep -Seconds 1
+        }
+        if ($stoppedTask.State -eq 'Running') { throw 'Worker task did not stop; refusing to change its files.' }
     }
     if (@(Get-Listeners).Count) { throw 'Port 5100 is occupied. Stop the manually launched Worker before deployment.' }
+    $migrationFile = Join-Path $RunDir 'migration-from-c.json'
+    $legacyConfig = Join-Path $RunDir 'legacy-worker.yaml'
+    $resetDataPending = Join-Path $RunDir 'migration-reset-data.pending'
+    foreach ($path in @($migrationFile, $legacyConfig, $resetDataPending, (Join-Path $RunDir 'legacy-runtime.json'))) { Assert-PlainPath $path }
+    if ($MigrateLegacy) {
+        [void]@(Get-LegacyCleanupTargets $LegacyRoot)
+        $survivors = @(Get-CimInstance Win32_Process | Where-Object {
+            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($LegacyRoot + '\', [StringComparison]::OrdinalIgnoreCase) -and
+            -not $_.ExecutablePath.StartsWith($LegacyRoot + '\browsers\', [StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($survivors.Count) { throw 'Old deployment processes are still running. Stop them before migration.' }
+        # Durable backups survive interrupted deletion and subsequent deployments.
+        foreach ($pair in @(@('project\worker.yaml','legacy-worker.yaml'), @('run\runtime.json','legacy-runtime.json'))) {
+            $source = Join-Path $LegacyRoot $pair[0]
+            $destination = Join-Path $RunDir $pair[1]
+            Assert-PlainPath $destination
+            if ((Test-Path -LiteralPath $source -PathType Leaf) -and -not (Test-Path -LiteralPath $destination)) { Copy-Item -LiteralPath $source -Destination $destination }
+        }
+        # Refuse to delete a custom browser placed elsewhere within the old root.
+        foreach ($browser in @('chrome','edge','firefox')) {
+            $existing = Find-ExistingBrowser $browser
+            if ($existing -and $existing.StartsWith($LegacyRoot + '\', [StringComparison]::OrdinalIgnoreCase) -and
+                -not $existing.StartsWith($LegacyRoot + '\browsers\', [StringComparison]::OrdinalIgnoreCase)) { throw "Browser is inside legacy cleanup scope: $existing" }
+        }
+        Write-Utf8 $migrationFile '{"source":"C:\\TrafficWorker","managed_by":"deploy_worker_windows.ps1"}'
+        if ($oldTask -and $taskRoot -eq $LegacyRoot) { Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm:$false }
+        Write-Host 'Deleting the old managed C:\TrafficWorker deployment and capture data; retaining its browsers. Configuration backup is on D:.'
+        $legacyCondaRoot = Join-Path $LegacyRoot 'miniconda'
+        $legacyConda = Join-Path $legacyCondaRoot 'Scripts\conda.exe'
+        if ((Test-Path -LiteralPath $legacyConda) -or (Test-Path -LiteralPath (Join-Path $legacyCondaRoot 'Uninstall-Miniconda3.exe'))) {
+            Uninstall-LegacyPackage 'Miniconda' $legacyCondaRoot $legacyConda
+        }
+        Remove-LegacyDeployment $LegacyRoot
+    }
+    $migratedFromC = Test-Path -LiteralPath $migrationFile
     if (Test-Path -LiteralPath $ConfigFile) { Copy-Item -LiteralPath $ConfigFile -Destination $BackupDir }
     foreach ($file in @('run_worker.py','runtime.json')) {
         if (Test-Path -LiteralPath (Join-Path $RunDir $file)) { Copy-Item -LiteralPath (Join-Path $RunDir $file) -Destination $BackupDir }
@@ -545,14 +844,20 @@ try {
     }
 
     Write-Host 'Installing/reusing Git...'
-    $Git = Find-MachineFile 'Git\cmd\git.exe'
+    $Git = Find-ExistingGit
+    $gitInstallLog = Join-Path $LogDir "git-install-$stamp.log"
     if (-not $Git) {
         $installer = Get-Installer 'git.exe' { Resolve-GitMirrorUrl }
-        Install-PackageFile $installer '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /ALLUSERS'
-        $Git = Find-MachineFile 'Git\cmd\git.exe'
+        Initialize-SoftwareDirectory $GitRoot
+        Write-Host "Git destination: $GitRoot | Installer log: $gitInstallLog"
+        try {
+            Install-PackageFile $installer "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /ALLUSERS /LOG=`"$gitInstallLog`" /DIR=`"$GitRoot`""
+        } catch { throw "Git installer failed: $($_.Exception.Message) Installer log: $gitInstallLog" }
+        $Git = Find-ExistingGit
+        if (-not $Git) { $Git = Join-Path $GitRoot 'cmd\git.exe' }
     }
-    if (-not $Git) { throw 'Machine-wide Git installation was not found.' }
-    Invoke-Native $Git @('--version')
+    Assert-GitInstallation $Git $gitInstallLog
+    Write-Host "Using C: Git: $Git"
 
     Write-Host 'Checking Git checkout...'
     if (Test-Path -LiteralPath $ProjectDir) {
@@ -566,6 +871,11 @@ try {
         Invoke-Native $Git @('-C',$ProjectDir,'merge-base','--is-ancestor','HEAD','origin/main')
     } else {
         Invoke-Native $Git @('clone','--branch','main','--single-branch',$RepoUrl,$ProjectDir)
+    }
+    $restoreLegacyConfig = $migratedFromC -and (Test-Path -LiteralPath $legacyConfig) -and -not (Test-Path -LiteralPath $ConfigFile)
+    if ($restoreLegacyConfig) {
+        Write-Utf8 $resetDataPending 'Use the new deployment data directory when restoring legacy configuration.'
+        Copy-Item -LiteralPath $legacyConfig -Destination $ConfigFile
     }
     if ((Test-Path -LiteralPath "$ProjectDir\master.yaml") -or (Test-Path -LiteralPath "$ProjectDir\master.yml")) { throw 'Master configuration found: use a separate Worker checkout.' }
     $tracked = @(Get-GitTrackedPaths $Git $ProjectDir 'HEAD') + @(Get-GitTrackedPaths $Git $ProjectDir 'origin/main')
@@ -621,7 +931,7 @@ def prepare(runtime, check_only=False):
         require(isinstance(value, dict), 'Invalid YAML section: ' + name)
         return value
     paths = section('paths')
-    data = Path(os.path.expandvars(str(paths.get('data_dir') or './worker_data'))).expanduser()
+    data = Path(os.path.expandvars(str('./worker_data' if runtime.get('reset_data_dir') else (paths.get('data_dir') or './worker_data')))).expanduser()
     data = data if data.is_absolute() else root / data
     for path in (data, *data.parents):
         require(not path.is_symlink() and not getattr(path, 'is_junction', lambda: False)(), 'Data directory must not use symlinks/junctions')
@@ -740,7 +1050,7 @@ if __name__ == '__main__':
     Write-Utf8 (Join-Path $RunDir 'deploy_helper.py') $helper
 
     Write-Host 'Installing/reusing browsers and Wireshark...'
-    $chrome = Find-MachineFile 'Google\Chrome\Application\chrome.exe'
+    $chrome = Find-ExistingBrowser 'chrome'
     if (-not $chrome) {
         if ($InstallerDirectory -and (Test-Path -LiteralPath (Join-Path $InstallerDirectory 'chrome.msi') -PathType Leaf)) {
             Install-PackageFile (Get-Installer 'chrome.msi' { throw 'Supply chrome.msi locally.' }) ''
@@ -749,7 +1059,9 @@ if __name__ == '__main__':
             $chrome = Install-ManagedChrome
         }
     }
-    $edge = Find-MachineFile 'Microsoft\Edge\Application\msedge.exe'
+    if (-not $chrome) { throw 'Chrome installation is missing.' }
+    Publish-ManagedChrome $chrome
+    $edge = Find-ExistingBrowser 'edge'
     if (-not $edge) {
         $installer = Get-Installer 'edge.msi' {
             if ($Sources.EdgeMsiUrl) { return $Sources.EdgeMsiUrl }
@@ -764,19 +1076,21 @@ if __name__ == '__main__':
         Install-PackageFile $installer ''
         $edge = Find-MachineFile 'Microsoft\Edge\Application\msedge.exe'
     }
-    $firefox = Find-MachineFile 'Mozilla Firefox\firefox.exe'
+    $firefox = Find-ExistingBrowser 'firefox'
     if (-not $firefox) {
-        Install-PackageFile (Get-Installer 'firefox.msi' { Resolve-FirefoxMirrorUrl }) ''
+        Install-PackageFile (Get-Installer 'firefox.msi' { Resolve-FirefoxMirrorUrl }) 'INSTALL_DIRECTORY_PATH="C:\Program Files\Mozilla Firefox"'
         $firefox = Find-MachineFile 'Mozilla Firefox\firefox.exe'
     }
     if (-not $chrome -or -not $edge -or -not $firefox) { throw 'A browser installation is missing.' }
-    $tshark = Find-MachineFile 'Wireshark\tshark.exe'
-    if (-not $tshark) {
+    Write-Host "Edge executable: $edge | Firefox executable: $firefox"
+    $tshark = Join-Path $WiresharkRoot 'tshark.exe'
+    if (-not (Test-Path -LiteralPath $tshark -PathType Leaf)) {
         $installer = Get-Installer 'wireshark.exe' { $Sources.WiresharkUrl; $Sources.WiresharkFallbackUrl } -ExpectedSha256 $Sources.WiresharkSha256
-        Install-PackageFile $installer '/S /desktopicon=no'
-        $tshark = Find-MachineFile 'Wireshark\tshark.exe'
+        $oldTshark = Find-MachineFile 'Wireshark\tshark.exe'
+        if ($migratedFromC -and $oldTshark -and $oldTshark -like 'C:\*') { Uninstall-LegacyPackage 'Wireshark' (Split-Path $oldTshark -Parent) $oldTshark }
+        Install-PackageFile $installer "/S /desktopicon=no /D=$WiresharkRoot"
     }
-    if (-not $tshark) { throw 'TShark installation missing.' }
+    if (-not (Test-Path -LiteralPath $tshark -PathType Leaf)) { throw 'TShark installation missing at the requested destination.' }
     $npcap = Get-Service -Name npcap -ErrorAction SilentlyContinue
     if (-not $npcap) {
         if ($NpcapOemInstaller) {
@@ -814,6 +1128,7 @@ if __name__ == '__main__':
 
     $runtime = [ordered]@{
         project=$ProjectDir; python=$Python; run=$RunDir; logs=$LogDir; tshark=$tshark
+        temp=$TempDir; reset_data_dir=[bool](Test-Path -LiteralPath $resetDataPending)
         browsers=@{chrome=$chrome; edge=$edge; firefox=$firefox}
         drivers=$drivers
         worker_id=$WorkerId; rotate_token=[bool]$RotateToken
@@ -829,6 +1144,9 @@ if __name__ == '__main__':
     Invoke-Native $Python @('-m','pip','check')
     Invoke-Native $Python @('-c','import flask, waitress, yaml, selenium, webdriver_manager, websocket')
     Invoke-Native $Python @((Join-Path $RunDir 'deploy_helper.py'),'prepare',$RuntimeFile)
+    if (Test-Path -LiteralPath $resetDataPending) { Remove-Item -LiteralPath $resetDataPending }
+    $runtime.reset_data_dir = $false
+    Write-Utf8 $RuntimeFile ($runtime | ConvertTo-Json -Depth 5)
 
     # A kill-on-close Job Object contains the supervisor and ALL inherited descendants.
     # Stopping the scheduled task therefore also stops browser/driver/capture processes.
@@ -875,6 +1193,9 @@ def main():
     env.update(WORKER_CONFIG_FILE=str(Path(runtime['project']) / 'worker.yaml'), PYTHONUTF8='1', PYTHONUNBUFFERED='1',
                PATH=os.pathsep.join(map(str, (prefix, prefix / 'Scripts', prefix / 'Library/bin', Path(runtime['tshark']).parent))) + os.pathsep + env.get('PATH', ''))
     env.update(runtime.get('drivers', {}))
+    if runtime.get('temp'):
+        Path(runtime['temp']).mkdir(parents=True, exist_ok=True)
+        env.update(TEMP=runtime['temp'], TMP=runtime['temp'])
     logs = Path(runtime['logs'])
     logs.mkdir(parents=True, exist_ok=True)
     for name in ('worker.stdout.log', 'worker.stderr.log'):
@@ -918,6 +1239,8 @@ if __name__ == '__main__':
     Write-Warning "Deployment incomplete. Worker may be stopped/disabled or running without passing acceptance. Logs: $LogDir ; backups: $BackupDir"
     throw
 } finally {
+    $env:TEMP = $previousTemp
+    $env:TMP = $previousTmp
     if ($transcript) { Stop-Transcript | Out-Null }
     if ($locked) { $lock.ReleaseMutex() }
     $lock.Dispose()

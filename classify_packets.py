@@ -8,6 +8,7 @@
 """
 
 import csv
+from analysis_scripts.tcp_flags import empty_tcp_category, TCP_CONTROL_FIELDS, tcp_flags_text
 import sys
 import shutil
 import logging
@@ -67,11 +68,13 @@ PKT_FIELDS = [
     "frame_no",
     "time_rel",          # 相对于 pcap 第一包的时间（秒）
     "pkt_len",
-    "tcp_payload_len",   # TCP payload 字节数（0 = 纯 ACK）
+    "tcp_payload_len",   # TCP payload 字节数（0 表示无载荷，需结合 flags 分类）
     "tls_content_type",  # Handshake / ApplicationData / -
     "h2_frame_type",     # DATA / HEADERS / SETTINGS / ... / -
     "h2_frame_len",      # HTTP/2 payload 长度（字节）
     "category",          # header / data / ack / tls_segment
+    "tcp_flags",        # 原始 TCP flags 位掩码
+    "tcp_flags_text",   # SYN、SYN|ACK、FIN|ACK、RST 等可读标志
 ]
 
 # ---------------------------------------------------------------------------
@@ -86,6 +89,7 @@ TSHARK_FIELDS = [
     "ipv6.src", "ipv6.dst",
     "tcp.srcport", "tcp.dstport",
     "tcp.len",
+    "tcp.flags",
     "tls.record.content_type",
     "http2.type",
     "http2.length",
@@ -154,14 +158,14 @@ def read_flow_tsv(tsv_path: Path) -> dict[FlowKey, dict]:
 # 包分类
 # ---------------------------------------------------------------------------
 
-def classify_pkt(raw_ct: str, raw_h2_types: list[str], tcp_payload_len: int) -> str:
+def classify_pkt(raw_ct: str, raw_h2_types: list[str], tcp_payload_len: int, tcp_flags=None) -> str:
     """依据 TLS content type、HTTP/2 frame type 和载荷长度标注数据包。"""
     if raw_ct == "22":
         return "header"
     if raw_h2_types:
         return "data" if any(t == "0" for t in raw_h2_types) else "header"
     if tcp_payload_len == 0:
-        return "ack"
+        return empty_tcp_category(tcp_flags)
     return "tls_segment"
 
 # ---------------------------------------------------------------------------
@@ -230,7 +234,7 @@ def process(pcap: Path, keylog: Path, flow_tsv: Path, output_dir: Path):
         h2_types_str = ",".join(H2_FRAME_TYPES.get(t, t) for t in raw_h2_types)
         h2_lens_str  = ",".join(raw_h2_lens)
 
-        category = classify_pkt(raw_ct, raw_h2_types, tcp_payload_len)
+        category = classify_pkt(raw_ct, raw_h2_types, tcp_payload_len, pkt.get("tcp.flags"))
 
         flow_pkts[key].append({
             "frame_no":         pkt["frame.number"],
@@ -241,6 +245,8 @@ def process(pcap: Path, keylog: Path, flow_tsv: Path, output_dir: Path):
             "h2_frame_type":    h2_types_str or "-",
             "h2_frame_len":     h2_lens_str  or "-",
             "category":         category,
+            "tcp_flags":        pkt.get("tcp.flags", ""),
+            "tcp_flags_text":   tcp_flags_text(pkt.get("tcp.flags")),
         })
 
     # 输出：每条流一个文件
@@ -269,7 +275,9 @@ def process(pcap: Path, keylog: Path, flow_tsv: Path, output_dir: Path):
             fh.write(f"# direction    : {direction}\n")
             fh.write(f"# pkt_count    : {len(pkts)}"
                      f"  header={cats['header']} data={cats['data']}"
-                     f" ack={cats['ack']} tls_segment={cats['tls_segment']}\n")
+                     f" ack={cats['ack']} tls_segment={cats['tls_segment']}"
+                     f" unknown={cats['unknown']}"
+                     + "".join(f" {field}={cats[field]}" for field in TCP_CONTROL_FIELDS) + "\n")
             fh.write("#\n")
 
             writer = csv.DictWriter(fh, fieldnames=PKT_FIELDS, delimiter="\t")

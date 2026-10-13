@@ -79,7 +79,8 @@ def process_dir(subdir: Path, browser: str) -> dict | None:
         log.info("[%s] TSV 无数据行，跳过", subdir.name)
         return None
 
-    entry_id, wiki_name = parse_id_name(subdir.name)
+    from analysis_scripts.result_layout import page_name
+    entry_id, wiki_name = parse_id_name(page_name(tsv_path))
 
     # 正向流：client→server（dst_port=443）
     # 反向流：server→client（src_port=443）
@@ -158,7 +159,8 @@ def main():
 
     output_path = Path(args.output) if args.output else root / "multi-flow.tsv"
 
-    subdirs = sorted(d for d in root.iterdir() if d.is_dir())
+    subdirs = ([root] if (root / f"capture_{args.browser}.tsv").is_file()
+               else sorted(d for d in root.iterdir() if d.is_dir()))
     log.info("根目录   : %s", root)
     log.info("浏览器   : %s", args.browser)
     log.info("子目录数 : %d", len(subdirs))

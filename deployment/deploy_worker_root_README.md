@@ -44,7 +44,7 @@ bash /root/deploy_worker_root.sh
 1. 检查 root、Ubuntu x86_64 和 systemd。
 2. 校验内嵌压缩包 SHA-256，解包 Worker、采集和分析脚本、依赖清单。
 3. 安装系统 Python、curl、证书、GnuPG、TShark、字体、UFW 等依赖。
-4. 安装 Miniconda，创建 Python 3.12 环境，安装 Flask、Waitress、PyYAML、Selenium、webdriver-manager。
+4. 从南京大学镜像安装 Miniconda，通过南京大学 conda-forge 镜像创建 Python 3.12 环境，再安装 Flask、Waitress、PyYAML、Selenium、webdriver-manager。镜像频道仅作用于本次创建环境的命令，不修改全局 `.condarc`；已有可用环境继续复用。
 5. 安装 Chrome 和 Mozilla 官方 DEB 版 Firefox，核对 Mozilla 签名密钥指纹。
 6. 固定 Firefox 路径 `/usr/lib/firefox/firefox`，避免此次遇到的 Snap 与独立 GeckoDriver 混用问题；不删除已有 Snap。
 7. 实际检查 root 抓包、Chrome 和 Firefox 无头启动。
@@ -58,7 +58,7 @@ bash /root/deploy_worker_root.sh
 ## 服务器前提
 
 - 标准 Ubuntu x86_64 云服务器，root 登录且 systemd 正常运行。
-- 能访问 Ubuntu、Anaconda、conda-forge、Python 包源、Google、Mozilla、GitHub 驱动下载和测试网站。
+- 能访问 Ubuntu、[南京大学 Anaconda 镜像](https://mirrors.nju.edu.cn/anaconda/)、Python 包源、Google、Mozilla、GitHub 驱动下载和测试网站。
 - 不支持 ARM64、非 Ubuntu 或没有 systemd 的裸容器。
 - 不需要桌面、Node.js 或手动激活 Conda。
 - 默认机器 ID 为 `Ubuntu-worker-01`，多台部署用 `--worker-id` 设置不同名称。

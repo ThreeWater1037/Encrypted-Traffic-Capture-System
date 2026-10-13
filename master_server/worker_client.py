@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from http.client import HTTPException, IncompleteRead
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -10,7 +11,7 @@ from urllib.request import Request, urlopen
 
 
 class WorkerRequestError(RuntimeError):
-    """Worker 无法访问或返回非成功状态。"""
+    """Worker 无法访问、响应不完整或返回非成功状态。"""
 
     def __init__(self, message: str, *, status_code: int | None = None):
         super().__init__(message)
@@ -49,12 +50,34 @@ class WorkerClient:
                 return json.loads(body) if body else {}
         except HTTPError as exc:
             try:
-                detail = json.loads(exc.read().decode("utf-8"))
-                message = detail.get("message") or detail.get("error")
-            except (UnicodeDecodeError, json.JSONDecodeError):
+                with exc:
+                    detail = json.loads(exc.read().decode("utf-8"))
+                message = (
+                    detail.get("message") or detail.get("error") or exc.reason
+                    if isinstance(detail, dict) else exc.reason
+                )
+            except (HTTPException, OSError, UnicodeDecodeError, json.JSONDecodeError):
+                # 错误响应本身也可能被截断；仍保留 HTTP 状态供调用方判断。
                 message = exc.reason
             raise WorkerRequestError(
-                f"Worker 返回 HTTP {exc.code}：{message}", status_code=exc.code
+                f"Worker 返回 HTTP {exc.code}（{method} {path}）：{message}",
+                status_code=exc.code,
+            ) from exc
+        except IncompleteRead as exc:
+            remaining = (
+                f"，仍缺少 {exc.expected} 字节" if exc.expected is not None else ""
+            )
+            raise WorkerRequestError(
+                f"Worker 响应传输中断（{method} {path}）："
+                f"已读取 {len(exc.partial)} 字节{remaining}"
+            ) from exc
+        except HTTPException as exc:
+            raise WorkerRequestError(
+                f"Worker HTTP 响应异常（{method} {path}）：{type(exc).__name__}"
+            ) from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WorkerRequestError(
+                f"Worker JSON 响应无效（{method} {path}）：{type(exc).__name__}"
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
             raise WorkerRequestError(f"无法连接 Worker：{exc}") from exc

@@ -226,7 +226,7 @@ Write-Host 'PASS: mirror stable selection/overrides, three matching drivers, loc
         # Rerunning must repair a previous extraction containing chrome.exe alone.
         $chromeZip = Join-Path $CacheDir 'chrome-win64.zip'
         $zip = [IO.Compression.ZipFile]::Open($chromeZip, [IO.Compression.ZipArchiveMode]::Create)
-        foreach ($name in @('chrome.exe','chrome.dll')) {
+        foreach ($name in @('chrome.exe','chrome.dll','resources.pak')) {
             $entry = $zip.CreateEntry('chrome-win64/' + $name)
             $writer = New-Object IO.StreamWriter($entry.Open())
             $writer.Write('fixture ' + $name); $writer.Dispose()

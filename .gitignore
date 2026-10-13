@@ -16,3 +16,4 @@ hit_today_urls.txt
 crawl_runs
 /hit_today_crawler/
 /tests/test_crawl_hit_today.py
+data

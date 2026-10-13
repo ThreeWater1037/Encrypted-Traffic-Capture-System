@@ -2,7 +2,9 @@
 
 脚本：`deploy_worker_git_root.sh`。固定仓库为 <https://gitee.com/Threewater1037/encrypted-traffic-capture-system.git>，分支为 `main`。
 
-支持空服务器从零安装，也支持将原来的内嵌源码部署迁移为 Git 管理。只需上传脚本，代码由脚本克隆。服务器必须能访问 Gitee、Ubuntu 软件源、Miniconda、conda-forge、PyPI、Google、Microsoft、Mozilla 和测试网站（包括浏览器驱动下载地址）。
+支持空服务器从零安装，也支持将原来的内嵌源码部署迁移为 Git 管理。只需上传脚本，代码由脚本克隆。服务器必须能访问 Gitee、Ubuntu 软件源、南京大学 Anaconda 镜像、PyPI、Google、Microsoft、Mozilla 和测试网站（包括浏览器驱动下载地址）。
+
+Miniconda 安装包和创建 Python 环境所用的 conda-forge 频道均使用 [南京大学镜像](https://mirrors.nju.edu.cn/anaconda/)。频道通过本次命令的 `--override-channels` 指定，不修改全局 `.condarc`；已有可用的 Conda 和 Python 环境继续复用。若旧脚本仍在下载 Miniconda，可按 Ctrl+C 停止，重新上传新版脚本后执行原命令。
 
 ## 直接执行
 

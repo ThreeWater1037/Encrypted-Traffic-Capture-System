@@ -63,7 +63,7 @@ class WorkerResilienceTests(unittest.TestCase):
             self.assertEqual(fetcher._run_entry(UrlEntry("1", "fixture", "https://example.com/"), 1, 1), (3, 0, 0))
         self.assertEqual(events, ["clean", "chrome", "clean", "edge", "clean", "firefox"])
 
-    def run_child(self, *, moving=False, script="wiki_fetcher.py", disabled=False):
+    def run_child(self, *, moving=False, script="wiki_fetcher.py", disabled=False, owner=None):
         store = MagicMock()
         store.is_cancel_requested.return_value = False
         manager = TaskManager(replace(self.config, capture_stall_seconds=0) if disabled else self.config,
@@ -74,7 +74,9 @@ class WorkerResilienceTests(unittest.TestCase):
             calls[0] += 1
             clock[0] += 4
             return 0 if calls[0] == 4 else None
-        with patch("worker_agent.task_runner.subprocess.Popen") as popen, \
+        with patch("worker_agent.task_runner.LINUX", owner is not None), \
+             patch("worker_agent.task_runner.LinuxProcessOwner", return_value=owner), \
+             patch("worker_agent.task_runner.subprocess.Popen") as popen, \
              patch("worker_agent.task_runner.time.monotonic", side_effect=lambda: clock[0]), \
              patch("worker_agent.task_runner.time.sleep"), \
              patch.object(manager, "_progress_stamp", side_effect=lambda _: (clock[0], 10) if moving else None), \
@@ -94,6 +96,30 @@ class WorkerResilienceTests(unittest.TestCase):
     def test_analysis_and_disabled_stall_guard_are_not_killed(self):
         self.assertEqual(self.run_child(script="batch_process.py"), (0, 0))
         self.assertEqual(self.run_child(disabled=True), (0, 0))
+
+    def test_ended_task_parent_does_not_skip_owned_child_cleanup(self):
+        process = MagicMock()
+        process.poll.return_value = 0
+        owner = process._capture_process_owner = MagicMock()
+        owner.terminate.return_value = {"signaled_pids": [123], "remaining_pids": [], "forced": True}
+        TaskManager._terminate_process_tree(process)
+        owner.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=2.0)
+
+    def test_surviving_owned_child_is_explicit_failure(self):
+        process = MagicMock()
+        process.poll.return_value = 0
+        owner = process._capture_process_owner = MagicMock()
+        owner.terminate.return_value = {"signaled_pids": [123], "remaining_pids": [123], "forced": True}
+        with self.assertRaisesRegex(RuntimeError, "still running"):
+            TaskManager._terminate_process_tree(process)
+
+    def test_natural_task_exit_also_cleans_owned_children(self):
+        owner = MagicMock()
+        owner.terminate.return_value = {"signaled_pids": [123], "remaining_pids": [], "forced": True}
+        result, _ = self.run_child(disabled=True, owner=owner)
+        self.assertEqual(result, 0)
+        owner.terminate.assert_called_once()
 
 
 class WatchdogTests(unittest.TestCase):

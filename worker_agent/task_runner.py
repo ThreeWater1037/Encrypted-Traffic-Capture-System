@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from capture_temp_cleanup import CLEANUP_INTERVAL_SECONDS, REGISTRY_ENV, cleanup_retained_directories
+from process_ownership import LINUX, LinuxProcessOwner
 
 from .config import WorkerConfig
 from .task_store import TERMINAL_STATUSES, TaskStore, utc_now
@@ -460,6 +461,9 @@ class TaskManager:
         environment[REGISTRY_ENV] = str((self.config.data_dir / "temp_cleanup").resolve())
         for name in ("TMPDIR", "TEMP", "TMP"):
             environment[name] = str(self.config.capture_temp_dir)
+        owner = LinuxProcessOwner("CAPTURE_TASK_OWNER") if LINUX else None
+        if owner is not None:
+            environment = owner.environment(environment)
         popen_kwargs: dict[str, Any] = {
             "cwd": self.config.data_dir,
             "env": environment,
@@ -476,6 +480,9 @@ class TaskManager:
         with log_path.open("ab", buffering=0) as log_file:
             popen_kwargs["stdout"] = log_file
             process = subprocess.Popen(command, **popen_kwargs)
+            process._capture_process_owner = owner
+            if owner is not None:
+                owner.bind(process, session=True)
 
             with self._active_lock:
                 self._active_process = process
@@ -514,10 +521,18 @@ class TaskManager:
                         )
                     time.sleep(0.5)
             finally:
-                with self._active_lock:
-                    if self._active_process is process:
-                        self._active_process = None
-                self.store.update_task(task_id, pid=None)
+                try:
+                    if owner is not None:
+                        details = owner.terminate()
+                        if details["signaled_pids"]:
+                            self._append_log(log_path, f"Owned task process cleanup: {json.dumps(details)}")
+                        if details["remaining_pids"]:
+                            raise RuntimeError(f"Owned task processes still running: {details['remaining_pids']}")
+                finally:
+                    with self._active_lock:
+                        if self._active_process is process:
+                            self._active_process = None
+                    self.store.update_task(task_id, pid=None)
 
     @staticmethod
     def _progress_stamp(path: Path | None) -> tuple[int, int] | None:
@@ -552,6 +567,13 @@ class TaskManager:
     @staticmethod
     def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
         """按操作系统终止整个子进程树，防止遗留浏览器或 TShark。"""
+        owner = vars(process).get("_capture_process_owner")
+        if owner is not None:
+            details = owner.terminate()
+            if details["remaining_pids"]:
+                raise RuntimeError(f"Owned task processes still running: {details['remaining_pids']}")
+            process.wait(timeout=2.0)
+            return
         if process.poll() is not None:
             return
         try:

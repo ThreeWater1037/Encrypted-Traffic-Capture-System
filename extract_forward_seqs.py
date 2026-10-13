@@ -5,7 +5,7 @@ capture_{browser}_inferred/ 下所有 forward_*.tsv，
 
 提取规则：
   handshake / control / header / data / ack / tls_segment / unknown
-    → 从文件头注释行读计数，如：
+    → 从逐包分类重新计数；零载荷包必须有 tcp_flags，如：
       # pkt_count    : 9  handshake=2 control=0 header=0 data=0 ack=6 tls_segment=1 unknown=0
 
   header_lens
@@ -23,6 +23,7 @@ capture_{browser}_inferred/ 下所有 forward_*.tsv，
   ack           ack       包个数
   tls_segment   tls_segment 包个数
   unknown       unknown   包个数
+  syn/syn_ack/fin/fin_ack/rst/rst_ack/tcp_other  零载荷 TCP 标志组合计数
   header_lens   header 包的 est_h2_payload_range 第一个数，逗号分隔
 
 用法：
@@ -36,6 +37,7 @@ capture_{browser}_inferred/ 下所有 forward_*.tsv，
 """
 
 import csv
+from analysis_scripts.tcp_flags import empty_tcp_category, TCP_CONTROL_FIELDS
 import re
 import sys
 import logging
@@ -50,7 +52,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # 计数字段（顺序与文件头一致）
-COUNT_FIELDS = ["handshake", "control", "header", "data", "ack", "tls_segment", "unknown"]
+COUNT_FIELDS = ["handshake", "control", "header", "data", "ack", "tls_segment", "unknown", *TCP_CONTROL_FIELDS]
 
 # 匹配 "key=数字" 的模式
 _RE_COUNT = re.compile(r"(\w+)=(\d+)")
@@ -114,7 +116,12 @@ def process_flow_file(tsv_path: Path) -> dict:
     # ── 解析数据行：只取 header 类包的 est_h2_payload_range ────────────
     if data_lines:
         reader = csv.DictReader(data_lines, delimiter="\t")
+        counts = {field: 0 for field in COUNT_FIELDS}
         for row in reader:
+            category = row.get("category", "unknown").strip()
+            if row.get("tcp_payload_len") == "0" or category in ("ack", "tcp_control", *TCP_CONTROL_FIELDS):
+                category = empty_tcp_category(row.get("tcp_flags"))
+            counts[category if category in counts else "unknown"] += 1
             if row.get("category", "").strip() != "header":
                 continue
             r = row.get("est_h2_payload_range", "").strip()
@@ -142,7 +149,8 @@ def process_dir(subdir: Path, browser: str) -> list[dict]:
     if not inferred_dir.is_dir():
         return []
 
-    entry_id, wiki_name = parse_id_name(subdir.name)
+    from analysis_scripts.result_layout import page_name
+    entry_id, wiki_name = parse_id_name(page_name(inferred_dir))
     forward_files = sorted(inferred_dir.glob("forward_*.tsv"))
     if not forward_files:
         return []
@@ -201,7 +209,8 @@ def main():
         log.error("目录不存在：%s", root)
         sys.exit(1)
 
-    subdirs = sorted(d for d in root.iterdir() if d.is_dir())
+    subdirs = ([root] if (root / f"capture_{args.browser}_inferred").is_dir()
+               else sorted(d for d in root.iterdir() if d.is_dir()))
     log.info("根目录   : %s", root)
     log.info("浏览器   : %s", args.browser)
     log.info("子目录数 : %d", len(subdirs))
