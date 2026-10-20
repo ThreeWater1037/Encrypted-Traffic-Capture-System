@@ -10,4 +10,5 @@ export const statusLabel = (status) => statusLabels[status] || status || '未知
 export const artifactLabels = {
   pcap: 'PCAP', tls_keylog: 'TLS keylog', checkpoint: '采集完成标记', html: '页面 HTML',
   report: '抓取报告', extract: '提取结果', classify: '分类结果', infer: '推断结果',
+  extraction: '提取校验凭据', flow_sequences: '流序列', tls_features: 'TLS 特征', pcap_retired: '提取验证后已删除 PCAP',
 }

@@ -1,9 +1,11 @@
 <script setup>
 import { onBeforeUnmount, onMounted } from 'vue'
-import { Activity, FlaskConical, History, LayoutDashboard, RefreshCw, Server, ShieldCheck, WifiOff } from '@lucide/vue'
+import { Activity, Database, FlaskConical, History, LayoutDashboard, RefreshCw, Server, ShieldCheck, WifiOff } from '@lucide/vue'
 import WorkspaceView from './views/WorkspaceView.vue'
 import JobsView from './views/JobsView.vue'
 import MachinesView from './views/MachinesView.vue'
+import DataResultsView from './views/DataResultsView.vue'
+import ExtractionsView from './views/ExtractionsView.vue'
 import * as api from './services/api'
 import { createConsoleState } from './services/consoleState'
 
@@ -19,18 +21,27 @@ const {
 const navItems = [
   { id: 'workspace', label: '实验工作台', icon: LayoutDashboard },
   { id: 'jobs', label: '任务与结果', icon: History },
+  { id: 'data-results', label: '数据与结果', icon: Database },
+  { id: 'extractions', label: '任务提取', icon: FlaskConical },
   { id: 'machines', label: '机器管理', icon: Server },
 ]
+function readHash() {
+  const id = window.location.hash.slice(1)
+  if (navItems.some(item => item.id === id)) activeView.value = id
+}
+function navigate(id) { activeView.value = id; window.location.hash = id }
+readHash()
 let pollTimer
 onMounted(() => {
+  window.addEventListener('hashchange', readHash)
   loadInitialData()
   pollTimer = window.setInterval(() => refreshDashboard(), 5 * 60 * 1000)
 })
-onBeforeUnmount(() => window.clearInterval(pollTimer))
+onBeforeUnmount(() => { window.clearInterval(pollTimer); window.removeEventListener('hashchange', readHash) })
 </script>
 
 <template>
-  <div class="app-shell">
+  <div :class="['app-shell', { 'data-view-active': activeView === 'data-results' }]">
     <aside class="sidebar">
       <div class="brand">
         <span class="brand-mark"><FlaskConical :size="20" /></span>
@@ -42,7 +53,7 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
           v-for="item in navItems"
           :key="item.id"
           :class="['nav-item', { active: activeView === item.id }]"
-          @click="activeView = item.id"
+          @click="navigate(item.id)"
         >
           <component :is="item.icon" :size="17" />
           <span>{{ item.label }}</span>
@@ -65,7 +76,7 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
           <span class="eyebrow">CONTROL PLANE</span>
           <h1>{{ navItems.find((item) => item.id === activeView)?.label }}</h1>
         </div>
-        <div class="topbar-meta">
+        <div v-if="!['data-results', 'extractions'].includes(activeView)" class="topbar-meta">
           <span><Activity :size="15" /> {{ runningCount }} 个任务运行中</span>
           <span><Server :size="15" /> {{ machines.filter((m) => ['ONLINE', 'BUSY'].includes(m.status)).length }}/{{ machines.length }} 台在线</span>
           <span>每 5 分钟自动刷新</span>
@@ -75,7 +86,9 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
 
       <section class="page-content">
         <p v-if="connectionError" class="load-error" role="alert">主控未连接，当前数据可能已过期：{{ connectionError }}</p>
-        <p v-if="lastUpdated" class="update-time">主控最近连接成功：{{ lastUpdated }}</p>
+        <p v-if="lastUpdated && activeView !== 'data-results'" class="update-time">主控最近连接成功：{{ lastUpdated }}</p>
+        <DataResultsView v-show="activeView === 'data-results'" :active="activeView === 'data-results'" />
+        <ExtractionsView v-show="activeView === 'extractions'" :active="activeView === 'extractions'" :machines="machines" />
         <WorkspaceView
           v-show="activeView === 'workspace'"
           :machines="machines"

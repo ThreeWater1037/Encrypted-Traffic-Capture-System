@@ -41,6 +41,19 @@ py -3.13 -m unittest tests.test_job_management tests.test_frontend_regressions t
 
 ## 本地运行
 
+### 数据与结果页面
+
+独立入口 `/#data-results` 面向分析人员，原“任务与结果”保留日志、取消、断点继续、重启和删除功能。
+
+- 总体任务分组和待归组批次均在服务端分页；整理分组使用修订号，防止覆盖并发修改。
+- URL 列表每行是一个 `批次 × URL × 机器 × 浏览器`，支持全部数据、未归组、总体任务、跨批次搜索、机器及 Chrome/Edge/Firefox 筛选；每页 20/50/100 条。
+- 文件摘要来自 PCAP/TLS 上报和检查；完整文件位置仅点击后查询。页面切换保留筛选与分页；结果页缓存最多 8 页、汇总 12 组、详情 20 条，手动刷新清空缓存。
+- “机器目录配置”保存到 Master 的 `result_locations` 表。填写 Worker 的绝对任务根目录，不含任务名。历史文件使用已保存的 `worker_task_id`，不重新计算旧目录。Worker 已上报的绝对路径优先；配置拼接路径标注“未核验”；无根目录时明确显示相对路径待补充。
+- 索引导出使用 `/api/v1/data/export`，覆盖当前筛选的全部分页，逐产物输出 UTF-8 BOM CSV；包含机器地址、完整/相对路径、路径来源与文件情况，不访问 Worker。
+- 新页面依赖同版本 Master 的 `/api/v1/data/*` 接口与新增目录配置表；启动 Master 时自动创建表，不修改现有采集记录。原始 PCAP 和 TLS 文件仍留在各 Worker。
+
+验证新增接口：`py -3.13 -m unittest tests.test_data_results tests.test_collection_queries tests.test_collections tests.test_master_openapi`。
+
 ```powershell
 cd frontend
 npm install --cache .npm-cache

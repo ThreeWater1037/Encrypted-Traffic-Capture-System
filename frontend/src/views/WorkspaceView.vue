@@ -40,6 +40,8 @@ const pcap = ref(typeof draft.pcap === 'boolean' ? draft.pcap : true)
 const saveHtml = ref(typeof draft.saveHtml === 'boolean' ? draft.saveHtml : false)
 const saveReports = ref(typeof draft.saveReports === 'boolean' ? draft.saveReports : false)
 const steps = reactive({ extract: false, classify: false, infer: false, ...(draft.steps || {}) })
+const pipeline = ref(typeof draft.pipeline === 'boolean' ? draft.pipeline : true)
+const deletePcap = ref(typeof draft.deletePcap === 'boolean' ? draft.deletePcap : true)
 const withCoframe = ref(typeof draft.withCoframe === 'boolean' ? draft.withCoframe : false)
 const sniSuffixes = ref(typeof draft.sniSuffixes === 'string' ? draft.sniSuffixes : '')
 const selections = reactive(draft.selections && typeof draft.selections === 'object' ? draft.selections : {})
@@ -67,7 +69,7 @@ watch([() => props.machines, () => props.machinesLoaded], ([machines, loaded]) =
 
 // 保存可序列化的工作台草稿；浏览器禁止恢复本地文件选择，因此不保存 selectedFile。
 watch(
-  [jobName, inputRows, pcap, saveHtml, saveReports, steps, withCoframe, sniSuffixes, selections],
+  [jobName, inputRows, pcap, saveHtml, saveReports, steps, pipeline, deletePcap, withCoframe, sniSuffixes, selections],
   () => {
     try {
       window.localStorage.setItem(DRAFT_KEY, JSON.stringify({
@@ -77,6 +79,8 @@ watch(
         saveHtml: saveHtml.value,
         saveReports: saveReports.value,
         steps: { ...steps },
+        pipeline: pipeline.value,
+        deletePcap: deletePcap.value,
         withCoframe: withCoframe.value,
         sniSuffixes: sniSuffixes.value,
         selections: { ...selections },
@@ -128,9 +132,11 @@ function submit() {
     const targets = targetPayload()
     if (!targets.length) throw new Error('请至少选择一台机器和一个浏览器')
     const analysis = {
-      steps: pcap.value ? Object.entries(steps).filter(([, enabled]) => enabled).map(([name]) => name) : [],
-      with_coframe: pcap.value && steps.infer && withCoframe.value,
-      sni_suffixes: sniSuffixes.value.split(',').map((value) => value.trim()).filter(Boolean),
+      pipeline: pcap.value && pipeline.value,
+      delete_pcap: pcap.value && pipeline.value && deletePcap.value,
+      steps: pcap.value && !pipeline.value ? Object.entries(steps).filter(([, enabled]) => enabled).map(([name]) => name) : [],
+      with_coframe: pcap.value && !pipeline.value && steps.infer && withCoframe.value,
+      sni_suffixes: pipeline.value ? [] : sniSuffixes.value.split(',').map((value) => value.trim()).filter(Boolean),
     }
     const outputs = { html: saveHtml.value, reports: saveReports.value }
     if (mode.value === 'file') {
@@ -143,6 +149,8 @@ function submit() {
       form.append('save_html', String(outputs.html))
       form.append('save_reports', String(outputs.reports))
       form.append('analysis_steps', analysis.steps.join(','))
+      form.append('analysis_pipeline', String(analysis.pipeline))
+      form.append('delete_pcap', String(analysis.delete_pcap))
       form.append('with_coframe', String(analysis.with_coframe))
       form.append('sni_suffixes', analysis.sni_suffixes.join(','))
       emit('submit', { kind: 'file', form })
@@ -207,8 +215,10 @@ function submit() {
     </section>
 
     <section class="panel options-panel">
-      <div class="section-heading"><div><span class="step-number">03</span><div><h2>采集与可选产物</h2><p>默认只保留 PCAP 与 TLS keylog；所有访问均使用全新 Profile</p></div></div></div>
+      <div class="section-heading"><div><span class="step-number">03</span><div><h2>采集与可选产物</h2><p>后台提取流序列和 TLS 特征；所有访问均使用全新 Profile</p></div></div></div>
       <div class="option-row"><div><strong>抓取 PCAP</strong><small>TLS keylog 固定保存；PCAP 默认开启</small></div><label class="switch"><input v-model="pcap" type="checkbox" /><span></span></label></div>
+      <div class="option-row"><div><strong>抓完后后台提取</strong><small>优先抓包，单进程依次生成流序列与 TLS 特征</small></div><label class="switch"><input v-model="pipeline" :disabled="!pcap" type="checkbox" /><span></span></label></div>
+      <div class="option-row"><div><strong>验证成功后删除原始 PCAP</strong><small>两套结果均通过校验才删除；失败时保留 PCAP，TLS 密钥始终保留</small></div><label class="switch"><input v-model="deletePcap" :disabled="!pcap || !pipeline" type="checkbox" /><span></span></label></div>
       <div class="analysis-steps">
         <span>其他抓取产物（可选）</span>
         <label><input v-model="saveHtml" type="checkbox" />页面 HTML</label>
@@ -216,11 +226,11 @@ function submit() {
       </div>
       <div class="analysis-steps">
         <span>后处理流水线（可选）</span>
-        <label v-for="label in ['extract', 'classify', 'infer']" :key="label"><input v-model="steps[label]" :disabled="!pcap" type="checkbox" />{{ label }}</label>
+        <label v-for="label in ['extract', 'classify', 'infer']" :key="label"><input v-model="steps[label]" :disabled="!pcap || pipeline" type="checkbox" />{{ label }}</label>
       </div>
       <div class="options-two">
-        <label class="field"><span>SNI 后缀过滤（逗号分隔）</span><input v-model="sniSuffixes" placeholder="留空表示不过滤" /></label>
-        <label class="check-line"><input v-model="withCoframe" :disabled="!pcap || !steps.infer" type="checkbox" />启用 coframe 分析</label>
+        <label class="field"><span>SNI 后缀过滤（逗号分隔）</span><input v-model="sniSuffixes" :disabled="pipeline" placeholder="留空表示不过滤" /></label>
+        <label class="check-line"><input v-model="withCoframe" :disabled="!pcap || pipeline || !steps.infer" type="checkbox" />启用 coframe 分析</label>
       </div>
       <div class="no-cache-note"><ShieldCheck :size="16" /><div><strong>无缓存模式已固定启用</strong><small>主控和 Worker 均返回 no-store；每次实验创建全新任务目录与浏览器配置。</small></div></div>
     </section>
