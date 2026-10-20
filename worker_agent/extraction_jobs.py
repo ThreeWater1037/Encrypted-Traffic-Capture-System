@@ -10,13 +10,15 @@ import json
 import time
 from pathlib import Path
 
-from capture_extraction import BROWSERS, save_json, verified_receipt
+from capture_extraction import BROWSERS, EXTRACTION_STEPS, normalize_steps, progress_path, save_json, verified_receipt
 from .schema import ValidationError, TASK_ID_RE
 from .task_store import TERMINAL_STATUSES, utc_now
 
 
-def extraction_id(source_id):
-    return 'extract-' + hashlib.sha256(source_id.encode()).hexdigest()[:32]
+def extraction_id(source_id, steps=None):
+    steps = normalize_steps(steps)
+    identity = source_id if steps == list(EXTRACTION_STEPS) else source_id + '\0' + ','.join(steps)
+    return 'extract-' + hashlib.sha256(identity.encode()).hexdigest()[:32]
 
 
 class ExtractionJobs:
@@ -26,13 +28,20 @@ class ExtractionJobs:
         self.config = manager.config
 
     def blocks_resume(self, source_id):
-        job = self.store.get_task_status(extraction_id(source_id))
-        return bool(job and job['status'] not in TERMINAL_STATUSES)
+        with self.store._connection() as c:
+            rows = c.execute("""SELECT status FROM tasks
+                WHERE json_extract(request_json, '$.kind')='extraction'
+                AND json_extract(request_json, '$.source_task_id')=?""", (source_id,)).fetchall()
+        return any(row[0] not in TERMINAL_STATUSES for row in rows)
 
-    def submit(self, source_id, *, keep_pcap=False, keep_pcap_count=None):
+    def submit(self, source_id, *, keep_pcap=False, keep_pcap_count=None, steps=None):
         from .task_runner import TaskConflictError, QueueFullError
         if not isinstance(source_id, str) or not TASK_ID_RE.fullmatch(source_id):
             raise ValidationError('source_task_id 无效')
+        try:
+            steps = normalize_steps(steps)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         if not isinstance(keep_pcap, bool):
             raise ValidationError('keep_pcap 必须是布尔值')
         if keep_pcap_count is not None and (type(keep_pcap_count) is not int or keep_pcap_count < 1):
@@ -47,7 +56,7 @@ class ExtractionJobs:
                 raise TaskConflictError('只允许提取已结束的成功或部分成功采集任务')
             if not source['request'].get('pcap'):
                 raise ValidationError('原任务没有开启 PCAP 抓包')
-            task_id = extraction_id(source_id)
+            task_id = extraction_id(source_id, steps)
             previous = self.store.get_task_status(task_id)
             if previous:
                 existing = self.get(task_id)
@@ -58,11 +67,15 @@ class ExtractionJobs:
                 # Explicit retries keep the same ID and verified receipts. The
                 # durable per-unit cursor is reset; verified units are cheap to skip.
                 if previous['status'] in {'PARTIAL', 'FAILED', 'CANCELED', 'INTERRUPTED'}:
+                    if self.blocks_resume(source_id):
+                        raise TaskConflictError('同一原任务已有其他提取正在运行或排队，请结束后再提交')
                     self.store.update_task(task_id, status='QUEUED', stage='WAITING_FOR_CAPTURE',
                                            cancel_requested=False, error=None, result_json=None,
                                            finished_at=None)
                     self.manager.enqueue_extraction(task_id)
                 return self.get(task_id), False
+            if self.blocks_resume(source_id):
+                raise TaskConflictError('同一原任务已有其他提取正在运行或排队，请结束后再提交')
             if self.manager.queue_size >= self.config.max_queue_size:
                 raise QueueFullError('Worker 本地任务队列已满')
             browsers = [b for b in BROWSERS if b in source['request']['browsers']]
@@ -70,7 +83,7 @@ class ExtractionJobs:
                 raise ValidationError('任务没有支持的浏览器')
             payload = dict(task_id=task_id, kind='extraction', source_task_id=source_id,
                            browsers=browsers, items=[], pcap=False, outputs={},
-                           keep_pcap=keep_pcap, keep_pcap_count=keep_pcap_count,
+                           keep_pcap=keep_pcap, keep_pcap_count=keep_pcap_count, extraction_steps=steps,
                            analysis={'steps': [], 'pipeline': False, 'delete_pcap': not keep_pcap or keep_pcap_count is not None})
             self.store.create_task(payload)
             (self.config.tasks_dir / task_id).mkdir(parents=True, exist_ok=True)
@@ -85,7 +98,10 @@ class ExtractionJobs:
         current = result.get('current') or {}
         if current.get('directory') and current.get('browser') in BROWSERS:
             try:
-                receipt = json.loads((Path(current['directory']) / f'extraction_{current["browser"]}.json').read_text(encoding='utf-8'))
+                progress_file = progress_path(current['directory'], current['browser'])
+                if not progress_file.exists():
+                    progress_file = Path(current['directory']) / f'extraction_{current["browser"]}.json'
+                receipt = json.loads(progress_file.read_text(encoding='utf-8'))
                 result['current_stage'] = receipt.get('stage') if receipt.get('status') == 'running' else 'preparing'
             except (OSError, ValueError):
                 result['current_stage'] = 'preparing'
@@ -96,6 +112,7 @@ class ExtractionJobs:
             'delete_pcap': not task['request'].get('keep_pcap', False) or task['request'].get('keep_pcap_count') is not None,
             'keep_pcap': task['request'].get('keep_pcap', False),
             'keep_pcap_count': task['request'].get('keep_pcap_count'),
+            'steps': task['request'].get('extraction_steps', list(EXTRACTION_STEPS)),
             'progress': result,
             'waiting_for_capture': task['status'] == 'QUEUED',
             'output_root': str(self.config.tasks_dir / task['request']['source_task_id'] / 'fetch_output'),
@@ -113,7 +130,8 @@ class ExtractionJobs:
             job['progress'].pop('errors', None)  # bounded details are fetched on click
         return {'jobs': jobs,
                 'page': {'total': total, 'offset': offset, 'limit': limit},
-                'active_task_id': self.manager.active_task_id, 'pcap_retention_supported': True}
+                'active_task_id': self.manager.active_task_id, 'pcap_retention_supported': True,
+                'selectable_extraction_steps': list(EXTRACTION_STEPS)}
 
     def _units(self, source):
         root = (self.config.tasks_dir / source['task_id'] / 'fetch_output').resolve()
@@ -154,6 +172,7 @@ class ExtractionJobs:
         progress.setdefault('retained', 0)
         keep_pcap = task['request'].get('keep_pcap', False)
         keep_count = task['request'].get('keep_pcap_count')
+        steps = task['request'].get('extraction_steps', list(EXTRACTION_STEPS))
         def refresh_manifest():
             manifest = manager._build_manifest(self.config.tasks_dir / source_id, source['request'],
                                                (source.get('result') or {}).get('process_errors', []))
@@ -195,17 +214,19 @@ class ExtractionJobs:
                         raise RuntimeError('检查点与原任务 URL 不一致')
                     command = [str(self.config.python_executable),
                         str(self.config.project_root / 'capture_extraction.py'), str(directory), browser]
+                    if steps != list(EXTRACTION_STEPS):
+                        command.extend(['--steps', *steps])
                     if not retain:
                         command.append('--delete-pcap')
                     code = manager._run_command(task_id, command, log_path, time.monotonic() + 6000)
                     if manager._stop_event.is_set():
                         raise TaskServiceStoppingError()
                     manager._raise_if_canceled(task_id)
-                    receipt = verified_receipt(directory, browser, full=True)
+                    receipt = verified_receipt(directory, browser, full=True, required_steps=steps)
                     pcap_exists = (directory / f'capture_{browser}.pcap').is_file()
                     retention_valid = pcap_exists if retain else (not pcap_exists and receipt and receipt.get('pcap_deleted'))
                     if code or not receipt or not retention_valid:
-                        error = f'提取或 PCAP 保留策略验证失败（退出码 {code}），详见 {directory / ("extraction_"+browser+".json")}'
+                        error = f'提取或 PCAP 保留策略验证失败（退出码 {code}），详见 {progress_path(directory, browser)}'
                         raise RuntimeError(error)
                     progress['succeeded'] += 1
                     progress['retained' if retain else 'deleted'] += 1
@@ -265,7 +286,8 @@ def register_routes(app, manager):
             return jsonify(message='请求必须是 JSON 对象'), 400
         try:
             result, created = manager.extractions.submit(data.get('source_task_id'),
-                keep_pcap=data.get('keep_pcap', False), keep_pcap_count=data.get('keep_pcap_count'))
+                keep_pcap=data.get('keep_pcap', False), keep_pcap_count=data.get('keep_pcap_count'),
+                steps=data.get('steps'))
         except ValidationError as exc:
             return jsonify(message=str(exc)), 400
         except QueueFullError as exc:

@@ -42,8 +42,47 @@ class StandaloneExtractionTests(unittest.TestCase):
 
     def execute(self, task_id, command, log_path, deadline):
         browser = command[3]
-        self.fixture.run_extract(browser, delete='--delete-pcap' in command)
+        steps = [arg for arg in command[command.index('--steps') + 1:] if not arg.startswith('--')] if '--steps' in command else None
+        self.fixture.run_extract(browser, delete='--delete-pcap' in command, steps=steps)
         return 0
+
+    def test_step_selection_can_run_separately_with_distinct_jobs_and_paths(self):
+        flow = self.enqueue(keep_pcap=True, steps=['flow'])
+        with self.assertRaises(TaskConflictError):
+            self.enqueue(keep_pcap=True, steps=['tls'])
+        with self.assertRaises(TaskConflictError):
+            self.manager.resume('capture-source', 'token')
+        self.assertEqual(self.run_job(flow)['status'], 'SUCCEEDED')
+        for unit in self.store.get_task('capture-source')['result']['units']:
+            self.assertTrue(unit['checks']['flow_sequences'])
+            self.assertNotIn('tls_features', unit['checks'])
+            self.assertFalse(unit['artifacts'].get('tls_features'))
+        tls = self.enqueue(keep_pcap=True, steps=['tls'])
+        self.assertNotEqual(flow, tls)
+        self.fixture.calls.clear()
+        self.assertEqual(self.run_job(tls)['status'], 'SUCCEEDED')
+        self.assertEqual(self.fixture.calls, ['extract_tls.py'] * 3)
+        for unit in self.store.get_task('capture-source')['result']['units']:
+            self.assertTrue(unit['artifacts']['flow_sequences'])
+            self.assertTrue(unit['artifacts']['tls_features'])
+            self.assertEqual(unit['status'], 'SUCCEEDED')
+        combined = self.enqueue(steps=['tls', 'flow'])
+        self.fixture.calls.clear()
+        self.assertEqual(self.run_job(combined)['status'], 'SUCCEEDED')
+        self.assertEqual(self.fixture.calls, [])
+
+    def test_single_steps_and_empty_selection_api(self):
+        for steps in ([], ['bad'], ['tls', 'tls'], 'tls', [False]):
+            response = self.client.post('/api/v1/extractions', json={
+                'source_task_id': 'capture-source', 'steps': steps}, headers=self.auth)
+            self.assertEqual(response.status_code, 400)
+        result = self.run_job(self.enqueue(steps=['tls']))
+        self.assertEqual(result['steps'], ['tls'])
+        self.assertEqual(result['status'], 'SUCCEEDED')
+        for unit in self.store.get_task('capture-source')['result']['units']:
+            self.assertTrue(unit['checks']['tls_features'])
+            self.assertNotIn('flow_sequences', unit['checks'])
+            self.assertTrue(unit['checks']['pcap_retired'])
 
     def run_job(self, task_id):
         with patch.object(self.manager, '_run_command', side_effect=self.execute):

@@ -884,16 +884,18 @@ class TaskManager:
                         checks.pop("pcap")
                         checks["pcap_retired"] = True
                     if request_data["analysis"].get("pipeline") or receipt:
-                        checks["flow_sequences"] = bool(receipt)
-                        checks["tls_features"] = bool(receipt)
+                        for step, label in (("flow", "flow_sequences"), ("tls", "tls_features")):
+                            if request_data["analysis"].get("pipeline") or (receipt and receipt.get(step + "_verified")):
+                                checks[label] = bool(receipt and receipt.get(step + "_verified"))
                         if request_data["analysis"].get("delete_pcap"):
                             checks["pcap_retired"] = bool(item_dir and retired_capture(item_dir, browser))
                         artifacts["extraction"] = self._artifact_info(
                             task_dir, item_dir / f"extraction_{browser}.json" if item_dir else None)
                         if receipt:
-                            result_dir = item_dir / receipt["result_dir"]
-                            artifacts["flow_sequences"] = self._artifact_info(task_dir, result_dir / "sequences")
-                            artifacts["tls_features"] = self._artifact_info(task_dir, result_dir / "tls")
+                            for step, label, folder in (("flow", "flow_sequences", "sequences"), ("tls", "tls_features", "tls")):
+                                if receipt.get(step + "_verified"):
+                                    result_dir = item_dir / receipt.get("result_dirs", {}).get(step, receipt["result_dir"])
+                                    artifacts[label] = self._artifact_info(task_dir, result_dir / folder)
 
                 if output_options.get("html", False):
                     body = item_dir / f"body_{browser}.html" if item_dir else None

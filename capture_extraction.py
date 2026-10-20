@@ -22,7 +22,26 @@ import uuid
 
 LOG = logging.getLogger(__name__)
 BROWSERS = ("chrome", "edge", "firefox")
+EXTRACTION_STEPS = ("flow", "tls")
 ROOT = Path(__file__).resolve().parent
+
+
+def normalize_steps(steps=None):
+    if steps is None:
+        return list(EXTRACTION_STEPS)
+    if (not isinstance(steps, list) or not steps
+            or any(not isinstance(step, str) or step not in EXTRACTION_STEPS for step in steps)
+            or len(set(steps)) != len(steps)):
+        raise ValueError("提取内容至少选择一项，且只能包含不重复的 flow（流序列）和 tls（TLS 特征）")
+    return [step for step in EXTRACTION_STEPS if step in steps]
+
+
+def receipt_steps(receipt):
+    return receipt.get("steps", list(EXTRACTION_STEPS))
+
+
+def progress_path(directory, browser):
+    return Path(directory) / f"extraction_{browser}.progress.json"
 
 
 def sync_directory(path):
@@ -79,18 +98,21 @@ def receipt_path(directory, browser):
     return Path(directory) / f"extraction_{browser}.json"
 
 
-def verified_receipt(directory, browser, *, full=False):
+def verified_receipt(directory, browser, *, full=False, required_steps=None):
     """Fast reads for progress; cryptographic validation before source deletion."""
     directory = Path(directory).resolve()
     try:
         receipt = json.loads(receipt_path(directory, browser).read_text(encoding="utf-8"))
-        if (receipt["version"] != 1 or receipt["status"] not in ("verified", "succeeded")
+        if (receipt["version"] not in (1, 2) or receipt["status"] not in ("verified", "succeeded")
                 or receipt["browser"] != browser):
             return None
         marker = directory / f"capture_{browser}.complete.json"
         if signature(marker) != receipt["checkpoint"]:
             return None
-        if not receipt["outputs"] or not receipt["flow_verified"] or not receipt["tls_verified"]:
+        steps = normalize_steps(receipt_steps(receipt))
+        if required_steps is not None and not set(normalize_steps(required_steps)).issubset(steps):
+            return None
+        if not receipt["outputs"] or any(not receipt.get(step + "_verified") for step in steps):
             return None
         for relative, expected in receipt["outputs"].items():
             path = (directory / relative).resolve()
@@ -176,33 +198,50 @@ def unit_lock(directory, browser):
                 msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-def extract_one(directory, browser, delete_pcap=False):
+def extract_one(directory, browser, delete_pcap=False, *, steps=None):
     if browser not in BROWSERS:
         raise ValueError("Unsupported extraction browser")
     with unit_lock(directory, browser):
-        return _extract_one(directory, browser, delete_pcap)
+        return _extract_one(directory, browser, delete_pcap, steps=normalize_steps(steps))
 
 
-def _extract_one(directory, browser, delete_pcap=False):
+def _extract_one(directory, browser, delete_pcap=False, *, steps=None):
     """Flow sequences first, TLS features second; failed attempts remain intact."""
     if browser not in BROWSERS:
         raise ValueError("Unsupported extraction browser")
     directory = Path(directory).resolve()
+    steps = normalize_steps(steps)
+    pcap = directory / f"capture_{browser}.pcap"
     previous = verified_receipt(directory, browser, full=True)
-    if previous:
+    if previous and pcap.exists() and (pcap.is_symlink() or signature(pcap) != previous["source"]):
+        previous = None
+    if previous and "flow" in steps and previous.get("flow_verified") and previous.get("keylog"):
+        keylog = directory / f"tls_keys_{browser}.log"
+        if keylog.is_symlink() or not keylog.is_file() or signature(keylog) != previous["keylog"]:
+            previous = None
+    missing = [step for step in steps if not previous or step not in receipt_steps(previous)]
+    if previous and not missing:
         # A crash after verification or unlink is recoverable without recapture.
         # The current invocation controls deletion of an existing source. Keep
         # the retirement marker for a source already removed before a crash.
         previous["delete_requested"] = bool(delete_pcap or
             (previous["delete_requested"] and not (directory / f"capture_{browser}.pcap").exists()))
         save_json(receipt_path(directory, browser), previous)
-        return retire_pcap(directory, browser, previous)
-    pcap = directory / f"capture_{browser}.pcap"
+        result = retire_pcap(directory, browser, previous)
+        save_json(progress_path(directory, browser), result)
+        return result
     keylog = directory / f"tls_keys_{browser}.log"
     marker = directory / f"capture_{browser}.complete.json"
-    receipt = {"version": 1, "browser": browser, "status": "running",
+    receipt = {"version": 2, "browser": browser, "status": "running",
                "started_at": time.time(), "delete_requested": bool(delete_pcap),
-               "pcap_deleted": False, "flow_verified": False, "tls_verified": False}
+               "pcap_deleted": False, "flow_verified": bool(previous and previous.get("flow_verified")),
+               "tls_verified": bool(previous and previous.get("tls_verified")),
+               "steps": normalize_steps(list(set(receipt_steps(previous) if previous else []) | set(steps))),
+               "requested_steps": steps, "outputs": dict(previous["outputs"]) if previous else {},
+               "result_dirs": dict(previous.get("result_dirs") or {
+                   step: previous["result_dir"] for step in receipt_steps(previous)}) if previous else {}}
+    if previous and previous.get("keylog"):
+        receipt["keylog"] = previous["keylog"]
     output = directory / "flow_extraction" / browser / ("attempt-" + uuid.uuid4().hex)
     try:
         storage_guard(directory)
@@ -211,66 +250,82 @@ def _extract_one(directory, browser, delete_pcap=False):
             raise RuntimeError("Capture checkpoint browser mismatch")
         if checkpoint.get("capture_summary", {}).get("packets_dropped", 0):
             raise RuntimeError("Capture reported packet loss; retaining PCAP for investigation")
-        for source in (pcap, keylog):
+        sources = [(pcap, "source"), (marker, "checkpoint")]
+        if "flow" in missing:
+            sources.append((keylog, "keylog"))
+        for source, _ in sources:
+            if source == marker:
+                continue
             if source.is_symlink() or source.stat().st_size != checkpoint["artifacts"][source.name]:
                 raise RuntimeError(f"Capture is not finalized: {source}")
-        receipt.update(source=signature(pcap), keylog=signature(keylog), checkpoint=signature(marker))
+        receipt.update({recorded: signature(source) for source, recorded in sources})
         output.mkdir(parents=True, exist_ok=False)
         receipt["result_dir"] = output.relative_to(directory).as_posix()
-        save_json(receipt_path(directory, browser), receipt)
+        save_json(progress_path(directory, browser), receipt)
         from analysis_scripts.result_layout import create_inputs
         inputs = create_inputs(output, pcap)
         scripts = ROOT / "analysis_scripts"
-        stages = [
+        flow_stages = [
             ["extract_features.py", str(pcap), "--output", str(inputs / f"capture_{browser}.tsv")],
             ["classify_packets.py", str(pcap), str(keylog), "--flow-tsv", str(inputs / f"capture_{browser}.tsv"), "--output-dir", str(inputs / f"capture_{browser}_flows")],
             ["infer_packets.py", str(pcap), "--flow-tsv", str(inputs / f"capture_{browser}.tsv"), "--output-dir", str(inputs / f"capture_{browser}_inferred")],
             ["extract_header_seqs.py", str(inputs), "--browser", browser, "--protocol", "both", "--allow-unpaired", "--output-dir", str(output / "sequences")],
             ["verify_sequences.py", str(output), browser, str(pcap)],
-            ["extract_tls.py", str(pcap), "-o", str(output / "tls" / f"capture_{browser}.jsonl")],
         ]
+        stages = flow_stages if "flow" in missing else []
+        if "tls" in missing:
+            stages = [*stages, ["extract_tls.py", str(pcap), "-o", str(output / "tls" / f"capture_{browser}.jsonl")]]
         for index, stage in enumerate(stages):
             storage_guard(directory)
             receipt["stage"] = stage[0]
-            save_json(receipt_path(directory, browser), receipt)
+            save_json(progress_path(directory, browser), receipt)
             with (output / f"{index + 1:02d}_{stage[0]}.log").open("wb") as log:
                 subprocess.run([sys.executable, str(scripts / stage[0]), *stage[1:]],
                                stdout=log, stderr=subprocess.STDOUT, check=True, timeout=900,
                                env={**os.environ, "PYTHONOPTIMIZE": "0"})
-        validation = json.loads((output / "verification.json").read_text())
-        if not validation.get("tcp_flags_verified") or not validation.get("packet_rows_per_mode"):
-            raise RuntimeError("No verified flow packets; original PCAP retained")
-        tls = output / "tls" / f"capture_{browser}.jsonl"
-        manifest = json.loads(tls.with_suffix(".manifest.json").read_text(encoding="utf-8"))
-        lines = 0
-        with tls.open(encoding="utf-8") as stream:
-            for line in stream:
-                json.loads(line)
-                lines += 1
-        if (not manifest.get("complete") or lines == 0 or
-                lines != manifest["stats"]["output_flows"] or
-                manifest["stats"].get("capture_truncated_packets", 0)):
-            raise RuntimeError("TLS result incomplete/empty; original PCAP retained")
-        for source, recorded in ((pcap, "source"), (keylog, "keylog"), (marker, "checkpoint")):
+        if "flow" in missing:
+            validation = json.loads((output / "verification.json").read_text())
+            if not validation.get("tcp_flags_verified") or not validation.get("packet_rows_per_mode"):
+                raise RuntimeError("No verified flow packets; original PCAP retained")
+        if "tls" in missing:
+            tls = output / "tls" / f"capture_{browser}.jsonl"
+            manifest = json.loads(tls.with_suffix(".manifest.json").read_text(encoding="utf-8"))
+            lines = 0
+            with tls.open(encoding="utf-8") as stream:
+                for line in stream:
+                    json.loads(line)
+                    lines += 1
+            if (not manifest.get("complete") or lines == 0 or
+                    lines != manifest["stats"]["output_flows"] or
+                    manifest["stats"].get("capture_truncated_packets", 0)):
+                raise RuntimeError("TLS result incomplete/empty; original PCAP retained")
+        for source, recorded in sources:
             if signature(source) != receipt[recorded]:
                 raise RuntimeError("Capture inputs changed during extraction")
-        receipt.update(outputs={p.relative_to(directory).as_posix(): output_signature(p)
-                                for p in output.rglob("*") if p.is_file()},
-                       flow_verified=True, tls_verified=True, status="verified", stage="verified")
+        receipt["outputs"].update({p.relative_to(directory).as_posix(): output_signature(p)
+                                  for p in output.rglob("*") if p.is_file()})
+        for step in missing:
+            receipt[step + "_verified"] = True
+            receipt["result_dirs"][step] = receipt["result_dir"]
+        receipt.update(status="verified", stage="verified")
         for folder in sorted((p for p in output.rglob("*") if p.is_dir()),
                              key=lambda p: len(p.parts), reverse=True):
             sync_directory(folder)
         for folder in (output, output.parent, output.parent.parent):
             sync_directory(folder)
         save_json(receipt_path(directory, browser), receipt)
-        return retire_pcap(directory, browser, receipt)
+        result = retire_pcap(directory, browser, receipt)
+        save_json(progress_path(directory, browser), result)
+        return result
     except Exception as exc:
         if receipt.get("status") in ("verified", "succeeded") and not pcap.exists():
             # Keep the durable verified receipt if final publication failed after
             # unlink. It is the recovery record for that transaction.
             raise
         receipt.update(status="failed", error=f"{type(exc).__name__}: {exc}", finished_at=time.time())
-        save_json(receipt_path(directory, browser), receipt)
+        save_json(progress_path(directory, browser), receipt)
+        if not previous:
+            save_json(receipt_path(directory, browser), receipt)
         raise
 
 
@@ -357,7 +412,7 @@ class ExtractionQueue:
                         finally:
                             if owner:
                                 owner.terminate()
-                    if process.returncode != 0 or not verified_receipt(directory, browser):
+                    if process.returncode != 0 or not verified_receipt(directory, browser, required_steps=list(EXTRACTION_STEPS)):
                         self.failures.append(item)
                         LOG.error("Extraction failed; retaining PCAP: %s/%s", directory, browser)
                     self.finished += 1
@@ -385,6 +440,7 @@ if __name__ == "__main__":
     parser.add_argument("directory", type=Path)
     parser.add_argument("browser", choices=BROWSERS)
     parser.add_argument("--delete-pcap", action="store_true")
+    parser.add_argument("--steps", nargs="+", choices=EXTRACTION_STEPS, default=None)
     args = parser.parse_args()
     lower_priority()
-    extract_one(args.directory, args.browser, args.delete_pcap)
+    extract_one(args.directory, args.browser, args.delete_pcap, steps=args.steps)

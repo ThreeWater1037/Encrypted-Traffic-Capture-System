@@ -32,11 +32,11 @@ paths:
         - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
         - { in: query, name: offset, schema: { type: integer, minimum: 0, default: 0 } }
       responses:
-        '200': { description: 'jobs、page、active_task_id、pcap_retention_supported=true；每个 job 包含原任务、三浏览器范围、keep_pcap、keep_pcap_count 和 progress（retained 为成功保留数，deleted 为成功清理数）' }
+        '200': { description: 'jobs、page、active_task_id、pcap_retention_supported=true、selectable_extraction_steps=[flow,tls]；每个 job 包含原任务、三浏览器范围、steps、keep_pcap、keep_pcap_count 和 progress（retained 为成功保留数，deleted 为成功清理数）' }
     post:
       operationId: submitStandaloneExtraction
-      summary: 将已结束的成功或部分成功任务入队；依次提取流序列和 TLS，校验成功后按策略保留或清理 PCAP
-      description: 按原任务 ID 幂等。失败、部分成功或取消后重新提交会跳过已验证结果。与抓包互斥，抓包优先，原后台流水线不变。
+      summary: 将已结束的成功或部分成功任务入队；按选择提取流序列、TLS 或两者，校验成功后按策略保留或清理 PCAP
+      description: 按原任务 ID 和提取内容幂等，同一原任务的不同选项不能同时运行。失败、部分成功或取消后重新提交会跳过已验证结果。与抓包互斥，抓包优先，原后台流水线不变。
       requestBody:
         required: true
         content:
@@ -46,13 +46,22 @@ paths:
               required: [source_task_id]
               properties:
                 source_task_id: { type: string }
+                steps:
+                  type: array
+                  nullable: true
+                  minItems: 1
+                  maxItems: 2
+                  uniqueItems: true
+                  default: [flow, tls]
+                  items: { type: string, enum: [flow, tls] }
+                  description: '流序列、TLS 特征，可单选或双选；省略或 null 默认双选。单选后如需补提另一项，必须保留原始 PCAP。'
                 keep_pcap: { type: boolean, default: false, description: '开启原始 PCAP 保留' }
                 keep_pcap_count: { type: integer, nullable: true, minimum: 1, description: 'keep_pcap=true 时有效；null 或省略表示全部保留，正整数表示按原 URL 顺序及 Chrome、Edge、Firefox 顺序保留前 N 个单元，缺失或失败单元仍占位置，失败项额外保留。重试必须沿用首次策略。' }
       responses:
         '200': { description: 已存在的提取任务 }
         '202': { description: 已排队 }
-        '400': { description: 无效来源或没有 PCAP }
-        '409': { description: 原任务仍在运行、尚未完成或保留策略与既有提取任务冲突 }
+        '400': { description: 无效来源、提取内容、保留策略或没有 PCAP }
+        '409': { description: 原任务仍在运行、尚未完成、已有另一选项的提取活动或保留策略与既有提取任务冲突 }
         '429': { description: 队列已满 }
   /api/v1/extractions/{extraction_id}:
     parameters:

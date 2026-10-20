@@ -53,9 +53,93 @@ class ExtractionTests(unittest.TestCase):
                 Path(command[2]).write_bytes(b"changed")
         return subprocess.CompletedProcess(command, 0)
 
-    def run_extract(self, browser="chrome", delete=True):
+    def run_extract(self, browser="chrome", delete=True, steps=None):
         with patch.object(extraction, "storage_guard"), patch.object(extraction.subprocess, "run", side_effect=self.stage):
-            return extraction.extract_one(self.directory, browser, delete)
+            return extraction.extract_one(self.directory, browser, delete, steps=steps)
+
+    def test_tls_only_without_keys_for_all_browsers(self):
+        for browser in extraction.BROWSERS:
+            with self.subTest(browser=browser):
+                self.capture(browser)
+                (self.directory / f'tls_keys_{browser}.log').unlink()
+                self.calls.clear()
+                receipt = self.run_extract(browser, steps=['tls'])
+                self.assertEqual(self.calls, ['extract_tls.py'])
+                self.assertTrue(receipt['tls_verified'])
+                self.assertFalse(receipt['flow_verified'])
+                self.assertTrue(receipt['pcap_deleted'])
+                self.assertIsNone(extraction.verified_receipt(self.directory, browser, required_steps=['flow']))
+                self.assertTrue(extraction.retired_capture(self.directory, browser))
+
+    def test_flow_only_skips_tls_and_can_delete_all_browsers(self):
+        for browser in extraction.BROWSERS:
+            with self.subTest(browser=browser):
+                self.capture(browser)
+                self.calls.clear()
+                receipt = self.run_extract(browser, steps=['flow'])
+                self.assertNotIn('extract_tls.py', self.calls)
+                self.assertEqual(self.calls[-1], 'verify_sequences.py')
+                self.assertTrue(receipt['flow_verified'])
+                self.assertFalse(receipt['tls_verified'])
+                self.assertTrue(receipt['pcap_deleted'])
+                self.assertIsNone(extraction.verified_receipt(self.directory, browser, required_steps=['tls']))
+
+    def test_separate_runs_merge_outputs_and_reuse_completed_steps(self):
+        for browser in extraction.BROWSERS:
+            with self.subTest(browser=browser):
+                self.capture(browser)
+                first = self.run_extract(browser, delete=False, steps=['flow'])
+                self.calls.clear()
+                second = self.run_extract(browser, delete=False, steps=['tls'])
+                self.assertEqual(self.calls, ['extract_tls.py'])
+                self.assertTrue(set(first['outputs']).issubset(second['outputs']))
+                self.assertNotEqual(second['result_dirs']['flow'], second['result_dirs']['tls'])
+                self.calls.clear()
+                both = self.run_extract(browser)
+                self.assertEqual(self.calls, [])
+                self.assertTrue(both['pcap_deleted'])
+                self.assertTrue(extraction.verified_receipt(self.directory, browser, full=True, required_steps=['flow', 'tls']))
+
+    def test_failed_addition_preserves_previous_success_and_pcap(self):
+        self.capture('firefox')
+        first = self.run_extract('firefox', delete=False, steps=['tls'])
+        self.fail_stage = 'verify_sequences.py'
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_extract('firefox', steps=['flow'])
+        self.assertEqual(extraction.verified_receipt(self.directory, 'firefox', full=True)['outputs'], first['outputs'])
+        self.assertTrue((self.directory / 'capture_firefox.pcap').exists())
+        self.assertIsNone(extraction.verified_receipt(self.directory, 'firefox', required_steps=['flow']))
+        self.fail_stage = None
+        self.calls.clear()
+        self.run_extract('firefox')
+        self.assertNotIn('extract_tls.py', self.calls)
+
+    def test_deleted_single_step_cannot_satisfy_unselected_step(self):
+        self.capture('edge')
+        self.run_extract('edge', steps=['tls'])
+        with self.assertRaises(FileNotFoundError):
+            self.run_extract('edge', steps=['flow'])
+        self.assertTrue(extraction.verified_receipt(self.directory, 'edge', required_steps=['tls']))
+        self.assertIsNone(extraction.verified_receipt(self.directory, 'edge', required_steps=['flow']))
+
+    def test_legacy_receipts_remain_valid(self):
+        self.capture('chrome')
+        receipt = self.run_extract(delete=False)
+        receipt['version'] = 1
+        receipt.pop('steps')
+        receipt.pop('result_dirs')
+        extraction.save_json(extraction.receipt_path(self.directory, 'chrome'), receipt)
+        self.calls.clear()
+        self.run_extract(steps=['tls'])
+        self.assertEqual(self.calls, [])
+        self.assertTrue(extraction.retired_capture(self.directory, 'chrome'))
+
+    def test_invalid_steps_never_start_analysis(self):
+        self.capture('chrome')
+        for steps in ([], ['bad'], ['flow', 'flow'], 'tls', [False], [{}]):
+            with self.subTest(steps=steps), self.assertRaises(ValueError):
+                self.run_extract(steps=steps)
+        self.assertEqual(self.calls, [])
 
     def test_all_browsers_delete_only_after_both_stages_and_resume_without_recapture(self):
         for browser in extraction.BROWSERS:
