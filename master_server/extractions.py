@@ -2,6 +2,7 @@
 from flask import jsonify, request
 from .schema import ValidationError
 from .worker_client import WorkerRequestError
+from capture_extraction import EXTRACTION_STEPS, normalize_steps
 
 
 def register_routes(app, store, dispatcher):
@@ -66,6 +67,10 @@ def register_routes(app, store, dispatcher):
         data = request.get_json(silent=True)
         if not isinstance(data, dict) or not isinstance(data.get('job_id'), str):
             raise ValidationError('需要 job_id')
+        try:
+            steps = normalize_steps(data.get('steps'))
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         keep_pcap, keep_count = data.get('keep_pcap', False), data.get('keep_pcap_count')
         if not isinstance(keep_pcap, bool):
             raise ValidationError('keep_pcap 必须是布尔值')
@@ -81,9 +86,12 @@ def register_routes(app, store, dispatcher):
             client = machine_client(machine_id)
             # Older Workers silently ignore unknown fields and always delete.
             # Check support before enqueueing any retention request.
-            if keep_pcap and client.list_extractions(limit=1).get('pcap_retention_supported') is not True:
+            capabilities = client.list_extractions(limit=1) if keep_pcap or steps != list(EXTRACTION_STEPS) else {}
+            if keep_pcap and capabilities.get('pcap_retention_supported') is not True:
                 return jsonify(message='该 Worker 尚未支持 PCAP 保留策略，请升级后再提交'), 409
-            result = client.submit_extraction(source_id, keep_pcap=keep_pcap, keep_pcap_count=keep_count)
+            if steps != list(EXTRACTION_STEPS) and capabilities.get('selectable_extraction_steps') != list(EXTRACTION_STEPS):
+                return jsonify(message='该 Worker 尚未支持单独选择提取内容，请升级后再提交'), 409
+            result = client.submit_extraction(source_id, keep_pcap=keep_pcap, keep_pcap_count=keep_count, steps=steps)
             result['job'] = job
             return jsonify(result), 202
         except WorkerRequestError as exc:

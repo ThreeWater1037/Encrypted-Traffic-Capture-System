@@ -79,6 +79,31 @@ class MasterExtractionTests(unittest.TestCase):
             self.assertEqual(response.status_code, 409)
             submit.assert_not_called()
 
+    def test_steps_contract_and_single_output_manifest(self):
+        response = self.client.post('/api/v1/machines/m/extractions', json={
+            'job_id': 'capture-source', 'steps': ['tls']}, headers=self.auth)
+        self.assertEqual(response.status_code, 202)
+        result = response.get_json()
+        self.assertEqual(result['steps'], ['tls'])
+        self.assertEqual(self.worker.run_job(result['task_id'])['status'], 'SUCCEEDED')
+        response = self.client.get(f'/api/v1/machines/m/extractions/{result["task_id"]}', headers=self.auth)
+        self.assertEqual(response.get_json()['steps'], ['tls'])
+        for unit in self.store.get_job('capture-source')['executions']:
+            self.assertTrue(unit['result']['artifacts']['tls_features'])
+            self.assertFalse(unit['result']['artifacts'].get('flow_sequences'))
+
+    def test_empty_steps_rejected_and_old_worker_cannot_silently_run_both(self):
+        with patch.object(self.bridge, 'submit_extraction') as submit:
+            for steps in ([], ['bogus'], ['tls', 'tls'], 'flow'):
+                response = self.client.post('/api/v1/machines/m/extractions', json={
+                    'job_id': 'capture-source', 'steps': steps}, headers=self.auth)
+                self.assertEqual(response.status_code, 400)
+            with patch.object(self.bridge, 'list_extractions', return_value={'pcap_retention_supported': True}):
+                response = self.client.post('/api/v1/machines/m/extractions', json={
+                    'job_id': 'capture-source', 'steps': ['flow']}, headers=self.auth)
+                self.assertEqual(response.status_code, 409)
+            submit.assert_not_called()
+
     def test_invalid_retention_options_rejected_without_worker_call(self):
         with patch.object(self.bridge, 'submit_extraction') as submit:
             for options in ({'keep_pcap': 'true'}, {'keep_pcap_count': 1},

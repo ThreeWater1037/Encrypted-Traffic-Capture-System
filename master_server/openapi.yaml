@@ -40,7 +40,7 @@ paths:
         '409': { description: Worker 尚未升级；不得因此中断当前抓包 }
     post:
       operationId: submitMachineExtraction
-      summary: 为已完成任务提交流序列和 TLS 顺序提取及验证后 PCAP 保留策略
+      summary: 为已完成任务选择提取流序列、TLS 特征或两者，并设置验证后的 PCAP 保留策略
       security: [{ bearerAuth: [] }]
       requestBody:
         required: true
@@ -51,11 +51,20 @@ paths:
               required: [job_id]
               properties:
                 job_id: { type: string }
+                steps:
+                  type: array
+                  nullable: true
+                  minItems: 1
+                  maxItems: 2
+                  uniqueItems: true
+                  default: [flow, tls]
+                  items: { type: string, enum: [flow, tls] }
+                  description: '流序列、TLS 特征，可单选或双选；省略或 null 默认双选。单选要求 Worker 声明 selectable_extraction_steps 能力。'
                 keep_pcap: { type: boolean, default: false, description: '保留 PCAP；旧 Worker 不支持时拒绝提交' }
                 keep_pcap_count: { type: integer, nullable: true, minimum: 1, description: 'keep_pcap=true 时有效；null 或省略表示全部保留，正整数表示按原 URL 顺序及 Chrome、Edge、Firefox 顺序保留前 N 个单元，缺失或失败单元仍占位置，失败项额外保留。重试必须沿用首次策略。' }
       responses:
         '202': { description: 提取任务已提交或幂等返回原记录 }
-        '400': { description: 无效的 PCAP 保留策略 }
+        '400': { description: 无效的提取内容或 PCAP 保留策略 }
         '409': { description: 来源任务未完成或 Worker 尚未升级 }
   /api/v1/machines/{machine_id}/extractions/{extraction_id}:
     parameters:
