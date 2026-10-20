@@ -20,6 +20,30 @@ class ValidationError(ValueError):
     """可安全返回给调用方的参数错误。"""
 
 
+def validate_collection_choice(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) not in ({"group_id"}, {"new_name"}):
+        raise ValidationError("collection 必须只包含 group_id 或 new_name")
+    key = next(iter(value))
+    return {key: _text(value[key], key, maximum=120 if key == "new_name" else 64)}
+
+
+def validate_collection_edit(value: Any) -> tuple[str, list[str], int]:
+    if not isinstance(value, dict) or set(value) != {"name", "job_ids", "revision"}:
+        raise ValidationError("总体任务需要 name、job_ids 和 revision")
+    name = _text(value["name"], "总体任务名称", maximum=120)
+    jobs = value["job_ids"]
+    if not isinstance(jobs, list) or len(jobs) > 10000 or any(not isinstance(j, str) or not j or len(j) > 64 for j in jobs):
+        raise ValidationError("job_ids 必须是最多 10000 个批次 ID 的数组")
+    if len(set(jobs)) != len(jobs):
+        raise ValidationError("job_ids 不能重复")
+    revision = value["revision"]
+    if type(revision) is not int or revision < 0:
+        raise ValidationError("revision 必须是非负整数")
+    return name, jobs, revision
+
+
 def named_task_id(name: str, seed: str) -> str:
     """保留可读名称，限制字符和 UTF-8 字节长度，并使用独立哈希防重。"""
     slug = "".join(char if char.isalnum() or char in "._-" else "-" for char in name)
@@ -185,6 +209,16 @@ def validate_job(payload: Any, *, max_items: int) -> dict[str, Any]:
     if not isinstance(analysis, dict):
         raise ValidationError("analysis 必须是对象")
     steps = analysis.get("steps", [])
+    pipeline = analysis.get("pipeline", False)
+    delete_pcap = analysis.get("delete_pcap", False)
+    if not isinstance(pipeline, bool) or not isinstance(delete_pcap, bool):
+        raise ValidationError("analysis.pipeline 和 analysis.delete_pcap 必须是布尔值")
+    if pipeline and not pcap:
+        raise ValidationError("后台提取必须设置 pcap=true")
+    if delete_pcap and not pipeline:
+        raise ValidationError("删除 PCAP 必须启用后台完整提取")
+    if pipeline and (steps or analysis.get("sni_suffixes") or analysis.get("with_coframe")):
+        raise ValidationError("后台完整提取不同时接受旧版 steps、sni_suffixes、with_coframe")
     if not isinstance(steps, list) or any(step not in ALLOWED_STEPS for step in steps):
         raise ValidationError("analysis.steps 只允许 extract、classify、infer")
     steps = list(dict.fromkeys(steps))
@@ -206,6 +240,8 @@ def validate_job(payload: Any, *, max_items: int) -> dict[str, Any]:
         "pcap": pcap,
         "outputs": {"html": save_html, "reports": save_reports},
         "analysis": {
+            "pipeline": pipeline,
+            "delete_pcap": delete_pcap,
             "steps": steps,
             "with_coframe": with_coframe,
             "sni_suffixes": list(dict.fromkeys(suffixes)),

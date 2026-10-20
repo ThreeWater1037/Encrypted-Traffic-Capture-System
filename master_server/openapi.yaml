@@ -13,6 +13,236 @@ tags:
   - name: Machines
   - name: Jobs
 paths:
+  /api/v1/extractions/candidates:
+    get:
+      operationId: listExtractionCandidates
+      summary: 按服务器分页读取可提取的已完成任务
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: query, name: machine_id, required: true, schema: { type: string } }
+        - { in: query, name: query, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { in: query, name: offset, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        '200': { description: jobs 和 page；只包含开启 PCAP 的成功或部分成功任务 }
+  /api/v1/machines/{machine_id}/extractions:
+    parameters:
+      - { in: path, name: machine_id, required: true, schema: { type: string } }
+    get:
+      operationId: listMachineExtractions
+      summary: 读取该 Worker 的独立提取队列
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: query, name: limit, schema: { type: integer, default: 20, maximum: 100 } }
+        - { in: query, name: offset, schema: { type: integer, default: 0, minimum: 0 } }
+      responses:
+        '200': { description: jobs、page、active_task_id }
+        '409': { description: Worker 尚未升级；不得因此中断当前抓包 }
+    post:
+      operationId: submitMachineExtraction
+      summary: 为已完成任务提交流序列和 TLS 顺序提取及验证后 PCAP 保留策略
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [job_id]
+              properties:
+                job_id: { type: string }
+                keep_pcap: { type: boolean, default: false, description: '保留 PCAP；旧 Worker 不支持时拒绝提交' }
+                keep_pcap_count: { type: integer, nullable: true, minimum: 1, description: 'keep_pcap=true 时有效；null 或省略表示全部保留，正整数表示按原 URL 顺序及 Chrome、Edge、Firefox 顺序保留前 N 个单元，缺失或失败单元仍占位置，失败项额外保留。重试必须沿用首次策略。' }
+      responses:
+        '202': { description: 提取任务已提交或幂等返回原记录 }
+        '400': { description: 无效的 PCAP 保留策略 }
+        '409': { description: 来源任务未完成或 Worker 尚未升级 }
+  /api/v1/machines/{machine_id}/extractions/{extraction_id}:
+    parameters:
+      - { in: path, name: machine_id, required: true, schema: { type: string } }
+      - { in: path, name: extraction_id, required: true, schema: { type: string } }
+    get:
+      operationId: getMachineExtraction
+      summary: 读取提取详情；终态时同步原任务的最新结果文件索引
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: 提取详情、原任务与结果位置 }
+        '502': { description: Worker 不可访问 }
+  /api/v1/machines/{machine_id}/extractions/{extraction_id}/cancel:
+    parameters:
+      - { in: path, name: machine_id, required: true, schema: { type: string } }
+      - { in: path, name: extraction_id, required: true, schema: { type: string } }
+    post:
+      operationId: cancelMachineExtraction
+      summary: 仅取消独立提取，不改变原采集任务
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: 已登记取消 }
+  /api/v1/data/groups:
+    get:
+      operationId: listDataGroups
+      summary: 分页读取总体任务，不返回批次成员或执行详情
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: query, name: offset, schema: { type: integer, minimum: 0 } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100 } }
+        - { in: query, name: query, schema: { type: string } }
+      responses:
+        '200': { description: 'groups、page、all_count、ungrouped_count、revision' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/v1/data/groups/{group_id}:
+    get:
+      operationId: getDataGroup
+      summary: 整理分组时读取名称、成员 ID 和修订号
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: group_id, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 'id、name、job_ids、revision；保存使用 collections 接口' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/v1/data/overview:
+    get:
+      operationId: getDataOverview
+      summary: 当前筛选的去重 URL、采集记录、批次数及机器分布
+      description: 机器分布遵循总体任务、query、browser 筛选，不应用 machine 筛选，便于切换机器。只读 Master 数据，不查询 Worker。
+      security: [{ bearerAuth: [] }]
+      parameters: &dataFilters
+        - { in: query, name: group, schema: { type: string, default: __all }, description: '总体任务 ID、__all 或 __ungrouped' }
+        - { in: query, name: query, schema: { type: string, maxLength: 2048 }, description: URL、名称或来源编号子串 }
+        - { in: query, name: browser, schema: { type: string }, description: 'chrome、edge、firefox；空值表示全部' }
+        - { in: query, name: machine, schema: { type: string } }
+      responses:
+        '200': { description: 'stats（records、urls、batches）、machines（machine_id、name、records）' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/v1/data/results:
+    get:
+      operationId: listDataResults
+      summary: 逐 URL × 批次 × 机器 × 浏览器分页，包含 PCAP 和 TLS 文件摘要
+      description: 每页最多 100 条；支持 overview 的 group、query、browser、machine 条件。只读取当前页文件摘要，状态来自文件上报和检查，不以任务成功代替文件存在。files.pcap/tls 为 present、missing、invalid。
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: query, name: group, schema: { type: string, default: __all } }
+        - { in: query, name: query, schema: { type: string } }
+        - { in: query, name: browser, schema: { type: string } }
+        - { in: query, name: machine, schema: { type: string } }
+        - { in: query, name: offset, schema: { type: integer, minimum: 0, default: 0 } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+      responses:
+        '200': { description: 'rows 与 page（offset、limit、total），超出末页时返回最后一页' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/v1/data/result:
+    get:
+      operationId: getDataResult
+      summary: 按需读取单条采集记录的实际 Worker 目录名和文件位置
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: query, name: group, schema: { type: string, default: __all } }
+        - { in: query, name: execution_id, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: '结果身份、机器地址、files（kind、label、path、source、absolute、size、state）；不返回诊断或日志。路径来源优先 Worker 绝对路径，其次共享目录配置推导并标注未核验；无法确定则保留相对路径。' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/v1/data/locations:
+    get:
+      operationId: getDataLocations
+      summary: 读取机器任务根目录配置，不返回 Worker Token
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: 'machines，包含 machine_id、name、base_url、root' }
+    post:
+      operationId: saveDataLocation
+      summary: 保存单台机器的共享目录配置，不移动或读取 Worker 文件
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [machine_id, root]
+              properties:
+                machine_id: { type: string }
+                root: { type: string, maxLength: 4096, description: '绝对任务根目录；空字符串清除配置，不得含 ..' }
+      responses:
+        '200': { description: 已保存的 machine_id 和 root }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/v1/data/export:
+    post:
+      operationId: exportDataIndex
+      summary: 流式导出当前筛选的全部采集文件索引
+      description: 与详情共用文件位置解析，保留历史 Worker 目录名；每个产物一行，PCAP/TLS 未上报也明确标记。跨全部分页，使用真实总体任务名称。UTF-8 BOM CSV，转义公式前缀。不触发 Worker 操作。
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                group: { type: string, default: __all }
+                filters: { type: object, description: query、browser、machine 等与 results 相同，不含分页 }
+      responses:
+        '200':
+          description: 文件位置索引
+          content:
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/v1/collections:
+    get:
+      tags: [Jobs]
+      operationId: listCollections
+      summary: 读取共享总体任务与批次归属
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: 一致的归属快照及全局修订号；已软删除批次不出现在 jobs 中
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CollectionSnapshot' }
+    post:
+      tags: [Jobs]
+      operationId: createCollection
+      summary: 新建总体任务，可同时归组已有批次
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CollectionEdit' }
+      responses:
+        '201':
+          description: 已保存，响应 id 为新总体任务 ID
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CollectionSnapshot' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/collections/{collection_id}:
+    post:
+      tags: [Jobs]
+      operationId: updateCollection
+      summary: 改名或替换总体任务的批次归属
+      description: 每个批次最多属于一个总体任务。所选批次从其他组移入；取消选择的原成员转为未归组。revision 过期或名称重复返回 409，客户端应重新读取后整理。不更改执行记录和 Worker 文件。
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: path
+          name: collection_id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CollectionEdit' }
+      responses:
+        '200':
+          description: 已保存，响应 id 为所编辑总体任务 ID
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CollectionSnapshot' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /api/v1/health:
     get:
       tags: [System]
@@ -109,6 +339,85 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Machine' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/collections/{collection_id}/overview:
+    get:
+      tags: [Collections]
+      operationId: collectionOverview
+      summary: SQLite 汇总 URL、机器和三浏览器执行统计，不读取 Worker 或返回详细结果
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: collection_id, required: true, schema: { type: string }, description: 总体任务 ID 或 __ungrouped }
+      responses:
+        '200':
+          description: stats 与 machines（含每台机器的 stats 和批次 ID/名称对）
+          content:
+            application/json:
+              schema: { type: object, required: [stats, machines], properties: { stats: { type: object }, machines: { type: array, items: { type: object } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/v1/collections/{collection_id}/results:
+    get:
+      tags: [Collections]
+      operationId: collectionResults
+      summary: 按 URL × 批次 × 机器分页，返回三浏览器轻量状态，不包含产物或 result_json
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: collection_id, required: true, schema: { type: string } }
+        - { in: query, name: offset, schema: { type: integer, minimum: 0, default: 0 } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { in: query, name: query, schema: { type: string }, description: URL、名称或编号子串 }
+        - { in: query, name: machine, schema: { type: string } }
+        - { in: query, name: batch, schema: { type: string } }
+        - { in: query, name: browser, schema: { type: string } }
+        - { in: query, name: status, schema: { type: string }, description: 与 browser 匹配同一执行单元；CAPTURED 包含保留的采集完成证据 }
+      responses:
+        '200':
+          description: rows 与 page（offset、limit、total），超出末页时回到最后一页
+          content:
+            application/json:
+              schema: { type: object, required: [rows, page], properties: { rows: { type: array, items: { type: object } }, page: { type: object } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/v1/collections/{collection_id}/result:
+    get:
+      tags: [Collections]
+      operationId: collectionResultDetail
+      summary: 点击加载单个 URL × 批次 × 机器的三浏览器文件详情
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: collection_id, required: true, schema: { type: string } }
+        - { in: query, name: job_id, required: true, schema: { type: string } }
+        - { in: query, name: item_id, required: true, schema: { type: string } }
+        - { in: query, name: machine_id, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: 单行结果，executions 含历史 Worker 任务 ID 和 result 产物详情
+          content:
+            application/json:
+              schema: { type: object }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/collections/{collection_id}/export:
+    post:
+      tags: [Collections]
+      operationId: exportCollectionResults
+      summary: 流式导出全部筛选结果（所有分页），不触发 Worker 采集
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: path, name: collection_id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filters: { type: object, description: 与 results 的 query、machine、batch、browser、status 相同 }
+                locations: { type: object, description: 按 machine_id 索引的 root 路径；推导路径标注未核验 }
+      responses:
+        '200':
+          description: 带 BOM 的 UTF-8 CSV，单元格防公式执行
+          content:
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
   /api/v1/jobs:
     get:
       tags: [Jobs]
@@ -116,6 +425,10 @@ paths:
       summary: 查询任务列表
       security: [{ bearerAuth: [] }]
       parameters:
+        - in: query
+          name: collection
+          description: 可选总体任务 ID 或 __ungrouped；筛选后再分页
+          schema: { type: string }
         - in: query
           name: sort
           description: 在全量筛选结果上排序后分页，默认最新创建在前
@@ -194,10 +507,16 @@ paths:
                   type: string
                   description: MachineTarget 数组的 JSON 字符串
                   example: '[{"machine_id":"worker-local","browsers":["chrome","edge"]}]'
+                collection:
+                  type: string
+                  description: 可选 CollectionChoice 的 JSON 字符串，与批次在同一数据库事务中保存；省略时兼容旧客户端，批次未归组。
+                  example: '{"new_name":"福布斯中国采集"}'
                 pcap: { type: boolean, default: true }
                 save_html: { type: boolean, default: false }
                 save_reports: { type: boolean, default: false }
                 analysis_steps: { type: string, example: extract,classify,infer }
+                analysis_pipeline: { type: boolean, default: false }
+                delete_pcap: { type: boolean, default: false }
                 with_coframe: { type: boolean, default: false }
                 sni_suffixes: { type: string, example: wikipedia.org,wikimedia.org }
       responses:
@@ -240,7 +559,7 @@ paths:
         - in: query
           name: unit
           description: url 按 URL 分页并保留其全部机器和浏览器执行单元；默认保持按执行单元分页
-          schema: { type: string, enum: [execution, url], default: execution }
+          schema: { type: string, enum: [execution, url, summary], default: execution }
         - in: query
           name: query
           description: unit=url 时，在整个任务内搜索 URL、名称或 ID（子串匹配）
@@ -418,6 +737,53 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
   schemas:
+    CollectionChoice:
+      description: 仅保存于 Master，不传入 Worker 采集请求。两者只能选其一。
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [group_id]
+          properties:
+            group_id: { type: string, minLength: 1, maxLength: 64 }
+        - type: object
+          additionalProperties: false
+          required: [new_name]
+          properties:
+            new_name: { type: string, minLength: 1, maxLength: 120 }
+    CollectionEdit:
+      type: object
+      additionalProperties: false
+      required: [name, job_ids, revision]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        job_ids:
+          type: array
+          maxItems: 10000
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 64 }
+        revision: { type: integer, minimum: 0, description: 编辑前 GET 返回的全局修订号 }
+    CollectionSnapshot:
+      type: object
+      required: [collections, revision]
+      properties:
+        id: { type: string, description: 仅保存响应携带此次编辑的总体任务 ID }
+        revision: { type: integer, minimum: 0 }
+        ungrouped: { type: object, description: 未归组任务的 jobs、batch_count、issue_count、signature }
+        collections:
+          type: array
+          items:
+            type: object
+            required: [id, name, jobs, created_at]
+            properties:
+              id: { type: string }
+              name: { type: string }
+              created_at: { type: string, format: date-time }
+              batch_count: { type: integer }
+              issue_count: { type: integer }
+              signature: { type: string, description: 成员或批次状态变化时变化，用于前端缓存失效 }
+              jobs:
+                type: array
+                items: { type: string }
     Health:
       type: object
       required: [status, service, machines, cache_enabled]
@@ -469,6 +835,7 @@ components:
       type: object
       required: [name, items, targets]
       properties:
+        collection: { $ref: '#/components/schemas/CollectionChoice' }
         job_id: { type: string, description: 留空时按安全处理后的任务名称加 16 位哈希生成，同名任务使用独立哈希；支持中文，最多 64 字符。显式指定的旧 ID 保持兼容。 }
         name: { type: string }
         items:
@@ -490,6 +857,8 @@ components:
         analysis:
           type: object
           properties:
+            pipeline: { type: boolean, default: false, description: 逐 PCAP 后台提取流序列和 TLS 特征，与旧步骤和过滤选项互斥 }
+            delete_pcap: { type: boolean, default: false, description: 需要 pipeline=true，两套提取验证成功后才删除原始 PCAP }
             steps:
               type: array
               default: []
@@ -514,6 +883,13 @@ components:
     Job:
       type: object
       properties:
+        collection:
+          type: object
+          nullable: true
+          description: 创建和重新开启响应中的总体任务回执。重新开启继承原批次归属；断点继续保持原批次及归属。
+          properties:
+            id: { type: string }
+            name: { type: string }
         job_id: { type: string }
         name: { type: string }
         status: { type: string }

@@ -8,11 +8,12 @@ from __future__ import annotations
 import json
 import hashlib
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from .schema import worker_directory_id
+from .schema import ValidationError, worker_directory_id
 
 
 TERMINAL_STATUSES = {"SUCCEEDED", "PARTIAL", "FAILED", "CANCELED", "INTERRUPTED"}
@@ -127,8 +128,31 @@ class MasterStore:
 
                 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_executions_job ON executions(job_id);
+                CREATE INDEX IF NOT EXISTS idx_executions_result_row
+                    ON executions(job_id, item_id, machine_id, browser);
                 CREATE INDEX IF NOT EXISTS idx_executions_worker_task
                     ON executions(worker_task_id);
+
+                CREATE TABLE IF NOT EXISTS collections (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS collection_members (
+                    job_id TEXT PRIMARY KEY REFERENCES jobs(job_id),
+                    collection_id TEXT NOT NULL REFERENCES collections(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_collection_members_collection
+                    ON collection_members(collection_id);
+                CREATE TABLE IF NOT EXISTS collection_revision (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    revision INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO collection_revision VALUES (1, 0);
+                CREATE TABLE IF NOT EXISTS result_locations (
+                    machine_id TEXT PRIMARY KEY REFERENCES machines(machine_id) ON DELETE CASCADE,
+                    root TEXT NOT NULL
+                );
                 """
             )
             columns = {
@@ -139,6 +163,70 @@ class MasterStore:
                 connection.execute("ALTER TABLE jobs ADD COLUMN resume_token TEXT")
             if "deleted_at" not in columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN deleted_at TEXT")
+
+    @staticmethod
+    def _collections_snapshot(connection) -> dict[str, Any]:
+        # One read transaction keeps membership and revision consistent.
+        revision = connection.execute("SELECT revision FROM collection_revision").fetchone()[0]
+        groups = [dict(row, jobs=[]) for row in connection.execute(
+            "SELECT * FROM collections ORDER BY created_at, id"
+        )]
+        ungrouped = {"id": "__ungrouped", "name": "未归组任务", "jobs": []}
+        by_id = {group["id"]: group for group in [*groups, ungrouped]}
+        signatures = {key: hashlib.sha256() for key in by_id}
+        for group in by_id.values():
+            group.update(batch_count=0, issue_count=0)
+        for row in connection.execute(
+            "SELECT m.collection_id, j.job_id, j.updated_at, j.status FROM jobs j "
+            "LEFT JOIN collection_members m ON j.job_id=m.job_id WHERE j.deleted_at IS NULL ORDER BY j.job_id"
+        ):
+            key = row["collection_id"] or "__ungrouped"
+            group = by_id[key]
+            group["jobs"].append(row["job_id"])
+            group["batch_count"] += 1
+            group["issue_count"] += row["status"] in {"FAILED", "PARTIAL", "INTERRUPTED"}
+            signatures[key].update(json.dumps(list(row), ensure_ascii=False).encode())
+        for key, group in by_id.items():
+            group["signature"] = signatures[key].hexdigest()
+        return {"collections": groups, "ungrouped": ungrouped, "revision": revision}
+
+    def list_collections(self) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            return self._collections_snapshot(connection)
+
+    def job_collection(self, job_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT c.id, c.name FROM collections c JOIN collection_members m "
+                "ON m.collection_id=c.id WHERE m.job_id=?", (job_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_collection(self, collection_id: str | None, name: str, job_ids: list[str], revision: int) -> dict[str, Any]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute("SELECT revision FROM collection_revision").fetchone()[0]
+            if revision != current:
+                raise sqlite3.IntegrityError("总体任务已被其他操作更新，请刷新后重新整理")
+            if collection_id and not connection.execute("SELECT 1 FROM collections WHERE id=?", (collection_id,)).fetchone():
+                raise ValidationError("总体任务不存在，请刷新")
+            for job_id in job_ids:
+                if not connection.execute("SELECT 1 FROM jobs WHERE job_id=? AND deleted_at IS NULL", (job_id,)).fetchone():
+                    raise ValidationError(f"采集批次不存在或已删除：{job_id}")
+            group_id = collection_id or uuid.uuid4().hex
+            if collection_id:
+                connection.execute("UPDATE collections SET name=? WHERE id=?", (name, group_id))
+            else:
+                connection.execute("INSERT INTO collections VALUES (?, ?, ?)", (group_id, name, utc_now()))
+            connection.execute("DELETE FROM collection_members WHERE collection_id=?", (group_id,))
+            connection.executemany(
+                "INSERT INTO collection_members VALUES (?, ?) ON CONFLICT(job_id) "
+                "DO UPDATE SET collection_id=excluded.collection_id",
+                ((job_id, group_id) for job_id in job_ids),
+            )
+            connection.execute("UPDATE collection_revision SET revision=revision+1")
+            return {**self._collections_snapshot(connection), "id": group_id}
 
     def machine_count(self) -> int:
         with self._connection() as connection:
@@ -234,9 +322,20 @@ class MasterStore:
         *,
         source_filename: str | None = None,
         source_path: str | None = None,
+        collection: dict[str, str] | None = None,
     ) -> None:
         now = utc_now()
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            group_id = None
+            if collection:
+                group_id = collection.get("group_id")
+                if group_id:
+                    if not connection.execute("SELECT 1 FROM collections WHERE id=?", (group_id,)).fetchone():
+                        raise ValidationError("所属总体任务不存在，请刷新后重新选择")
+                else:
+                    group_id = uuid.uuid4().hex
+                    connection.execute("INSERT INTO collections VALUES (?, ?, ?)", (group_id, collection["new_name"], now))
             connection.execute(
                 """
                 INSERT INTO jobs (
@@ -282,6 +381,9 @@ class MasterStore:
                 """,
                 rows,
             )
+            if group_id:
+                connection.execute("INSERT INTO collection_members VALUES (?, ?)", (request_data["job_id"], group_id))
+                connection.execute("UPDATE collection_revision SET revision=revision+1")
 
     @staticmethod
     def worker_task_id(job_id: str, machine_id: str) -> str:
@@ -326,9 +428,14 @@ class MasterStore:
         return "deleted"
 
     @staticmethod
-    def _job_filter(status: str, query: str) -> tuple[str, list[str]]:
+    def _job_filter(status: str, query: str, collection: str = "") -> tuple[str, list[str]]:
         conditions = ["deleted_at IS NULL"]
         params = []
+        if collection == "__ungrouped":
+            conditions.append("job_id NOT IN (SELECT job_id FROM collection_members)")
+        elif collection:
+            conditions.append("job_id IN (SELECT job_id FROM collection_members WHERE collection_id=?)")
+            params.append(collection)
         if status != "ALL":
             conditions.append("status = ?")
             params.append(status)
@@ -337,20 +444,20 @@ class MasterStore:
             params.extend([query.strip(), query.strip()])
         return " AND ".join(conditions), params
 
-    def job_list_counts(self, *, status: str = "ALL", query: str = "") -> dict[str, Any]:
-        condition, params = self._job_filter(status, query)
+    def job_list_counts(self, *, status: str = "ALL", query: str = "", collection: str = "") -> dict[str, Any]:
+        condition, params = self._job_filter(status, query, collection)
         with self._connection() as connection:
             total = connection.execute(f"SELECT COUNT(*) FROM jobs WHERE {condition}", params).fetchone()[0]
             counts = dict(connection.execute("SELECT status, COUNT(*) FROM jobs WHERE deleted_at IS NULL GROUP BY status").fetchall())
         return {"total": total, "running": sum(count for state, count in counts.items() if state not in TERMINAL_STATUSES)}
 
-    def list_jobs(self, *, limit: int = 100, offset: int = 0, status: str = "ALL", query: str = "", sort: str = "created_desc") -> list[dict[str, Any]]:
-        condition, params = self._job_filter(status, query)
+    def list_jobs(self, *, limit: int = 100, offset: int = 0, status: str = "ALL", query: str = "", sort: str = "created_desc", collection: str = "") -> list[dict[str, Any]]:
+        condition, params = self._job_filter(status, query, collection)
         order = JOB_SORT_ORDERS[sort]
         with self._connection() as connection:
             rows = connection.execute(
                 f"""
-                SELECT job_id, name, status, stage, error, cancel_requested,
+                SELECT job_id, name, source_filename, status, stage, error, cancel_requested,
                        resume_token, created_at, started_at, finished_at, updated_at
                   FROM jobs WHERE {condition}
                  ORDER BY {order}, job_id DESC LIMIT ? OFFSET ?
@@ -427,12 +534,15 @@ class MasterStore:
         """分页读取任务明细，避免前端轮询一次加载数万条 execution。"""
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM jobs WHERE job_id = ? AND deleted_at IS NULL", (job_id,)
+                "SELECT job_id, name, source_filename, status, stage, error, cancel_requested, "
+                "created_at, started_at, finished_at, updated_at FROM jobs WHERE job_id = ? AND deleted_at IS NULL", (job_id,)
             ).fetchone()
             if row is None:
                 return None
             item_page = None
-            if unit == "url":
+            if unit == "summary":
+                executions = []
+            elif unit == "url":
                 conditions = "job_id = ?"
                 params = [job_id]
                 if query.strip():

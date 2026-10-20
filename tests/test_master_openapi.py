@@ -15,6 +15,23 @@ class MasterOpenApiTests(unittest.TestCase):
 
     def test_expected_paths_are_documented(self) -> None:
         expected = {
+            "/api/v1/extractions/candidates": {"get"},
+            "/api/v1/machines/{machine_id}/extractions": {"get", "post"},
+            "/api/v1/machines/{machine_id}/extractions/{extraction_id}": {"get"},
+            "/api/v1/machines/{machine_id}/extractions/{extraction_id}/cancel": {"post"},
+            "/api/v1/data/groups": {"get"},
+            "/api/v1/data/groups/{group_id}": {"get"},
+            "/api/v1/data/overview": {"get"},
+            "/api/v1/data/results": {"get"},
+            "/api/v1/data/result": {"get"},
+            "/api/v1/data/locations": {"get", "post"},
+            "/api/v1/data/export": {"post"},
+            "/api/v1/collections": {"get", "post"},
+            "/api/v1/collections/{collection_id}/overview": {"get"},
+            "/api/v1/collections/{collection_id}/results": {"get"},
+            "/api/v1/collections/{collection_id}/result": {"get"},
+            "/api/v1/collections/{collection_id}/export": {"post"},
+            "/api/v1/collections/{collection_id}": {"post"},
             "/api/v1/health": {"get"},
             "/api/v1/machines": {"get", "post"},
             "/api/v1/machines/{machine_id}": {"delete"},

@@ -85,6 +85,19 @@ class WorkerClient:
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/api/v1/health")
 
+    def list_extractions(self, *, limit=20, offset=0):
+        return self._request('GET', '/api/v1/extractions?' + urlencode({'limit': limit, 'offset': offset}))
+
+    def submit_extraction(self, source_task_id, *, keep_pcap=False, keep_pcap_count=None):
+        return self._request('POST', '/api/v1/extractions', {
+            'source_task_id': source_task_id, 'keep_pcap': keep_pcap, 'keep_pcap_count': keep_pcap_count})
+
+    def get_extraction(self, extraction_id):
+        return self._request('GET', '/api/v1/extractions/' + quote(extraction_id, safe=''))
+
+    def cancel_extraction(self, extraction_id):
+        return self._request('POST', '/api/v1/extractions/' + quote(extraction_id, safe='') + '/cancel')
+
     def capabilities(self) -> dict[str, Any]:
         return self._request("GET", "/api/v1/capabilities")
 

@@ -9,7 +9,9 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request, stream_with_context
+from . import collection_queries
+from . import data_queries
 
 from .config import MasterConfig
 from .dispatcher import (
@@ -18,7 +20,14 @@ from .dispatcher import (
     public_machine,
     summarize_job,
 )
-from .schema import ValidationError, parse_uploaded_input, validate_job, validate_machine
+from .schema import (
+    ValidationError,
+    parse_uploaded_input,
+    validate_job,
+    validate_machine,
+    validate_collection_choice,
+    validate_collection_edit,
+)
 from .store import JOB_SORT_ORDERS, MasterStore, TERMINAL_STATUSES, utc_now
 from .worker_client import WorkerClient, WorkerRequestError
 
@@ -62,7 +71,12 @@ def _create_job(
     source_filename: str | None = None,
     source_content: bytes | None = None,
 ):
-    normalized = validate_job(payload, max_items=config.max_items)
+    collection = None
+    capture_payload = payload
+    if isinstance(payload, dict):
+        collection = validate_collection_choice(payload.get("collection"))
+        capture_payload = {key: value for key, value in payload.items() if key != "collection"}
+    normalized = validate_job(capture_payload, max_items=config.max_items)
     if store.job_id_exists(normalized["job_id"]):
         raise sqlite3.IntegrityError(f"job_id {normalized['job_id']} 已存在")
     missing: list[str] = []
@@ -91,6 +105,7 @@ def _create_job(
             normalized,
             source_filename=Path(source_filename).name if source_filename else None,
             source_path=source_path,
+            collection=collection,
         )
     except Exception:
         # 数据库插入失败时清理由本次请求创建的上传文件。
@@ -113,7 +128,7 @@ def _create_job(
         )
         raise
     job = store.get_job_page(normalized["job_id"])
-    return jsonify(summarize_job(job or {})), 202
+    return jsonify({**summarize_job(job or {}), "collection": store.job_collection(normalized["job_id"])}), 202
 
 
 def create_app(
@@ -145,6 +160,8 @@ def create_app(
     app.extensions["master_config"] = master_config
     app.extensions["master_store"] = master_store
     app.extensions["job_dispatcher"] = job_dispatcher
+    from .extractions import register_routes
+    register_routes(app, master_store, job_dispatcher)
 
     @app.before_request
     def authenticate_master_api():
@@ -200,6 +217,90 @@ def create_app(
     @app.get("/api/v1/machines")
     def list_machines():
         return jsonify({"machines": [public_machine(item) for item in master_store.list_machines()]})
+
+    @app.get("/api/v1/collections")
+    def list_collections():
+        return jsonify(master_store.list_collections())
+
+    @app.get('/api/v1/data/groups')
+    def data_groups():
+        return jsonify(data_queries.group_page(master_store, request.args.to_dict()))
+
+    @app.get('/api/v1/data/groups/<group_id>')
+    def data_group_detail(group_id):
+        return jsonify(data_queries.group_detail(master_store, group_id))
+
+    @app.get('/api/v1/data/overview')
+    def data_overview():
+        return jsonify(data_queries.overview(master_store, request.args.get('group', '__all'), request.args.to_dict()))
+
+    @app.get('/api/v1/data/results')
+    def data_results():
+        return jsonify(data_queries.results_page(master_store, request.args.get('group', '__all'), request.args.to_dict()))
+
+    @app.get('/api/v1/data/result')
+    def data_result():
+        result = data_queries.result_detail(master_store, request.args.get('group', '__all'), request.args.get('execution_id', ''))
+        if result is None:
+            return jsonify({'error': 'not_found', 'message': '结果不存在或已移出当前分组，请刷新'}), 404
+        return jsonify(result)
+
+    @app.get('/api/v1/data/locations')
+    def data_locations():
+        return jsonify(data_queries.locations(master_store))
+
+    @app.post('/api/v1/data/locations')
+    def data_save_location():
+        return jsonify(data_queries.save_location(master_store, request.get_json(silent=True)))
+
+    @app.post('/api/v1/data/export')
+    def data_export():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise ValidationError('请求体必须是对象')
+        group = payload.get('group', '__all')
+        if not isinstance(group, str):
+            raise ValidationError('总体任务格式错误')
+        lines = data_queries.csv_export(master_store, group, payload.get('filters', {}))
+        return Response(stream_with_context(lines), content_type='text/csv; charset=utf-8',
+                        headers={'Content-Disposition': 'attachment; filename="capture-results-index.csv"'})
+
+    @app.get("/api/v1/collections/<collection_id>/overview")
+    def collection_overview(collection_id):
+        return jsonify(collection_queries.overview(master_store, collection_id))
+
+    @app.get("/api/v1/collections/<collection_id>/results")
+    def collection_results(collection_id):
+        try:
+            offset = max(0, int(request.args.get('offset', '0')))
+            limit = min(100, max(1, int(request.args.get('limit', '20'))))
+        except ValueError:
+            raise ValidationError('offset 和 limit 必须是整数')
+        return jsonify(collection_queries.results_page(master_store, collection_id, request.args.to_dict(), offset, limit))
+
+    @app.get("/api/v1/collections/<collection_id>/result")
+    def collection_result(collection_id):
+        row = collection_queries.result_detail(master_store, collection_id, request.args.get('job_id', ''),
+                                               request.args.get('item_id', ''), request.args.get('machine_id', ''))
+        if row is None:
+            return jsonify({'error': 'not_found', 'message': '结果不存在或已移出此总体任务，请刷新'}), 404
+        return jsonify(row)
+
+    @app.post("/api/v1/collections/<collection_id>/export")
+    def collection_export(collection_id):
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise ValidationError('请求体必须是对象')
+        lines = collection_queries.csv_export(master_store, collection_id, payload.get('filters', {}), payload.get('locations', {}))
+        return Response(stream_with_context(lines), content_type='text/csv; charset=utf-8',
+                        headers={'Content-Disposition': 'attachment; filename="results.csv"'})
+
+    @app.post("/api/v1/collections")
+    @app.post("/api/v1/collections/<collection_id>")
+    def save_collection(collection_id=None):
+        name, job_ids, revision = validate_collection_edit(request.get_json(silent=True))
+        saved = master_store.save_collection(collection_id, name, job_ids, revision)
+        return jsonify(saved), 200 if collection_id else 201
 
     @app.post("/api/v1/machines")
     def save_machine():
@@ -277,10 +378,17 @@ def create_app(
             },
             "analysis": {
                 "steps": _form_list("analysis_steps", default=[]),
+                "pipeline": _form_bool("analysis_pipeline", default=False),
+                "delete_pcap": _form_bool("delete_pcap", default=False),
                 "with_coframe": _form_bool("with_coframe", default=False),
                 "sni_suffixes": _form_list("sni_suffixes", default=[]),
             },
         }
+        if "collection" in request.form:
+            try:
+                payload["collection"] = json.loads(request.form["collection"])
+            except json.JSONDecodeError as exc:
+                raise ValidationError("collection 必须是 JSON 对象") from exc
         return _create_job(
             payload,
             store=master_store,
@@ -302,9 +410,10 @@ def create_app(
         sort = request.args.get("sort", "created_desc")
         if sort not in JOB_SORT_ORDERS:
             raise ValidationError("sort 必须为 " + "、".join(JOB_SORT_ORDERS))
-        counts = master_store.job_list_counts(status=status, query=query)
+        collection = request.args.get("collection", "")
+        counts = master_store.job_list_counts(status=status, query=query, collection=collection)
         offset = min(offset, max(0, (counts["total"] - 1) // limit) * limit)
-        jobs = master_store.list_jobs(limit=limit, offset=offset, status=status, query=query, sort=sort)
+        jobs = master_store.list_jobs(limit=limit, offset=offset, status=status, query=query, sort=sort, collection=collection)
         return jsonify({
             "jobs": [summarize_job(item) for item in jobs],
             "page": {"offset": offset, "limit": limit, "total": counts["total"], "returned": len(jobs), "sort": sort},
@@ -314,8 +423,8 @@ def create_app(
     @app.get("/api/v1/jobs/<job_id>")
     def get_job(job_id: str):
         unit = request.args.get("unit", "execution")
-        if unit not in {"execution", "url"}:
-            raise ValidationError("unit 必须为 execution 或 url")
+        if unit not in {"execution", "url", "summary"}:
+            raise ValidationError("unit 必须为 execution、url 或 summary")
         try:
             offset = max(0, int(request.args.get("offset", "0")))
             limit = min(5000, max(1, int(request.args.get("limit", "500"))))
@@ -399,6 +508,9 @@ def create_app(
         if options.get("job_id"):
             payload["job_id"] = options["job_id"]
         payload["name"] = options.get("name") or f"{source['name']} - 新一轮"[:120]
+        collection = master_store.job_collection(job_id)
+        if collection:
+            payload["collection"] = {"group_id": collection["id"]}
         return _create_job(
             payload,
             store=master_store,
