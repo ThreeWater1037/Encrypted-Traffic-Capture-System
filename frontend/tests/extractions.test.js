@@ -55,7 +55,7 @@ test('submissions send none, first N, and all retention policies', async () => {
   await state.submit('first-five')
   state.retentionMode.value = 'all'
   await state.submit('all')
-  assert.deepEqual(requests, [
+  assert.deepEqual(requests.map(({ steps, ...retention }) => retention), [
     { keep_pcap: false, keep_pcap_count: null },
     { keep_pcap: true, keep_pcap_count: 5 },
     { keep_pcap: true, keep_pcap_count: null },
@@ -75,5 +75,22 @@ test('invalid counts never reach API and retry uses saved policy instead of curr
   assert.equal(requests.length, 0)
   await state.submit('retry', { keep_pcap: true, keep_pcap_count: 2 })
   await state.submit('legacy-retry', {})
-  assert.deepEqual(requests, [{ keep_pcap: true, keep_pcap_count: 2 }, { keep_pcap: false, keep_pcap_count: null }])
+  assert.deepEqual(requests.map(({ steps, ...retention }) => retention), [{ keep_pcap: true, keep_pcap_count: 2 }, { keep_pcap: false, keep_pcap_count: null }])
+})
+
+
+test('flow and TLS can be selected separately or together; empty selection never submits', async () => {
+  const requests = []
+  const state = createExtractions(base({ submitExtraction: async (machine, id, options) => {
+    requests.push(options); return { task_id: id, status: 'QUEUED' }
+  } }))
+  await state.selectMachine('a')
+  for (const steps of [['flow'], ['tls'], ['tls', 'flow']]) {
+    state.extractionSteps.value = steps; await state.submit('job')
+  }
+  state.extractionSteps.value = []; await state.submit('empty')
+  assert.match(state.error.value, /至少选择/)
+  await state.submit('retry', { steps: ['tls'], keep_pcap: true })
+  await state.submit('legacy', {})
+  assert.deepEqual(requests.map(r => r.steps), [['flow'], ['tls'], ['flow', 'tls'], ['tls'], ['flow', 'tls']])
 })

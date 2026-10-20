@@ -7,6 +7,7 @@ export function createExtractions(api) {
   const loading = ref(false), busy = ref(false), error = ref(''), queueError = ref(''), message = ref('')
   const detailLoading = ref(false)
   const keepPcap = ref(false), retentionMode = ref('first'), keepPcapCount = ref(10)
+  const extractionSteps = ref(['flow', 'tls'])
   let revision = 0, detailRevision = 0
   async function load() {
     if (!machine.value) return
@@ -46,6 +47,11 @@ export function createExtractions(api) {
     const options = existing
       ? { keep_pcap: existing.keep_pcap ?? false, keep_pcap_count: existing.keep_pcap_count ?? null }
       : { keep_pcap: keepPcap.value, keep_pcap_count: keepPcap.value && retentionMode.value === 'first' ? keepPcapCount.value : null }
+    const selected = existing ? (existing.steps ?? ['flow', 'tls']) : extractionSteps.value
+    if (!selected.length || selected.some(step => !['flow', 'tls'].includes(step))) {
+      error.value = '请至少选择一项提取内容'; return
+    }
+    options.steps = ['flow', 'tls'].filter(step => selected.includes(step))
     if (options.keep_pcap_count !== null && (!Number.isSafeInteger(options.keep_pcap_count) || options.keep_pcap_count < 1)) {
       error.value = '保留数量必须为正整数'; return
     }
@@ -72,6 +78,6 @@ export function createExtractions(api) {
   }
   async function refresh() { await load(); if (detail.value) await openDetail(detail.value.task_id) }
   return { machine, query, candidates, jobs, detail, page, queuePage, loading, detailLoading, busy, error, queueError, message,
-    keepPcap, retentionMode, keepPcapCount,
+    keepPcap, retentionMode, keepPcapCount, extractionSteps,
     selectMachine, load, openDetail, submit, cancel, refresh }
 }
