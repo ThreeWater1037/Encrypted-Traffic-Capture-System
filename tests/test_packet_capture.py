@@ -41,6 +41,7 @@ class PacketCaptureTests(unittest.TestCase):
                     call("Network.enable", {}),
                     call("Network.setCacheDisabled", {"cacheDisabled": True}),
                     call("Network.setBypassServiceWorker", {"bypass": True}),
+                    call("Page.getFrameTree", {}),
                 ])
                 driver.get_log.assert_called_once_with("performance")
 
@@ -77,13 +78,13 @@ class PacketCaptureTests(unittest.TestCase):
         builder.build.return_value = driver
         with tempfile.TemporaryDirectory() as tmp, \
              patch.dict("wiki_fetcher.AVAILABLE_DRIVERS", {"chrome": builder}), \
-             patch.object(WikiFetcher, "_wait_for_normal_page", return_value={}) as normal_wait, \
+             patch("wiki_fetcher.WikiFetcher._wait_for_normal_page", return_value={}) as normal_wait, \
              patch("wiki_fetcher.time.sleep"):
             fetcher = WikiFetcher(Path(tmp), ["chrome"], False)
             item_dir = fetcher._url_dir("wiki")
             result = fetcher._fetch_with(driver.current_url, "chrome", item_dir)
             self.assertIsNone(result.error)
-            self.assertEqual(builder.build.call_args.kwargs, {})
+            self.assertEqual(builder.build.call_args.kwargs, {"language": "zh-CN"})
             normal_wait.assert_called_once_with(driver)
             self.assertFalse((item_dir / "resource_status_chrome.json").exists())
             self.assertFalse(any(call.args[0] == "Network.setExtraHTTPHeaders"

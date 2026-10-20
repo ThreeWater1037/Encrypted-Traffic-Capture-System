@@ -22,6 +22,54 @@ def bidi(method, request_id="r", *, context="main", hop=0, url="https://example.
 
 
 class FirefoxNetworkTests(unittest.TestCase):
+    def test_old_context_request_started_after_target_document_is_excluded(self):
+        doc = {"request":"doc","url":"https://example.com/","destination":"document"}
+        result, _ = self.run_timeline([
+            (0, [bidi("beforeRequestSent",request=doc),
+                 bidi("responseStarted",request=doc,response={"status":200}),
+                 bidi("responseCompleted",request=doc,response={"status":200})]),
+            (.1, [{"method":"browsingContext.contextCreated",
+                   "params":{"context":"old-child","parent":"main"}},
+                  bidi("beforeRequestSent","late-old",context="old-child")]),
+            (.2, [{"method":"browsingContext.contextDestroyed",
+                   "params":{"context":"old-child"}}]),
+        ], previous_frames=["main","old-child"],completion_policy="target_document")
+        self.assertEqual(result["resource_status"],"complete")
+        self.assertEqual(result["prior_navigation_requests"][0]["scope_reason"],"previous_page_frame")
+
+    def test_prior_document_child_is_separate_from_target_page(self):
+        doc = {"request": "doc", "url": "https://example.com/", "destination": "document"}
+        result, _ = self.run_timeline([
+            (0, [{"method":"browsingContext.contextCreated",
+                  "params":{"context":"old-child","parent":"main"}},
+                 bidi("beforeRequestSent", "old", context="old-child")]),
+            (.1, [bidi("beforeRequestSent", request=doc),
+                  bidi("responseStarted", request=doc, response={"status":200}),
+                  bidi("responseCompleted", request=doc, response={"status":200})]),
+            (.2, [{"method":"browsingContext.contextDestroyed",
+                   "params":{"context":"old-child"}}]),
+        ], completion_policy="target_document")
+        self.assertEqual(result["resource_status"], "complete")
+        self.assertEqual(result["request_count"], 1)
+        self.assertEqual(result["detached_requests"], [])
+        self.assertEqual(result["prior_navigation_requests"][0]["request_id"], "old:0")
+
+    def test_target_child_removal_still_marks_partial(self):
+        doc = {"request": "doc", "url": "https://example.com/", "destination": "document"}
+        result, _ = self.run_timeline([
+            (0, [bidi("beforeRequestSent", request=doc),
+                 bidi("responseStarted", request=doc, response={"status":200}),
+                 bidi("responseCompleted", request=doc, response={"status":200}),
+                 {"method":"browsingContext.contextCreated",
+                  "params":{"context":"child","parent":"main"}},
+                 bidi("beforeRequestSent", "real", context="child")]),
+            (.2, [{"method":"browsingContext.contextDestroyed",
+                   "params":{"context":"child"}}]),
+        ], completion_policy="target_document")
+        self.assertEqual(result["resource_status"], "partial")
+        self.assertEqual(result["detached_requests"][0]["request_id"], "real:0")
+        self.assertEqual(result["prior_navigation_requests"], [])
+
     def make_policy(self):
         driver = MagicMock()
         policy = FirefoxNetworkPolicy(driver)
@@ -31,8 +79,9 @@ class FirefoxNetworkTests(unittest.TestCase):
         policy.frame_tree = lambda: {"frame": {"id": "main", "url": "https://example.com/"}}
         return driver, policy
 
-    def run_timeline(self, timeline, *, timeout=5.0, recheck_at=None, **tracker_options):
+    def run_timeline(self, timeline, *, timeout=5.0, recheck_at=None, previous_frames=(), **tracker_options):
         driver, policy = self.make_policy()
+        driver._capture_previous_frame_ids = list(previous_frames)
         if tracker_options.get("completion_policy") == "target_document":
             policy.reject_cache_hits = False
         clock = [0.0]

@@ -77,7 +77,7 @@ class DriverResolutionTests(unittest.TestCase):
                  patch.object(builder, '_find_binary', return_value='/browser'), \
                  patch('wiki_fetcher._resolve_driver_path', return_value='/local/driver') as resolve, \
                  patch('wiki_fetcher.' + service) as service_type, \
-                 patch('wiki_fetcher.webdriver.' + browser.capitalize()), \
+                 patch('wiki_fetcher.Capture' + browser.capitalize()), \
                  patch('wiki_fetcher._initialize_chromium_network'), \
                  patch('wiki_fetcher._initialize_firefox_network'), \
                  patch.dict(os.environ, {}, clear=False):

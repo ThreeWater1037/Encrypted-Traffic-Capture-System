@@ -28,6 +28,22 @@ def configure_uncached_network(driver) -> None:
     driver.execute_cdp_cmd("Network.setBypassServiceWorker", {"bypass": True})
 
 
+def remember_navigation_frames(driver) -> None:
+    """Remember the page being left, using CDP frames or BiDi contexts."""
+    firefox = vars(driver).get("_capture_firefox_network")
+    tree = firefox.frame_tree() if firefox is not None else driver.execute_cdp_cmd(
+        "Page.getFrameTree", {})["frameTree"]
+    frame_ids = []
+    def visit(node):
+        frame_id = node["frame"]["id"]
+        if isinstance(frame_id, str):
+            frame_ids.append(frame_id)
+        for child in node.get("childFrames", []):
+            visit(child)
+    visit(tree)
+    driver._capture_previous_frame_ids = frame_ids
+
+
 def _performance_events(driver):
     """Supplement ChromeDriver's log with out-of-process target events."""
     firefox = vars(driver).get("_capture_firefox_network")
@@ -99,6 +115,8 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float,
     firefox = vars(driver).get("_capture_firefox_network")
     tree = firefox.frame_tree() if firefox is not None else driver.execute_cdp_cmd("Page.getFrameTree", {})["frameTree"]
     main_frame = tree["frame"]["id"]
+    initial_main_loader = tree["frame"].get("loaderId")
+    navigation_started_at = None
     # A known frame's loader distinguishes this navigation from old new-tab
     # requests that can finish just after the pre-navigation log drain.
     frames = {}
@@ -112,6 +130,9 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float,
             add_frame_tree(child, frame["id"])
 
     add_frame_tree(tree)
+    # Existing contexts that survive in the committed tree still belong to the
+    # target. Only absent previous-page frames (and their descendants) are old.
+    previous_frames = set(vars(driver).get("_capture_previous_frame_ids", [])) - set(frames)
     clock_offset = 0.0 if firefox is not None else None
     try:
         if firefox is None:
@@ -135,6 +156,7 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float,
     seen_request_events = set()
     failures = []
     detached = []
+    prior_navigation_requests = []
     ignored_count = 0
     finished_count = 0
     redirect_count = 0
@@ -151,6 +173,35 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float,
         value = event_time(params, now)
         last_activity = value if last_activity is None else max(last_activity, value)
 
+    def prior_navigation_reason(item):
+        if navigation_started_at is None:
+            return None
+        if item.get("frame_id") in previous_frames:
+            return "previous_page_frame"
+        stamp = item.get("started_timestamp")
+        if isinstance(stamp, (int, float)) and stamp < navigation_started_at:
+            return "started_before_target_navigation"
+        return None
+
+    def exclude_prior_navigation():
+        """Late protocol delivery must not make the previous page part of this one."""
+        nonlocal finished_count, redirect_count
+        for item in list(requests):
+            reason = prior_navigation_reason(item)
+            if not reason:
+                continue
+            prior_navigation_requests.append({
+                **item, "scope_reason": reason})
+            requests.remove(item)
+            if pending.get(item["request_id"]) is item:
+                pending.pop(item["request_id"])
+            if item["state"] in {"finished", "redirected"}:
+                finished_count -= 1
+            if item["state"] == "redirected":
+                redirect_count -= 1
+        failures[:] = [item for item in failures if not prior_navigation_reason(item)]
+        detached[:] = [item for item in detached if not prior_navigation_reason(item)]
+
     def summary(now):
         return {
             "request_count": len(requests), "finished_count": finished_count,
@@ -159,6 +210,9 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float,
                                                if item.get("policy_reason")],
             "pending_count": len(pending), "pending_requests": list(pending.values()),
             "detached_requests": detached, "ignored_request_count": ignored_count,
+            "navigation_started_timestamp": navigation_started_at,
+            "previous_page_frame_ids": sorted(previous_frames),
+            "prior_navigation_requests": prior_navigation_requests,
             "requests": requests, "idle_seconds": idle_seconds,
             "same_document_image_reuses": [item.copy() for item in requests
                                             if item.get("same_document_image_reuse")],
@@ -185,19 +239,48 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float,
         }
 
     while True:
-        for entry in _performance_events(driver):
-            message = json.loads(entry["message"])["message"]
+        messages = [json.loads(entry["message"])["message"]
+                    for entry in _performance_events(driver)]
+        # Chrome/Edge combine two independently buffered CDP streams; Firefox
+        # supplies BiDi receipt timestamps in the same normalized vocabulary.
+        # Inspect the whole batch before admitting requests: startup iframe
+        # events can precede OR follow the current document's events in it.
+        if navigation_started_at is None:
+            starts = []
+            for message in messages:
+                params = message.get("params", {})
+                if (message["method"] == "Network.requestWillBeSent"
+                        and params.get("type") == "Document"
+                        and params.get("frameId") == main_frame
+                        and (not initial_main_loader or params.get("loaderId") == initial_main_loader)
+                        and params.get("request", {}).get("url", "").startswith(("http://", "https://"))
+                        and isinstance(params.get("timestamp"), (int, float))):
+                    starts.append(params["timestamp"])
+            if starts:
+                navigation_started_at = min(starts)
+                exclude_prior_navigation()
+        for message in messages:
             method = message["method"]
             params = message.get("params", {})
             request_id = params.get("requestId")
             now = time.monotonic()
 
+            if method == "Page.frameAttached" and params.get("parentFrameId") in previous_frames:
+                previous_frames.add(params["frameId"])
+            elif method == "Page.frameNavigated" and params.get("frame", {}).get("parentId") in previous_frames:
+                previous_frames.add(params["frame"]["id"])
             if method == "Page.frameAttached" and params.get("parentFrameId") in frames:
                 frame_id = params["frameId"]
                 frames.setdefault(frame_id, None)
                 parents[frame_id] = params["parentFrameId"]
             elif method == "Page.frameNavigated":
                 frame = params["frame"]
+                # The current frame tree (or a newly admitted Document request)
+                # owns the main loader. Replayed startup commits must not roll
+                # it back and hide subsequent requests from the target page.
+                if (frame["id"] == main_frame and frames.get(main_frame)
+                        and frame.get("loaderId") != frames[main_frame]):
+                    continue
                 if frame["id"] in frames or frame.get("parentId") in frames:
                     frames[frame["id"]] = frame.get("loaderId")
                     parents[frame["id"]] = frame.get("parentId")
@@ -231,6 +314,18 @@ def _network_idle_session(driver, *, idle_seconds: float, timeout: float,
                 event_key = (request_id, params.get("loaderId"), url,
                              params.get("timestamp") if params.get("redirectResponse") else None)
                 if event_key in seen_request_events:
+                    continue
+                scope_reason = prior_navigation_reason({
+                    "started_timestamp": params.get("timestamp"), "frame_id": params.get("frameId")})
+                if scope_reason:
+                    seen_request_events.add(event_key)
+                    prior_navigation_requests.append({
+                        "request_id": request_id, "url": url, "type": params.get("type", "Other"),
+                        "frame_id": params.get("frameId"), "loader_id": params.get("loaderId"),
+                        "started_timestamp": params.get("timestamp"),
+                        "state": "outside_navigation",
+                        "scope_reason": scope_reason,
+                    })
                     continue
                 frame_id = params.get("frameId")
                 loader_id = params.get("loaderId")

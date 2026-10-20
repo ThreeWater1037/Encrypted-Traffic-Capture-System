@@ -50,6 +50,112 @@ class FakeDriver:
 
 
 class NetworkIdleTests(unittest.TestCase):
+    def test_previous_context_still_present_in_target_tree_is_kept(self):
+        clock = [0.0]
+        driver = FakeDriver(clock, [
+            (0,[request("doc",0,type="Document"),finished("doc",0),
+                request("kept",.01,frameId="child",loaderId="child-page")]),
+            (.2,[event("Page.frameDetached",frameId="child",reason="remove")]),
+        ])
+        driver._capture_previous_frame_ids = ["main","child"]
+        original = driver.execute_cdp_cmd
+        def command(name,params):
+            if name == "Page.getFrameTree":
+                return {"frameTree":{"frame":{"id":"main","loaderId":"page"},
+                       "childFrames":[{"frame":{"id":"child","loaderId":"child-page"}}]}}
+            return original(name,params)
+        driver.execute_cdp_cmd = command
+        with patch("browser_loading.time.monotonic",side_effect=lambda:clock[0]), \
+             patch("browser_loading.time.sleep",side_effect=lambda t:clock.__setitem__(0,clock[0]+t)):
+            result=wait_for_network_idle(driver)
+        self.assertEqual(result["resource_status"],"partial")
+        self.assertEqual(result["detached_requests"][0]["request_id"],"kept")
+        self.assertEqual(result["prior_navigation_requests"],[])
+
+    def test_previous_page_frame_requests_started_after_navigation_are_excluded(self):
+        result, _, _ = self.run_wait([
+            (0, [request("doc", 0, type="Document"), finished("doc", 0)]),
+            (.1, [event("Page.frameAttached", frameId="old", parentFrameId="main"),
+                  event("Page.frameAttached", frameId="old-nested", parentFrameId="old"),
+                  request("late-old", .1, frameId="old", loaderId="old-loader"),
+                  request("nested-old", .1, frameId="old-nested", loaderId="nested")]),
+            (.2, [event("Page.frameDetached", frameId="old", reason="remove")]),
+        ], previous_frames=["main","old"])
+        self.assertEqual(result["request_count"], 1)
+        self.assertEqual(result["resource_status"], "complete")
+        self.assertEqual(result["detached_requests"], [])
+        self.assertEqual([r["scope_reason"] for r in result["prior_navigation_requests"]],
+                         ["previous_page_frame", "previous_page_frame"])
+
+    def test_prior_navigation_iframe_events_are_excluded_in_either_stream_order(self):
+        old = [
+            event("Page.frameAttached", frameId="old-child", parentFrameId="main"),
+            request("old-image", -1, url="https://www.gstatic.com/logo.svg",
+                    frameId="old-child", loaderId="old-page"),
+            event("Page.frameDetached", frameId="old-child", reason="remove"),
+        ]
+        current = [request("doc", 0, type="Document"), finished("doc", 0)]
+        for messages in (old + current, current + old):
+            with self.subTest(messages=messages):
+                result, _, duration = self.run_wait([(0, messages)])
+                self.assertEqual(result["resource_status"], "complete")
+                self.assertEqual(result["detached_requests"], [])
+                self.assertEqual(result["request_count"], 1)
+                self.assertEqual(result["finished_count"], 1)
+                self.assertEqual(result["prior_navigation_requests"][0]["request_id"], "old-image")
+                self.assert_duration(duration, .5)
+
+    def test_old_requests_delivered_later_do_not_reset_quiet_window(self):
+        result, _, duration = self.run_wait([
+            (0, [request("doc", 0, type="Document"), finished("doc", 0)]),
+            (.4, [event("Page.frameAttached", frameId="old-child", parentFrameId="main"),
+                  request("old", -.1, frameId="old-child", loaderId="old"),
+                  event("Network.loadingFailed", .4, requestId="old", errorText="canceled")]),
+        ])
+        self.assert_duration(duration, .5)
+        self.assertEqual(result["resource_status"], "complete")
+        self.assertEqual(result["failed_requests"], [])
+        self.assertEqual(len(result["prior_navigation_requests"]), 1)
+
+    def test_replayed_startup_commit_cannot_hide_target_fetch(self):
+        result, _, duration = self.run_wait([
+            (0, [request("doc", 0, type="Document"), finished("doc", 0),
+                 event("Page.frameNavigated", frame={"id":"main","loaderId":"new-tab"})]),
+            (.2, [request("real-fetch", .2, type="Fetch")]),
+            (1, [finished("real-fetch", 1)]),
+        ])
+        self.assertEqual(result["finished_count"], 2)
+        self.assertEqual(result["requests"][-1]["request_id"], "real-fetch")
+        self.assert_duration(duration, 1.5)
+
+    def test_current_page_detach_is_not_hidden_by_hostname_or_navigation_filter(self):
+        result, _, _ = self.run_wait([
+            (0, [request("doc", 0, type="Document"), finished("doc", 0),
+                 event("Page.frameAttached", frameId="child", parentFrameId="main"),
+                 request("real", .01, url="https://www.gstatic.com/logo.svg",
+                         frameId="child", loaderId="child-page")]),
+            (.2, [event("Page.frameDetached", frameId="child", reason="remove")]),
+        ])
+        self.assertEqual(result["resource_status"], "partial")
+        self.assertEqual(result["detached_requests"][0]["request_id"], "real")
+        self.assertEqual(result["prior_navigation_requests"], [])
+
+    def test_late_document_anchor_reclassifies_prior_completed_failed_and_detached(self):
+        result, _, _ = self.run_wait([
+            (0, [event("Page.frameAttached", frameId="old-child", parentFrameId="main"),
+                 request("done", 0, frameId="old-child", loaderId="old"),
+                 finished("done", 0),
+                 request("failure", 0, frameId="old-child", loaderId="old"),
+                 event("Network.loadingFailed", 0, requestId="failure", errorText="old failure"),
+                 request("detached", 0, frameId="old-child", loaderId="old"),
+                 event("Page.frameDetached", frameId="old-child", reason="remove")]),
+            (.1, [request("doc", .1, type="Document"), finished("doc", .1)]),
+        ])
+        self.assertEqual(result["request_count"], 1)
+        self.assertEqual(result["finished_count"], 1)
+        self.assertEqual(len(result["prior_navigation_requests"]), 3)
+        self.assertEqual(result["resource_status"], "complete")
+
     def test_child_target_finished_event_completes_request_without_double_counting(self):
         clock = [0.0]
         main = request("document", 0, type="Document")
@@ -124,9 +230,10 @@ class NetworkIdleTests(unittest.TestCase):
         self.assertEqual(result["finished_count"], 1)
         self.assertEqual(result["pending_count"], 0)
 
-    def run_wait(self, timeline, *, metrics=True, **kwargs):
+    def run_wait(self, timeline, *, metrics=True, previous_frames=(), **kwargs):
         clock = [0.0]
         driver = FakeDriver(clock, timeline, metrics)
+        driver._capture_previous_frame_ids = list(previous_frames)
 
         def sleep(seconds):
             clock[0] += seconds

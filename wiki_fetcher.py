@@ -51,7 +51,7 @@ from browser_proxy import BrowserProxy, parse_browser_proxy
 from browser_request_policy import blocked_urls_for_page
 from browser_session import CaptureChrome, CaptureEdge, CaptureFirefox, NAVIGATION_TIMEOUT
 from browser_loading import (
-    HIT_LEGACY_HOSTS, NetworkIdleTracker, configure_uncached_network,
+    HIT_LEGACY_HOSTS, NetworkIdleTracker, configure_uncached_network, remember_navigation_frames,
 )
 from capture_readiness import CaptureReadinessMonitor, validate_capture_file
 from capture_temp_cleanup import CaptureTempMaintenance, ensure_capture_storage, register_retained_directory
@@ -82,6 +82,23 @@ def _replace_capture_file(temporary: Path, destination: Path) -> None:
             time.sleep(min(0.02 * (2 ** attempt), 0.25))
 
 
+def _is_wikipedia_url(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    return host == "wikipedia.org" or host.endswith(".wikipedia.org")
+
+
+def _wikipedia_bot_user_agent() -> str | None:
+    """Identify this operator when configured; never invent contact details."""
+    contact = os.environ.get("WIKIPEDIA_BOT_CONTACT", "").strip()
+    if not contact:
+        return None
+    if any(ord(c) < 32 or ord(c) > 126 for c in contact):
+        raise ValueError("WIKIPEDIA_BOT_CONTACT must contain printable ASCII contact information")
+    if "(" in contact or ")" in contact:
+        raise ValueError("WIKIPEDIA_BOT_CONTACT must not contain parentheses")
+    return f"EncryptedTrafficCaptureBot/1.0 ({contact})"
+
+
 def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
     """设置导航兜底、无缓存策略和站点范围内的资源屏蔽。"""
     # Navigation must expire before the local driver HTTP transport budget.
@@ -99,6 +116,7 @@ def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
             firefox.set_blocked_urls(blocked_urls)
         if urlsplit(url).hostname == "today.hit.edu.cn":
             firefox.block_hosts(HIT_LEGACY_HOSTS)
+        remember_navigation_frames(driver)
         return
     if isinstance(driver, (webdriver.Chrome, webdriver.Edge)):
         configure_uncached_network(driver)
@@ -117,6 +135,7 @@ def _prepare_navigation(driver: webdriver.Remote, url: str) -> None:
         if policy is not None:
             policy.check()
             policy.reset_observation()
+        remember_navigation_frames(driver)
 
 
 def _initialize_firefox_network(driver):
@@ -673,9 +692,17 @@ class ChromeDriver(BrowserDriver):
         key_log_path: Path,
         profile_dir: Path,
         proxy: BrowserProxy | None = None,
+        *,
+        language: str | None = None,
+        user_agent: str | None = None,
     ) -> webdriver.Chrome:
         """配置 Chrome 启动参数、驱动服务和 CDP 无缓存设置。"""
         opts = ChromeOptions()
+        if user_agent:
+            opts.add_argument(f"--user-agent={user_agent}")
+        if language:
+            opts.add_argument(f"--lang={language}")
+            opts.add_experimental_option("prefs", {"intl.accept_languages": language})
         opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
         opts.page_load_strategy = "eager"
         binary = self._find_binary()
@@ -725,6 +752,9 @@ class EdgeDriver(BrowserDriver):
         key_log_path: Path,
         profile_dir: Path,
         proxy: BrowserProxy | None = None,
+        *,
+        language: str | None = None,
+        user_agent: str | None = None,
     ) -> webdriver.Edge:
         """配置 Edge 启动参数、驱动服务和 CDP 无缓存设置。"""
         binary = self._find_binary()
@@ -732,6 +762,11 @@ class EdgeDriver(BrowserDriver):
             raise RuntimeError("Microsoft Edge not found")
 
         opts = EdgeOptions()
+        if user_agent:
+            opts.add_argument(f"--user-agent={user_agent}")
+        if language:
+            opts.add_argument(f"--lang={language}")
+            opts.add_experimental_option("prefs", {"intl.accept_languages": language})
         opts.set_capability("ms:loggingPrefs", {"performance": "ALL"})
         opts.page_load_strategy = "eager"
         opts.binary_location = binary
@@ -769,6 +804,9 @@ class FirefoxDriver(BrowserDriver):
         key_log_path: Path,
         profile_dir: Path,
         proxy: BrowserProxy | None = None,
+        *,
+        language: str | None = None,
+        user_agent: str | None = None,
     ) -> webdriver.Firefox:
         """配置 Firefox Profile、缓存首选项和 TLS key log 环境变量。"""
         binary = self._find_binary()
@@ -778,6 +816,11 @@ class FirefoxDriver(BrowserDriver):
             )
 
         opts = FirefoxOptions()
+        if user_agent:
+            opts.set_preference("general.useragent.override", user_agent)
+        if language:
+            opts.set_preference("intl.accept_languages", language)
+            opts.set_preference("intl.locale.requested", language)
         opts.binary_location = binary
         opts.set_capability("webSocketUrl", True)
         opts.page_load_strategy = "eager"
@@ -1134,7 +1177,14 @@ class WikiFetcher:
             phase_timings["capture_start"] = time.perf_counter() - fetch_started
             log.info("    Starting %s ...", bd.name)
             phase_started = time.perf_counter()
-            driver = bd.build(browser_key_log, profile_dir, self.proxy)
+            if driver_key in {"chrome", "edge", "firefox"} and _is_wikipedia_url(url):
+                wiki_options = {"language": "zh-CN"}
+                bot_user_agent = _wikipedia_bot_user_agent()
+                if bot_user_agent:
+                    wiki_options["user_agent"] = bot_user_agent
+                driver = bd.build(browser_key_log, profile_dir, self.proxy, **wiki_options)
+            else:
+                driver = bd.build(browser_key_log, profile_dir, self.proxy)
             if driver_key == "firefox":
                 actual_profile = driver.capabilities.get("moz:profile")
                 if isinstance(actual_profile, str) and actual_profile:

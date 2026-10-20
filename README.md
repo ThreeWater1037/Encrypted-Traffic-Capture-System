@@ -597,6 +597,35 @@ python wiki_fetcher.py --input urls.txt --browsers edge --pcap --network-idle-se
 共用完成策略；Safari 仍使用 complete 后的固定延时。超过附带资源预算的未完成请求、
 更晚才由定时器发起的请求不保证采集完整。
 
+Wikipedia 目前与其他网站共用最新版提速采集流程：Chrome/Edge 使用 CDP，Firefox
+使用 WebDriver BiDi；默认空闲阈值 0.5 秒、URL 间隔 1 秒，沿用 `target_document`
+完成策略。仅访问 `wikipedia.org` 及其子域时，将三浏览器的语言首选项设为 `zh-CN`；
+其他网站的语言配置保持原状。Chrome/Edge 绕过 Service Worker，Firefox 在独立临时
+Profile 中禁用 Service Worker。
+
+三浏览器共用的网络账本以当前主文档的导航起点和导航前后的框架树区分前一页面请求。
+前一页面独有框架的请求即使在新导航发起后才开始，也不会归入目标页；
+仍存在于目标页框架树中的上下文不会仅因导航前已存在而被排除。
+延迟到达的新标签页/旧 iframe 请求保留在 `prior_navigation_requests`，不参与当前
+页面的完成与 `partial` 判断；当前页面的 iframe 中断仍记录为 `detached_requests`
+或失败请求。未获得可验证的导航时间时保留原有保守判断，不按资源域名排除请求。
+
+Wiki 自动化访问可设置环境变量 `WIKIPEDIA_BOT_CONTACT` 为运营者的真实联系邮箱、
+公开项目网址或 `wikipedia:语言; User:用户名`（非 ASCII 字符需 URL 编码）。
+配置后，Chrome、Edge、Firefox 的 Wiki 会话使用
+`EncryptedTrafficCaptureBot/1.0 (联系方式)` 作为 User-Agent；其他网站会话不受影响。
+Worker 通过服务环境继承该变量，命令行运行时也可直接设置。未配置时保留现有标识；
+不会填入虚构联系人。此配置不改变当前抓包节奏，也不是限流豁免。
+遇到 429 应遵守响应的 `Retry-After`，不要立即重复跑批；当前采集器不会自动实现跨任务、
+跨进程的 Wikimedia 限流退避。持续被限流时，可按 Wikimedia 的
+[Bot traffic](https://wikitech.wikimedia.org/wiki/Bot_traffic) 文档申请识别及协助；
+地图的访问权限限制需要另行处理。
+
+`wiki_legacy_2874751.py` 暂时搁置，仅作为旧版参考保留，当前 CLI 和 Worker 均不调用。
+它保留提交 `2874751b54302ef4b9e37612e59b2ff54f29e812` 的实现及 6 行 `zh-CN` 配置；
+源码一致性仍由回归测试校验。旧版 Firefox 采用固定等待，并不提供完整网络观测。
+如需再次启用旧版，应明确修改路由并重新验证，不能把文件存在视为已启用。
+
 Chrome/Edge/Firefox 采集 `forbeschina.com` 及其子域名时，在导航前精确屏蔽
 `https://www.google.com/recaptcha/api2/aframe`（仅此完整 URL，不匹配其他路径或带查询参数的 URL）。
 同时屏蔽 `https://www.google-analytics.com/g/collect`，该规则允许任意查询参数，
