@@ -274,3 +274,23 @@ Ubuntu 两种部署脚本及 Windows 部署脚本会在旧 Worker 停止后、�
 避免一个超大 HTTP 请求、结果 JSON 和 SQLite 事务成为单点故障。24 小时运行还需
 由 systemd、Windows 服务或容器 restart policy 拉起 Worker；代码负责进程恢复后的
 续跑，不负责在操作系统杀死进程后自行复活。
+
+## 逐份抓包后台提取
+
+新模式通过 `analysis: {"pipeline": true, "delete_pcap": true}` 启用，旧任务和省略该参数的 API 调用保持原行为。它与旧 `steps`、`with_coframe`、`sni_suffixes` 选项互斥。上传表单使用 `analysis_pipeline=true` 和 `delete_pcap=true`。
+
+每个 URL/浏览器原子检查点提交后入队；单个后台执行器依次运行流特征、解密分类、推断分类、三个方向的流序列、独立流校验，然后提取 TLS 特征。Chrome、Edge、Firefox 共用该流程。Chrome/Edge 绕过 Service Worker，Firefox 在临时 Profile 中禁用 Service Worker 的策略保持不变。
+
+Linux 上分析进程及子进程使用 nice 15、idle 磁盘优先级、单 CPU 亲和性；采集期间按 100 ms 运行/300 ms 暂停限制整个分析进程组，采集结束后恢复连续运行。Windows 使用低于正常的进程优先级，不具备此 Linux 进程组占空比限制；需单独进行 Windows 真实浏览器验收。提取启动及各阶段检查至少 8 GiB 空间、100000 inode，Linux 额外检查 512 MiB 可用内存。
+
+结果位于页面目录的 `flow_extraction/<browser>/attempt-<id>/{inputs,sequences,tls}`；失败尝试保留，重试写新目录。`extraction_<browser>.json` 绑定原始 PCAP/密钥/检查点的 SHA-256、大小、mtime 和全部输出文件签名。两套结果验证成功且源文件未变化后，才允许删除原始 PCAP；密钥、详细流、三个方向序列及凭据均保留。发现已报告的丢包、空 TLS 结果、解析失败、低空间或输入变化时保留 PCAP。
+
+检查点本身是可恢复队列；续跑跳过有效的已删除 PCAP，并验证/复用提取凭据。提取失败退出码为 3，不触发整批采集重试。可用原任务续跑重提失败项。取消或超时清理分析子进程，下一次续跑重建未完成队列。`extraction_progress.json` 记录队列、失败和清空阶段。
+
+后台提取模式下，采集失败而需要重抓的旧 PCAP 和密钥先移入页面目录的 `failed_captures/<browser>/<id>/`，不在重抓时删除；因此存在失败历史时，这些未提取成功的原包仍占用磁盘，需要单独核查。
+
+独立命令行示例：
+
+```bash
+python wiki_fetcher.py --input part_01.txt --browsers chrome edge firefox --pcap --extract-background --delete-pcap-after-extract --output-dir ./fetch_output
+```

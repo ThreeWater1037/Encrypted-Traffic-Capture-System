@@ -85,6 +85,8 @@ class TaskManager:
         # 持久化任务必须在重启后全部恢复，因此内存队列不设置硬上限；
         # max_queue_size 只用于拒绝新的提交。
         self._queue: queue.Queue[str | None] = queue.Queue()
+        self._extraction_queue: queue.PriorityQueue[tuple[str, str]] = queue.PriorityQueue()
+        self._submission_lock = threading.RLock()
         self._stop_event = threading.Event()
         self._active_lock = threading.Lock()
         self._active_task_id: str | None = None
@@ -96,8 +98,14 @@ class TaskManager:
         )
         self._next_temp_cleanup = 0.0
         self.recovered_task_count = self.store.recover_incomplete_tasks()
+        from .extraction_jobs import ExtractionJobs
+        self.extractions = ExtractionJobs(self)
         for task_id in self.store.queued_task_ids():
-            self._queue.put_nowait(task_id)
+            restored = self.store.get_task(task_id)
+            if restored['request'].get('kind') == 'extraction':
+                self.enqueue_extraction(task_id)
+            else:
+                self._queue.put_nowait(task_id)
         if autostart:
             self.start()
 
@@ -105,6 +113,11 @@ class TaskManager:
         """启动唯一的后台消费者线程。"""
         if not self._thread.is_alive():
             self._thread.start()
+
+    def enqueue_extraction(self, task_id: str) -> None:
+        """Keep extraction FIFO order even after yielding to capture work."""
+        task = self.store.get_task_status(task_id)
+        self._extraction_queue.put_nowait((task['created_at'], task_id))
 
     def shutdown(self, timeout: float = 5.0) -> None:
         """停止接收执行工作，并终止仍在运行的子进程树。"""
@@ -126,7 +139,7 @@ class TaskManager:
     @property
     def queue_size(self) -> int:
         """返回尚未被消费者取出的任务数量。"""
-        return self._queue.qsize()
+        return self._queue.qsize() + self._extraction_queue.qsize()
 
     def submit(self, request_data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         """以 task_id 实现幂等提交，并创建专属任务目录。"""
@@ -188,12 +201,19 @@ class TaskManager:
         self, task_id: str, resume_token: str
     ) -> tuple[dict[str, Any] | None, bool]:
         """以幂等令牌恢复原任务目录，保留已提交的 URL 检查点。"""
-        exists, should_enqueue = self.store.resume_task(task_id, resume_token)
-        if not exists:
-            return None, False
-        if should_enqueue:
-            self._queue.put_nowait(task_id)
-        return self.store.get_task_status(task_id), should_enqueue
+        with self._submission_lock:
+            if self.extractions.blocks_resume(task_id):
+                raise TaskConflictError('原任务正在排队提取或提取中，请先取消提取')
+            exists, should_enqueue = self.store.resume_task(task_id, resume_token)
+            if not exists:
+                return None, False
+            if should_enqueue:
+                task = self.store.get_task(task_id)
+                if task['request'].get('kind') == 'extraction':
+                    self.enqueue_extraction(task_id)
+                else:
+                    self._queue.put_nowait(task_id)
+            return self.store.get_task_status(task_id), should_enqueue
 
     def cancel_active_process(self) -> None:
         """关闭当前活跃子进程，供取消和服务退出复用。"""
@@ -206,12 +226,17 @@ class TaskManager:
         """串行消费队列；单个任务失败不会终止整个 Worker。"""
         while not self._stop_event.is_set():
             self._cleanup_temp_if_due()
+            source_queue = self._queue
             try:
                 task_id = self._queue.get(timeout=0.5)
             except queue.Empty:
-                continue
+                try:
+                    source_queue = self._extraction_queue
+                    _, task_id = source_queue.get_nowait()
+                except queue.Empty:
+                    continue
             if task_id is None:
-                self._queue.task_done()
+                source_queue.task_done()
                 return
             try:
                 task = self.store.get_task(task_id)
@@ -232,7 +257,7 @@ class TaskManager:
                 with self._active_lock:
                     self._active_task_id = None
                     self._active_process = None
-                self._queue.task_done()
+                source_queue.task_done()
 
     def _cleanup_temp_if_due(self) -> None:
         """Run between tasks, at most hourly; never race this Worker's capture."""
@@ -249,6 +274,9 @@ class TaskManager:
 
     def _run_task(self, task: dict[str, Any]) -> None:
         """执行 PREPARING→CAPTURING→ANALYZING→VALIDATING 状态机。"""
+        if task['request'].get('kind') == 'extraction':
+            self.extractions.run(task)
+            return
         task_id = task["task_id"]
         request_data = task["request"]
         task_dir = self.config.tasks_dir / task_id
@@ -289,6 +317,10 @@ class TaskManager:
             ]
             if request_data["pcap"]:
                 capture_command.append("--pcap")
+            if request_data["analysis"].get("pipeline"):
+                capture_command.append("--extract-background")
+                if request_data["analysis"].get("delete_pcap"):
+                    capture_command.append("--delete-pcap-after-extract")
             if output_options.get("html", False):
                 capture_command.append("--save-html")
             if output_options.get("reports", False):
@@ -299,10 +331,18 @@ class TaskManager:
             )
             capture_retries = 0
             while True:
+                if request_data["analysis"].get("pipeline"):
+                    from capture_extraction import save_json
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    save_json(output_dir / "extraction_progress.json", {"draining": False})
+                    self.store.update_task(task_id, status="CAPTURING", stage="CAPTURING")
                 capture_code = self._run_command(
                     task_id, capture_command, log_path, deadline
                 )
                 if capture_code == 0:
+                    break
+                if capture_code == 3 and request_data["analysis"].get("pipeline"):
+                    errors.append("后台提取失败；原始 PCAP 保留，可续跑重提")
                     break
                 if capture_retries >= MAX_CAPTURE_RETRIES:
                     raise RuntimeError(
@@ -501,11 +541,22 @@ class TaskManager:
                     if return_code is not None:
                         return return_code
                     if progress_path is not None and self.config.capture_stall_seconds > 0:
+                        draining = False
+                        if "--extract-background" in command:
+                            try:
+                                draining = _read_progress_snapshot(progress_path.parent / "extraction_progress.json").get("draining", False)
+                            except (OSError, ValueError):
+                                pass
+                        if draining:
+                            # Capture has ended; bounded extraction subprocess timeouts
+                            # now own liveness. Do not kill a healthy queue drain.
+                            progress_path = None
+                            self.store.update_task(task_id, status="ANALYZING", stage="ANALYZING")
                         stamp = self._progress_stamp(progress_path)
                         if stamp != progress_stamp:
                             progress_stamp = stamp
                             last_progress = time.monotonic()
-                        elif time.monotonic() - last_progress >= self.config.capture_stall_seconds:
+                        elif progress_path is not None and time.monotonic() - last_progress >= self.config.capture_stall_seconds:
                             self._append_log(log_path,
                                 f"Capture made no checkpoint progress for {self.config.capture_stall_seconds}s; "
                                 "terminating capture process tree for bounded checkpoint retry")
@@ -725,7 +776,16 @@ class TaskManager:
                         valid = False
                         break
                     artifact_path = marker_dir / filename
-                    if not artifact_path.is_file() or artifact_path.stat().st_size != expected_size:
+                    try:
+                        actual_size = artifact_path.stat().st_size if artifact_path.is_file() else None
+                    except FileNotFoundError:
+                        actual_size = None
+                    if actual_size != expected_size:
+                        from capture_extraction import retired_capture
+                        if filename == f"capture_{browser}.pcap" and retired_capture(marker_dir, browser):
+                            checks["pcap_retired"] = True
+                            artifacts["extraction"] = self._artifact_info(task_dir, marker_dir / f"extraction_{browser}.json")
+                            continue
                         valid = False
                         break
                     if filename.startswith("tls_keys_"):
@@ -818,6 +878,22 @@ class TaskManager:
                     pcap = item_dir / f"capture_{browser}.pcap" if item_dir else None
                     checks["pcap"] = self._file_has_data(pcap)
                     artifacts["pcap"] = self._artifact_info(task_dir, pcap)
+                    from capture_extraction import retired_capture, verified_receipt
+                    receipt = verified_receipt(item_dir, browser) if item_dir else None
+                    if item_dir and retired_capture(item_dir, browser):
+                        checks.pop("pcap")
+                        checks["pcap_retired"] = True
+                    if request_data["analysis"].get("pipeline") or receipt:
+                        checks["flow_sequences"] = bool(receipt)
+                        checks["tls_features"] = bool(receipt)
+                        if request_data["analysis"].get("delete_pcap"):
+                            checks["pcap_retired"] = bool(item_dir and retired_capture(item_dir, browser))
+                        artifacts["extraction"] = self._artifact_info(
+                            task_dir, item_dir / f"extraction_{browser}.json" if item_dir else None)
+                        if receipt:
+                            result_dir = item_dir / receipt["result_dir"]
+                            artifacts["flow_sequences"] = self._artifact_info(task_dir, result_dir / "sequences")
+                            artifacts["tls_features"] = self._artifact_info(task_dir, result_dir / "tls")
 
                 if output_options.get("html", False):
                     body = item_dir / f"body_{browser}.html" if item_dir else None

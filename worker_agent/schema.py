@@ -29,7 +29,7 @@ ALLOWED_TOP_LEVEL_KEYS = {
     "analysis",
 }
 ALLOWED_OUTPUT_KEYS = {"html", "reports"}
-ALLOWED_ANALYSIS_KEYS = {"steps", "with_coframe", "sni_suffixes"}
+ALLOWED_ANALYSIS_KEYS = {"steps", "with_coframe", "sni_suffixes", "pipeline", "delete_pcap"}
 
 
 class ValidationError(ValueError):
@@ -173,6 +173,16 @@ def validate_task_payload(payload: Any, config: WorkerConfig) -> dict[str, Any]:
         )
 
     raw_steps = raw_analysis.get("steps", [])
+    pipeline = raw_analysis.get("pipeline", False)
+    delete_pcap = raw_analysis.get("delete_pcap", False)
+    if not isinstance(pipeline, bool) or not isinstance(delete_pcap, bool):
+        raise ValidationError("analysis.pipeline 和 analysis.delete_pcap 必须是布尔值")
+    if pipeline and not pcap:
+        raise ValidationError("后台提取必须设置 pcap=true")
+    if delete_pcap and not pipeline:
+        raise ValidationError("删除 PCAP 必须启用后台完整提取")
+    if pipeline and (raw_steps or raw_analysis.get("sni_suffixes") or raw_analysis.get("with_coframe")):
+        raise ValidationError("后台完整提取不同时接受旧版 steps、sni_suffixes、with_coframe")
     if not isinstance(raw_steps, list):
         raise ValidationError("analysis.steps 必须是数组")
     steps: list[str] = []
@@ -212,6 +222,8 @@ def validate_task_payload(payload: Any, config: WorkerConfig) -> dict[str, Any]:
             "reports": save_reports,
         },
         "analysis": {
+            "pipeline": pipeline,
+            "delete_pcap": delete_pcap,
             "steps": steps,
             "with_coframe": with_coframe,
             "sni_suffixes": suffixes,

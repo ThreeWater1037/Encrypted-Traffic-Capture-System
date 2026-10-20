@@ -263,12 +263,22 @@ class PacketCaptureTests(unittest.TestCase):
                 "warning",
                 "--log-debug",
                 "Main",
+                "-B",
+                "64",
                 "-i",
                 "any",
                 "-w",
                 str(pcap_path),
             ],
         )
+
+    def test_linux_capture_buffer_applies_to_all_browsers(self) -> None:
+        with patch("wiki_fetcher.platform.system", return_value="Linux"):
+            for browser in ("chrome", "edge", "firefox"):
+                with self.subTest(browser=browser):
+                    command = PacketCapture(Path(f"capture_{browser}.pcap"))._build_cmd("tshark", "/usr/bin/tshark")
+                    self.assertEqual(command[command.index("-B") + 1], "64")
+                    self.assertLess(command.index("-B"), command.index("-i"))
 
     def test_windows_tshark_retries_after_timeout(self) -> None:
         tshark_output = (

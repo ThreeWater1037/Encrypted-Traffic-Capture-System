@@ -235,6 +235,10 @@ class PacketCapture:
             # Only enable Main's startup notification. Enabling every dumpcap
             # INFO domain can interleave child diagnostic messages on Windows.
             cmd = [binary, "-q", "--log-level", "warning", "--log-debug", "Main"]
+            if platform.system().lower() == "linux":
+                # Absorb short page-download bursts while low-priority analysis
+                # is active. Set before -i so it applies to every interface.
+                cmd += ["-B", "64"]
             for iface in ifaces:
                 cmd += ["-i", iface]
             cmd += ["-w", str(self.pcap_path)]
@@ -462,6 +466,13 @@ class PacketCapture:
         self._proc = None
         if self._monitor:
             self.summary["stderr_drained"] = self._monitor.join(timeout=1.0)
+            diagnostics = self._monitor.details
+            if isinstance(diagnostics, dict):
+                self.summary["capture_diagnostics"] = diagnostics
+                self.summary["packets_dropped"] = sum(
+                    int(match.group(1))
+                    for line in diagnostics.get("stderr_tail", [])
+                    for match in [re.search(r"(\d+) packets? dropped", line)] if match)
             if not self.summary["stderr_drained"]:
                 self.summary.setdefault("error", "Capture stderr did not close after process exit")
             else:
@@ -892,6 +903,8 @@ class WikiFetcher:
         save_reports: bool = False,
         network_idle_seconds: float = NETWORK_IDLE_SECONDS,
         interval_seconds: float = INTERVAL_BETWEEN_URLS,
+        extract_background: bool = False,
+        delete_pcap_after_extract: bool = False,
     ):
         if not math.isfinite(network_idle_seconds) or network_idle_seconds <= 0:
             raise ValueError("network_idle_seconds must be finite and greater than zero")
@@ -912,6 +925,14 @@ class WikiFetcher:
         self.progress_run_id = uuid.uuid4().hex
         self.all_records: list[SessionRecord] = []   # flat list across all URLs
         self.temp_maintenance = CaptureTempMaintenance()
+        if extract_background and not capture_pcap:
+            raise ValueError("Background extraction requires PCAP capture")
+        if delete_pcap_after_extract and not extract_background:
+            raise ValueError("PCAP deletion requires verified background extraction")
+        self.extract_background = extract_background
+        self.delete_pcap_after_extract = delete_pcap_after_extract
+        self.extraction_queue = None
+        self.extraction_succeeded = True
 
     # ------------------------------------------------------------------
     # Per-URL output directory
@@ -956,9 +977,17 @@ class WikiFetcher:
         if not isinstance(sizes, dict):
             return False
         for path in self._expected_artifacts(url_dir, browser_key):
-            if not path.is_file() or path.stat().st_size <= 0:
+            try:
+                actual_size = path.stat().st_size if path.is_file() else 0
+            except FileNotFoundError:
+                actual_size = 0
+            if actual_size <= 0:
+                if path == self._pcap_path(url_dir, browser_key):
+                    from capture_extraction import retired_capture
+                    if retired_capture(url_dir, browser_key):
+                        continue
                 return False
-            if sizes.get(path.name) != path.stat().st_size:
+            if sizes.get(path.name) != actual_size:
                 return False
         return True
 
@@ -966,6 +995,15 @@ class WikiFetcher:
         """重抓前清理半截文件，防止旧非空 PCAP 被误判为新结果。"""
         paths = self._expected_artifacts(url_dir, browser_key)
         paths.append(self._completion_marker_path(url_dir, browser_key))
+        if self.extract_background:
+            existing = [path for path in paths if path.exists()]
+            if existing:
+                archive = url_dir / "failed_captures" / browser_key / uuid.uuid4().hex
+                archive.mkdir(parents=True, exist_ok=False)
+                for path in existing:
+                    path.replace(archive / path.name)
+                log.warning("    未完成采集原包及密钥已保留：%s", archive)
+            return
         for path in paths:
             try:
                 path.unlink(missing_ok=True)
@@ -1404,6 +1442,8 @@ class WikiFetcher:
 
             if key in completed_browsers:
                 log.info("  → %s [检查点已完成，跳过]", AVAILABLE_DRIVERS[key].name)
+                if self.extraction_queue:
+                    self.extraction_queue.enqueue(url_dir, key)
                 skipped += 1
                 continue
 
@@ -1417,6 +1457,8 @@ class WikiFetcher:
                 self.all_records.append(record)
             if self._mark_complete(entry, url_dir, key, record):
                 captured += 1
+                if self.extraction_queue:
+                    self.extraction_queue.enqueue(url_dir, key)
             else:
                 incomplete += 1
                 log.warning("    URL 检查点未提交；下次启动会重新抓取该单元")
@@ -1447,6 +1489,21 @@ class WikiFetcher:
     # ------------------------------------------------------------------
 
     def run(self, entries: Iterable["UrlEntry"], *, total: int) -> bool:
+        from capture_extraction import ExtractionQueue
+        if self.extract_background:
+            self.extraction_queue = ExtractionQueue(
+                self.output_dir, delete_pcap=self.delete_pcap_after_extract)
+        normal_exit = False
+        try:
+            result = self._run_captures(entries, total=total)
+            normal_exit = True
+            return result
+        finally:
+            if self.extraction_queue:
+                self.extraction_succeeded = self.extraction_queue.close(cancel=not normal_exit)
+                self.extraction_queue = None
+
+    def _run_captures(self, entries: Iterable["UrlEntry"], *, total: int) -> bool:
         """执行完整批次；URL 之间保留固定间隔以减少相互干扰。"""
         log.info("词条数 : %d", total)
         log.info("Output : %s", self.output_dir)
@@ -1633,7 +1690,15 @@ def main():
                         help="Chrome/Edge/Firefox 所有页面请求结束后的静默窗口（默认 0.5 秒）。")
     parser.add_argument("--interval-seconds", type=float, default=INTERVAL_BETWEEN_URLS,
                         help="前一 URL 完成资源清理后的间隔（默认 1 秒，可设为 0）。")
+    parser.add_argument("--extract-background", action="store_true",
+                        help="每份抓包完成后，后台依次提取流序列和 TLS 特征。")
+    parser.add_argument("--delete-pcap-after-extract", action="store_true",
+                        help="仅在两套提取均验证成功后删除原始 PCAP，保留密钥及结果。")
     args = parser.parse_args()
+    if args.extract_background and not args.pcap:
+        parser.error("--extract-background requires --pcap")
+    if args.delete_pcap_after_extract and not args.extract_background:
+        parser.error("--delete-pcap-after-extract requires --extract-background")
 
     # 构建 UrlEntry 列表
     if args.input:
@@ -1666,10 +1731,15 @@ def main():
         save_reports=args.save_reports,
         network_idle_seconds=args.network_idle_seconds,
         interval_seconds=args.interval_seconds,
+        extract_background=args.extract_background,
+        delete_pcap_after_extract=args.delete_pcap_after_extract,
     )
     if not fetcher.run(entries, total=total):
         log.error("仍有采集单元未完成；退出码 2 将触发 Worker 检查点重试")
         raise SystemExit(2)
+    if not fetcher.extraction_succeeded:
+        log.error("后台提取未全部完成；保留失败 PCAP，退出码 3；采集检查点保持有效")
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":

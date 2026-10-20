@@ -16,6 +16,9 @@ class WorkerOpenApiTests(unittest.TestCase):
     def test_document_has_expected_paths_and_methods(self) -> None:
         self.assertEqual(self.document["openapi"], "3.0.3")
         expected = {
+            "/api/v1/extractions": {"get", "post"},
+            "/api/v1/extractions/{extraction_id}": {"get"},
+            "/api/v1/extractions/{extraction_id}/cancel": {"post"},
             "/api/v1/health": {"get"},
             "/api/v1/capabilities": {"get"},
             "/api/v1/tasks": {"post"},

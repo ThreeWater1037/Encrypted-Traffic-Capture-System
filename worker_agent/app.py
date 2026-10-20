@@ -106,6 +106,8 @@ def detect_capabilities(config: WorkerConfig) -> dict[str, Any]:
             "browser_proxy_configured": config.proxy_url is not None,
         },
         "analysis": {
+            "standalone_extraction": True,
+            "standalone_browsers": ["chrome", "edge", "firefox"],
             "scripts_ready": all(
                 (config.project_root / script).is_file()
                 for script in (
@@ -289,6 +291,8 @@ def create_app(
     app.extensions["worker_config"] = worker_config
     app.extensions["task_store"] = task_store
     app.extensions["task_manager"] = task_manager
+    from .extraction_jobs import register_routes
+    register_routes(app, task_manager)
 
     @app.before_request
     def authenticate_internal_api():
@@ -407,6 +411,8 @@ def create_app(
                     "reports": _form_bool("save_reports", default=False),
                 },
                 "analysis": {
+                    "pipeline": _form_bool("analysis_pipeline", default=False),
+                    "delete_pcap": _form_bool("delete_pcap", default=False),
                     "steps": _form_list(
                         "analysis_steps",
                         default=[],
